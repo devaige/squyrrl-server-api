@@ -1,0 +1,18 @@
+# 构建产物
+bin/
+*.test
+*.out
+
+# 本地配置
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+
+# Go
+vendor/
+
+# 操作系统
+.DS_Store

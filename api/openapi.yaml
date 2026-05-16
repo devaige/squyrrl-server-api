@@ -1,0 +1,1530 @@
+openapi: 3.1.0
+info:
+  title: Squyrrl API
+  version: 0.1.0
+  description: |
+    Squyrrl（箩筐）主 API 契约。本文件描述 Phase 1 已实现的 20 个端点。
+
+    ## 认证模型
+
+    - 客户端用邮箱 OTP 登录得到 `access_token`（1h）+ `refresh_token`（30d）。
+    - 受保护端点要求 `Authorization: Bearer <access_token>` 请求头。
+    - access token 过期后用 `/auth/refresh` 旋转出新的 access；refresh token 不旋转。
+    - 任何 token 都仅以 SHA-256 哈希入库；明文 token 永不持久化。
+
+    ## 同步并发控制
+
+    - `snippets.version` 是单调自增的乐观锁。
+    - 写入端点（PATCH / DELETE）必须携带 `If-Match: "<version>"` 头，否则 400 / 409。
+    - 读取端点会返回 `ETag: "<version>"` 响应头。
+    - 增量同步：`GET /snippets?since=<RFC3339>` 返回 `updated_at >= since` 的碎片，按时间升序，附带 `next_since` 用于下一次请求。
+    - `?include_deleted=true` 让同步流包含软删除的碎片（带 `deleted_at`），客户端据此本地下架。
+
+    ## 数据混淆
+
+    - `snippets.text_content` 与未来的文件 blob 在客户端用 XChaCha20-Poly1305 + 应用静态密钥混淆后再上传。
+    - 服务器只见混淆字节，不解密。在 JSON 中字段以 base64 出现（Go `[]byte` 默认编码）。
+  contact:
+    name: Squyrrl
+    url: https://squyrrl.app
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: 开发环境（本机 Docker Compose）
+  - url: https://api.squyrrl.app
+    description: 生产环境（占位）
+
+tags:
+  - name: System
+    description: 健康检查与平台信息
+  - name: Auth
+    description: 认证、会话、当前用户
+  - name: Pages
+    description: 用户的页面（碎片组织单元，1:N）
+  - name: Tags
+    description: 用户的标签（碎片组织单元，N:N）
+  - name: Snippets
+    description: 碎片 — 产品的核心实体
+  - name: Files
+    description: 文件存储（混淆字节）+ 跨用户去重
+  - name: URIs
+    description: URI 解析为特殊碎片（Phase 1.5：YouTube）
+  - name: Telegram
+    description: Telegram Bot 绑定与转发（用户端 + 内部端）
+  - name: Passkey
+    description: WebAuthn / Passkey 注册与无密码登录
+  - name: QR
+    description: 扫码绑定新设备
+  - name: Wallet
+    description: 用户订阅 plan + 代币余额（只读视图 + 内部充值端点）
+
+# 全局默认要求 Bearer。公开端点用 security: [] 显式覆盖
+security:
+  - bearerAuth: []
+
+# =============================================================================
+# 端点
+# =============================================================================
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [System]
+      summary: 健康检查
+      description: 返回服务运行状态及数据库联通性。
+      security: []
+      responses:
+        '200':
+          description: 一切正常
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, env]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  env: { type: string, examples: [dev, test, prod] }
+        '503':
+          description: 数据库不通
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [down] }
+                  db: { type: string }
+
+  # ---------------------------------------------------------------- Auth
+  /auth/email/request:
+    post:
+      operationId: requestEmailOtp
+      tags: [Auth]
+      summary: 请求邮箱登录验证码
+      description: |
+        生成 6 位数字 OTP，10 分钟有效，通过 SMTP 邮件投递。
+        无论邮箱是否存在均返回 204，避免邮箱枚举。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '204': { description: 已（尝试）发送 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /auth/email/verify:
+    post:
+      operationId: verifyEmailOtp
+      tags: [Auth]
+      summary: 用 OTP 验证并签发会话
+      description: 校验 OTP 成功后注册或登录用户，注册或更新设备，签发 access + refresh token。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code, device]
+              properties:
+                email: { type: string, format: email }
+                code: { type: string, pattern: '^\d{6}$' }
+                device: { $ref: '#/components/schemas/DeviceInput' }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      tags: [Auth]
+      summary: 旋转 access token
+      description: 用 refresh_token 换发新的 access_token。refresh_token 本身不旋转。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: 新 token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: 登出当前会话
+      description: 撤销当前 access token 对应的会话；客户端应清空本地 token。
+      responses:
+        '204': { description: 已撤销 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [Auth]
+      summary: 当前用户信息
+      responses:
+        '200':
+          description: 当前 user + device 视角
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, device_id]
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  device_id: { type: string, format: uuid }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- Pages
+  /pages:
+    post:
+      operationId: createPage
+      tags: [Pages]
+      summary: 创建页面
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PageCreateInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Page' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      operationId: listPages
+      tags: [Pages]
+      summary: 列出当前用户的页面
+      description: 按 `order_idx` 升序、`created_at` 升序返回；不含软删除条目。
+      responses:
+        '200':
+          description: 页面列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Page' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pages/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: getPage
+      tags: [Pages]
+      summary: 拉取单个页面
+      responses:
+        '200':
+          description: 页面
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Page' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updatePage
+      tags: [Pages]
+      summary: 更新页面
+      description: "系统页面（`is_system: true`）禁止改名 / 改隐藏，但可调 `order_idx`。"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PageUpdateInput' }
+      responses:
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Page' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 系统页面只读
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deletePage
+      tags: [Pages]
+      summary: 软删除页面
+      description: |
+        软删除该页面，并把该用户下指向它的所有未删除碎片的 `page_id` 置为 NULL，
+        同时把这些碎片的 `version` 加 1（保证客户端通过同步流能看到变更）。
+        系统页面禁止删除。
+      responses:
+        '204': { description: 已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 系统页面只读
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Tags
+  /tags:
+    post:
+      operationId: createTag
+      tags: [Tags]
+      summary: 创建标签
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagCreateInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: 标签名重复
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      operationId: listTags
+      tags: [Tags]
+      summary: 列出标签
+      description: 按 `name` 升序返回。
+      responses:
+        '200':
+          description: 标签列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tag' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /tags/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    patch:
+      operationId: updateTag
+      tags: [Tags]
+      summary: 重命名标签
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 50 }
+      responses:
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 同名标签已存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      operationId: deleteTag
+      tags: [Tags]
+      summary: 删除标签
+      description: 物理删除；通过外键级联自动清理 `snippet_tags` 关联。
+      responses:
+        '204': { description: 已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Snippets
+  /snippets:
+    post:
+      operationId: createSnippet
+      tags: [Snippets]
+      summary: 创建碎片
+      description: |
+        客户端可通过 `id` 字段携带本地生成的 UUID（用于离线写）。
+        `tag_ids` 与 `page_id` 必须归属当前用户，否则返回 400。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SnippetCreateInput' }
+      responses:
+        '201':
+          description: 已创建
+          headers:
+            ETag:
+              description: 当前 version，包在双引号里，可用作后续 If-Match
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snippet' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      operationId: listSnippets
+      tags: [Snippets]
+      summary: 列出 / 同步碎片
+      description: |
+        - 不传 `since`：浏览模式，按 `updated_at` 倒序，最多 `limit`（默认 100，上限 200）。
+        - 传 `since`：同步模式，按 `updated_at` 升序，返回 `updated_at >= since` 的条目，附 `next_since` 供下次请求。
+        - `include_deleted=true` 让结果包含软删除条目（`deleted_at` 非空）。
+      parameters:
+        - in: query
+          name: page_id
+          schema: { type: string, format: uuid }
+        - in: query
+          name: tag_id
+          schema: { type: string, format: uuid }
+        - in: query
+          name: since
+          description: RFC3339 时间戳；触发同步模式
+          schema: { type: string, format: date-time }
+        - in: query
+          name: include_deleted
+          schema: { type: boolean, default: false }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+        - in: query
+          name: q
+          description: |
+            全文搜索关键字。Phase 1.5 仅对 `title` / `description` 做 ILIKE 单词包含匹配（大小写不敏感）。
+            `text_content` 因后续将启用客户端混淆，不在服务端索引；客户端启用混淆后需要全文搜索时切换到本地索引方案。
+          schema: { type: string }
+      responses:
+        '200':
+          description: 碎片列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SnippetList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /snippets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: getSnippet
+      tags: [Snippets]
+      summary: 拉取单个碎片
+      responses:
+        '200':
+          description: 碎片
+          headers:
+            ETag:
+              description: 当前 version，可作为后续 If-Match
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snippet' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateSnippet
+      tags: [Snippets]
+      summary: 更新碎片（乐观锁）
+      description: |
+        必须携带版本号，渠道有二选一：
+        - HTTP 头 `If-Match: "<version>"`（推荐）
+        - body 中的 `version` 字段（兜底）
+
+        字段存在即更新；缺省字段保持不变。`tag_ids` 为空数组表示清空所有标签。
+        type / source / 等不可变字段无法通过 PATCH 修改。
+      parameters:
+        - in: header
+          name: If-Match
+          schema: { type: string }
+          description: 双引号包裹的版本号，例如 `"3"`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SnippetUpdateInput' }
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              description: 自增后的 version
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snippet' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            版本不匹配（乐观锁失败）。
+            服务端会自动把客户端提交的内容作为「loser 副本」入用户的「冲突收件箱」系统页面（按需建立），
+            响应里包含 `loser_snippet_id` 和 `loser_page_id` 便于客户端跳转展示。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SnippetConflictResponse' }
+    delete:
+      operationId: deleteSnippet
+      tags: [Snippets]
+      summary: 软删除碎片
+      description: |
+        必须携带 `If-Match` 头。删除会设置 `deleted_at = now()` 并把 `version + 1`，
+        以便客户端能通过同步流（include_deleted=true）感知到此次删除。
+      parameters:
+        - in: header
+          name: If-Match
+          required: true
+          schema: { type: string }
+          description: 双引号包裹的版本号
+      responses:
+        '204': { description: 已删除 }
+        '400':
+          description: 缺少 If-Match 头
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 版本不匹配
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /snippets/{id}/archive:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    post:
+      operationId: archiveSnippet
+      tags: [Snippets]
+      summary: 抓取 URL 碎片原始内容并作为附件入库
+      description: |
+        - 仅适用于 `type=url` 的碎片
+        - 服务端用 `net/http` 抓取 `payload.url` 一次（5 MiB 上限），**不执行 JS、不内联资源**
+          —— ADR-006 完整 SingleFile 留作 Phase 2（chromedp / headless Chrome）
+        - 抓到的字节作为 `text/html`（或上游 Content-Type）上传到 files 表
+        - 创建一条 element 记录挂在该 snippet 下，alt_text 固定为 `Archived HTML`
+        - snippet.version 自增 1，让客户端通过 sync 流拉到新 element
+        - 同一 URL 多次 archive：files 去重，但仍会插入新 element（用户可手动删除）
+      responses:
+        '200':
+          description: 已归档
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArchiveResponse' }
+        '400':
+          description: snippet 非 URL 类型 / payload 缺 url 字段 / 解析 ID 失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: 目标内容超过 5MiB
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: 抓取上游失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Files
+  /files/check:
+    post:
+      operationId: checkFile
+      tags: [Files]
+      summary: 按 plain_hash 查重
+      description: |
+        客户端先把文件明文 SHA-256 提交，命中则直接拿到 file_id 复用，
+        未命中再走 `POST /files` 上传字节。节流量并实现跨用户去重（ADR-004）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileCheckInput' }
+      responses:
+        '200':
+          description: 查重结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileCheckResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /files:
+    post:
+      operationId: uploadFile
+      tags: [Files]
+      summary: 上传混淆字节
+      description: |
+        请求体为客户端混淆后的二进制（XChaCha20-Poly1305 + 应用静态密钥）。
+        必须以 header 形式申报 plain_hash / cipher_hash / 大小 / MIME；
+        服务端会重新计算上传字节的 SHA-256 与 X-Cipher-Hash 比对。
+      parameters:
+        - in: header
+          name: X-Plain-Hash
+          required: true
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+        - in: header
+          name: X-Cipher-Hash
+          required: true
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+        - in: header
+          name: X-Size-Bytes
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - in: header
+          name: X-Mime
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: 已上传或已命中去重
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/File' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413':
+          description: 单文件超过 100MiB
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /files/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: getFileMetadata
+      tags: [Files]
+      summary: 获取文件元数据
+      description: |
+        仅返回 file 元数据 JSON（id / plain_hash / cipher_hash / size / mime），不传字节。
+        客户端在显示已附附件预览前先调此端点拿 mime，再根据 mime 决定是否调 `download` 拉缩略图字节。
+      responses:
+        '200':
+          description: 文件元数据
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/File' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /files/{id}/download:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: downloadFile
+      tags: [Files]
+      summary: 下载混淆字节
+      description: |
+        返回客户端混淆字节流；客户端用应用静态密钥解混淆得到原文。
+        响应头携带 X-Plain-Hash / X-Cipher-Hash 便于校验。
+      responses:
+        '200':
+          description: 混淆字节
+          headers:
+            X-Plain-Hash:
+              schema: { type: string }
+            X-Cipher-Hash:
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- URIs
+  /uris/parse:
+    post:
+      operationId: parseUri
+      tags: [URIs]
+      summary: 解析 URI 为结构化碎片
+      description: |
+        服务端按已注册的 provider 顺序匹配 URI（Phase 1.5：YouTube oEmbed），
+        命中后调上游 API 解析并写入跨用户共享缓存（ADR-005）。
+        响应中的 `snippet` 字段可直接 POST 给 `/snippets` 创建特殊碎片。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uri]
+              properties:
+                uri: { type: string, format: uri }
+      responses:
+        '200':
+          description: 解析成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParseResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            credits 余额不足。cache 命中不收费；cache miss 时按 `SQUYRRL_PARSE_COST` 扣减（dev 默认 0 即不强制，生产推荐 2）。
+            客户端应引导用户充值后重试，或读取 `/me/wallet` 查询当前余额。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 没有可用的 parser
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: 上游 provider 错误
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Telegram Binding
+  /tg/binding/start:
+    post:
+      operationId: startTelegramBinding
+      tags: [Telegram]
+      summary: 用户端：生成 Telegram 绑定码
+      description: 8 位字符的不易混淆码，10 分钟内一次性使用。客户端展示给用户，让用户在 Bot 内输入 `/bind <code>` 完成绑定。
+      responses:
+        '200':
+          description: 绑定码
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BindingCode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/tg/binding/complete:
+    post:
+      operationId: completeTelegramBinding
+      tags: [Telegram]
+      summary: Bot 端：用绑定码完成绑定
+      description: 仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, tg_user_id]
+              properties:
+                code: { type: string }
+                tg_user_id: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 已绑定
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id]
+                properties:
+                  user_id: { type: string, format: uuid }
+        '401':
+          description: 内部 token 缺失或绑定码无效
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 该 tg_user_id 已绑定其它用户
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/snippet:
+    post:
+      operationId: forwardTelegramSnippet
+      tags: [Telegram]
+      summary: Bot 端：以已绑定用户身份创建碎片
+      description: 仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。服务端按 tg_user_id 找对应 user_id 创建。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tg_user_id, snippet]
+              properties:
+                tg_user_id: { type: integer, format: int64 }
+                snippet:
+                  type: object
+                  properties:
+                    type: { type: string, default: normal }
+                    title: { type: string }
+                    description: { type: string }
+                    text_content: { type: string, format: byte }
+                    text_format: { type: string, default: plain }
+      responses:
+        '201':
+          description: 碎片已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snippet' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: tg_user_id 未绑定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Wallet
+  /me/wallet:
+    get:
+      operationId: getWallet
+      tags: [Wallet]
+      summary: 当前用户的订阅 plan + 代币余额
+      description: |
+        Phase 1.5 只读视图：
+        - `plan` = 用户当前 active 的会员订阅 tier；无活跃订阅时返 `"free"`。
+        - `credits_balance` = `SUM(delta)` over `credits_ledger`，永远以此为准。
+      responses:
+        '200':
+          description: 钱包视图
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Wallet' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/admin/credits/grant:
+    post:
+      operationId: grantCredits
+      tags: [Wallet]
+      summary: 内部：给指定用户调整 credits 余额
+      description: |
+        受 X-Internal-Token 头保护。供管理后台 / 支付回调 / 运营批处理调用。
+        `delta` 可正可负；服务端用 advisory lock 串行化同一用户的并发写入，
+        保证 `credits_ledger.balance_after` 列单调连续。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, delta, reason]
+              properties:
+                user_id: { type: string, format: uuid }
+                delta:
+                  type: integer
+                  format: int64
+                  description: 正数入账，负数罚扣 / 退款冲销
+                reason:
+                  type: string
+                  description: 流水原因，例如 'purchase' / 'admin_grant' / 'parse_uri' / 'refund'
+      responses:
+        '200':
+          description: 流水记录已生成
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreditsGrantResponse' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Passkey (WebAuthn)
+  /auth/passkey/register/begin:
+    post:
+      operationId: passkeyRegisterBegin
+      tags: [Passkey]
+      summary: 已登录用户：发起 passkey 注册
+      description: |
+        返回 PublicKeyCredentialCreationOptions（W3C Web Authentication）+ session_id。
+        客户端应调用 `navigator.credentials.create({ publicKey })`，
+        把生成的 `PublicKeyCredential` 序列化后通过 `register/finish` 回传。
+      responses:
+        '200':
+          description: 注册 ceremony 已开始
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PasskeyRegisterBeginResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/passkey/register/finish:
+    post:
+      operationId: passkeyRegisterFinish
+      tags: [Passkey]
+      summary: 已登录用户：提交 passkey 凭据完成注册
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, response]
+              properties:
+                session_id: { type: string }
+                response:
+                  type: object
+                  description: 客户端 PublicKeyCredential 的 JSON 序列化
+                  additionalProperties: true
+                name:
+                  type: string
+                  description: 用户给该凭据起的名字（"MacBook 内置 TouchID" 等）
+      responses:
+        '204': { description: 已绑定 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/passkey/login/begin:
+    post:
+      operationId: passkeyLoginBegin
+      tags: [Passkey]
+      summary: 公开：发起 passkey 登录（无密码）
+      description: |
+        服务端按 email 定位用户并发出 challenge。
+        返回 PublicKeyCredentialRequestOptions + session_id；
+        客户端调 `navigator.credentials.get({ publicKey })` 后回传到 `login/finish`。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200':
+          description: 登录 ceremony 已开始
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PasskeyLoginBeginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: 用户未注册过 passkey 或邮箱不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/passkey/login/finish:
+    post:
+      operationId: passkeyLoginFinish
+      tags: [Passkey]
+      summary: 公开：提交 passkey assertion，签发会话
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, email, response, device]
+              properties:
+                session_id: { type: string }
+                email: { type: string, format: email }
+                response:
+                  type: object
+                  additionalProperties: true
+                device: { $ref: '#/components/schemas/DeviceInput' }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- QR 扫码绑定
+  /auth/qr/start:
+    post:
+      operationId: qrStart
+      tags: [QR]
+      summary: 已登录设备：拿一个 90 秒有效的绑定码
+      description: |
+        客户端可把返回的 `code` 编码为二维码展示给新设备扫描，
+        或直接让用户在新设备手动输入绑定码（推荐 8 字符不易混淆字符集）。
+      responses:
+        '200':
+          description: 绑定码
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QRCode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/qr/redeem:
+    post:
+      operationId: qrRedeem
+      tags: [QR]
+      summary: 新设备：兑换绑定码 + 设备元数据 → 登录
+      description: |
+        与 `/auth/email/verify` / `/auth/passkey/login/finish` 共享 LoginResult 响应；
+        签发到的 access/refresh token 与其它登录方式无差异。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, device]
+              properties:
+                code:
+                  type: string
+                  minLength: 8
+                  maxLength: 8
+                device: { $ref: '#/components/schemas/DeviceInput' }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: 绑定码无效或已过期
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+# =============================================================================
+# 复用组件
+# =============================================================================
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    internalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: 仅供 Bot 等内部服务调用；与主 API 共享同一个秘密
+
+  parameters:
+    UUIDPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: 请求参数无效
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: 未认证 / token 无效
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 资源不存在或不归属当前用户
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ---------- 通用 ----------
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: 人可读的错误描述（中文） }
+
+    # ---------- 认证 ----------
+    User:
+      type: object
+      required: [id, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        email:
+          type: [string, 'null']
+          format: email
+        handle:
+          type: [string, 'null']
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Device:
+      type: object
+      required: [id, user_id, name, platform, last_seen_at]
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { $ref: '#/components/schemas/Platform' }
+        last_seen_at: { type: string, format: date-time }
+
+    Platform:
+      type: string
+      enum: [ios, android, macos, windows, linux, web, browser, telegram, wechat]
+
+    DeviceInput:
+      type: object
+      required: [name, platform]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        platform: { $ref: '#/components/schemas/Platform' }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, access_expires_at, refresh_expires_at]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        access_expires_at: { type: string, format: date-time }
+        refresh_expires_at: { type: string, format: date-time }
+
+    LoginResult:
+      type: object
+      required: [user, device, tokens]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        device: { $ref: '#/components/schemas/Device' }
+        tokens: { $ref: '#/components/schemas/TokenPair' }
+
+    # ---------- 页面 ----------
+    Page:
+      type: object
+      required: [id, name, is_hidden, is_system, order_idx, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        is_hidden: { type: boolean }
+        is_system: { type: boolean }
+        order_idx: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PageCreateInput:
+      type: object
+      required: [name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端可选指定 UUID（离线生成）
+        name: { type: string, minLength: 1, maxLength: 100 }
+        is_hidden: { type: boolean, default: false }
+        order_idx: { type: integer, default: 0 }
+
+    PageUpdateInput:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        is_hidden: { type: boolean }
+        order_idx: { type: integer }
+
+    # ---------- 标签 ----------
+    Tag:
+      type: object
+      required: [id, name, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    TagCreateInput:
+      type: object
+      required: [name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端可选指定 UUID
+        name: { type: string, minLength: 1, maxLength: 50 }
+
+    # ---------- 碎片 ----------
+    SnippetType:
+      type: string
+      enum: [uri, url, normal, special]
+
+    SnippetTextFormat:
+      type: string
+      enum: [plain, markdown, code]
+
+    SnippetSourceType:
+      type: string
+      enum: [device, upstream]
+
+    Snippet:
+      type: object
+      required:
+        - id
+        - type
+        - text_format
+        - payload
+        - source_type
+        - source_data
+        - version
+        - tag_ids
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        page_id:
+          type: [string, 'null']
+          format: uuid
+        type: { $ref: '#/components/schemas/SnippetType' }
+        subtype:
+          type: [string, 'null']
+          description: type=special 时的具体子类，例如 tweet / apk / gist / youtube
+        title:
+          type: [string, 'null']
+        description:
+          type: [string, 'null']
+        text_content:
+          type: string
+          format: byte
+          description: 客户端混淆后的字节，base64 编码。服务器不解密
+        text_format: { $ref: '#/components/schemas/SnippetTextFormat' }
+        text_lang:
+          type: [string, 'null']
+          description: 仅 text_format=code 时有意义
+        payload:
+          type: object
+          additionalProperties: true
+          description: "类型相关字段，例如 url 碎片的 `{url: ...}` 或推文解析数据"
+        source_type: { $ref: '#/components/schemas/SnippetSourceType' }
+        source_data:
+          type: object
+          additionalProperties: true
+          description: |
+            device 时形如 `{device_id, name, platform}`；
+            upstream 时形如 `{provider, author_handle, author_avatar_url, ...}`
+        version:
+          type: integer
+          format: int64
+          description: 单调自增；写入时作乐观锁
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
+        elements:
+          type: array
+          items: { $ref: '#/components/schemas/Element' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at:
+          type: [string, 'null']
+          format: date-time
+
+    Element:
+      type: object
+      required: [id, file_id, order_idx, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        file_id: { type: string, format: uuid }
+        order_idx: { type: integer }
+        alt_text:
+          type: [string, 'null']
+        created_at: { type: string, format: date-time }
+
+    ElementInput:
+      type: object
+      required: [file_id]
+      properties:
+        file_id: { type: string, format: uuid }
+        order_idx: { type: integer, default: 0 }
+        alt_text: { type: string }
+
+    SnippetCreateInput:
+      type: object
+      required: [type, source_type]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: 客户端可选指定 UUID
+        page_id:
+          type: string
+          format: uuid
+        type: { $ref: '#/components/schemas/SnippetType' }
+        subtype: { type: string }
+        title: { type: string }
+        description: { type: string }
+        text_content: { type: string, format: byte }
+        text_format: { $ref: '#/components/schemas/SnippetTextFormat' }
+        text_lang: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        source_type: { $ref: '#/components/schemas/SnippetSourceType' }
+        source_data:
+          type: object
+          additionalProperties: true
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
+        elements:
+          type: array
+          items: { $ref: '#/components/schemas/ElementInput' }
+
+    SnippetUpdateInput:
+      type: object
+      description: |
+        所有字段可选；缺省即不变。`version` 在 body 与 If-Match 头中至少提供一个，
+        两者均存在时以 If-Match 头为准。
+      properties:
+        version:
+          type: integer
+          format: int64
+          description: 兜底版本号（推荐改用 If-Match 头）
+        page_id:
+          type: string
+          format: uuid
+        title: { type: string }
+        description: { type: string }
+        text_content: { type: string, format: byte }
+        text_format: { $ref: '#/components/schemas/SnippetTextFormat' }
+        text_lang: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        tag_ids:
+          type: [array, 'null']
+          description: nil = 不变；空数组 = 清空所有标签
+          items: { type: string, format: uuid }
+        elements:
+          type: [array, 'null']
+          description: nil = 不变；空数组 = 清空所有元素；非空 = 完整替换
+          items: { $ref: '#/components/schemas/ElementInput' }
+
+    SnippetList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Snippet' }
+        next_since:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            仅同步模式（请求带 `since`）会出现，作为下次请求的 `since` 值。
+            浏览模式下省略。
+
+    # ---------- 文件 ----------
+    File:
+      type: object
+      required: [id, plain_hash, cipher_hash, size_bytes, mime, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        plain_hash: { type: string, description: 明文 SHA-256 hex }
+        cipher_hash: { type: string, description: 混淆字节 SHA-256 hex }
+        size_bytes: { type: integer, format: int64 }
+        mime: { type: string }
+        created_at: { type: string, format: date-time }
+
+    FileCheckInput:
+      type: object
+      required: [plain_hash]
+      properties:
+        plain_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+
+    FileCheckResponse:
+      type: object
+      required: [exists]
+      properties:
+        exists: { type: boolean }
+        file:
+          oneOf:
+            - $ref: '#/components/schemas/File'
+            - type: 'null'
+
+    # ---------- URI 解析 ----------
+    ParsedSnippet:
+      type: object
+      description: |
+        与 SnippetCreateInput 字段对齐，可直接 POST 到 /snippets。
+        - type=special：YouTube / Tweet / Gist 等专用解析器，subtype 为 provider 名
+        - type=url：通用 OG 兜底解析（任何 http(s) 链接），无 subtype
+      required: [type, payload, source_type, source_data]
+      properties:
+        type: { type: string, enum: [special, url] }
+        subtype:
+          type: string
+          description: 仅 type=special 时出现；空字符串/省略表示无
+        title: { type: string }
+        description: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+        source_type: { type: string, enum: [upstream] }
+        source_data:
+          type: object
+          additionalProperties: true
+
+    ParseResponse:
+      type: object
+      required: [provider, resource_id, snippet, cached]
+      properties:
+        provider:
+          type: string
+          description: 已注册的 provider 名（按优先级匹配）。Phase 1.5 注册顺序：youtube → gist → reddit → url（generic OG 兜底）。
+          examples: [youtube, gist, reddit, url]
+        resource_id: { type: string, description: 该资源在 provider 命名空间内的稳定 ID }
+        snippet: { $ref: '#/components/schemas/ParsedSnippet' }
+        cached:
+          type: boolean
+          description: true 表示命中跨用户解析缓存，未触发上游调用
+
+    # ---------- Passkey ----------
+    PasskeyRegisterBeginResponse:
+      type: object
+      required: [publicKey, session_id]
+      properties:
+        publicKey:
+          type: object
+          additionalProperties: true
+          description: PublicKeyCredentialCreationOptions（W3C 规范，由 webauthn 库直接序列化）
+        session_id:
+          type: string
+          description: 服务器给客户端的临时 ID；finish 时回传以索引 ceremony state
+
+    PasskeyLoginBeginResponse:
+      type: object
+      required: [publicKey, session_id]
+      properties:
+        publicKey:
+          type: object
+          additionalProperties: true
+          description: PublicKeyCredentialRequestOptions
+        session_id: { type: string }
+
+    # ---------- 冲突归档 ----------
+    SnippetConflictResponse:
+      type: object
+      required: [error, current_version, loser_snippet_id, loser_page_id]
+      properties:
+        error: { type: string, examples: ['version conflict'] }
+        current_version:
+          type: integer
+          format: int64
+          description: 服务端当前 snippet 的实际版本，客户端应用此 version 重试
+        loser_snippet_id:
+          type: string
+          format: uuid
+          description: 客户端提交内容已作为副本入冲突收件箱的 snippet ID
+        loser_page_id:
+          type: string
+          format: uuid
+          description: 用户的「冲突收件箱」系统页面 ID
+
+    # ---------- 归档 ----------
+    ArchiveResponse:
+      type: object
+      required: [snippet_id, file_id, element_id, size_bytes, mime]
+      properties:
+        snippet_id: { type: string, format: uuid }
+        file_id: { type: string, format: uuid }
+        element_id: { type: string, format: uuid }
+        size_bytes:
+          type: integer
+          format: int64
+          description: 抓到的原始字节数（≤ 5 MiB）
+        mime: { type: string, examples: [text/html] }
+
+    # ---------- 钱包 ----------
+    Wallet:
+      type: object
+      required: [plan, credits_balance]
+      properties:
+        plan:
+          type: string
+          enum: [free, basic, standard, premium, maximum]
+          description: 当前活跃订阅 tier；无活跃订阅时返 'free'
+        credits_balance:
+          type: integer
+          format: int64
+          description: SUM(delta) over credits_ledger；可为负（罚扣 / 退款冲销）
+
+    CreditsGrantResponse:
+      type: object
+      required: [user_id, delta, balance_after, ledger_id]
+      properties:
+        user_id: { type: string, format: uuid }
+        delta: { type: integer, format: int64 }
+        balance_after:
+          type: integer
+          format: int64
+          description: 该笔写入后的余额（写入瞬间的诊断字段；真实余额以 Wallet.credits_balance 为准）
+        ledger_id: { type: string, format: uuid }
+
+    # ---------- QR 扫码绑定 ----------
+    QRCode:
+      type: object
+      required: [code, expires_at]
+      properties:
+        code:
+          type: string
+          minLength: 8
+          maxLength: 8
+          description: 8 位不易混淆字符（去掉 0/O/1/I/L）
+        expires_at: { type: string, format: date-time }
+
+    # ---------- Telegram 绑定 ----------
+    BindingCode:
+      type: object
+      required: [code, expires_at]
+      properties:
+        code:
+          type: string
+          description: 8 位不易混淆字符（去掉 0/O/1/I/L）
+        expires_at: { type: string, format: date-time }

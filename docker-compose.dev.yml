@@ -1,0 +1,74 @@
+# 开发环境依赖栈：Postgres / Redis / MinIO / NATS / Mailhog
+# 仅用于 dev / test 环境；生产采用托管服务。
+#
+# 主机端口统一加 50000 偏移以避开常见的本地服务和 SSH 隧道：
+#   Postgres 55432  Redis 56379  NATS 54222 / 58222
+#   MinIO 59000 / 59001  Mailhog 51025 / 58025
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: squyrrl-postgres
+    environment:
+      POSTGRES_USER: squyrrl
+      POSTGRES_PASSWORD: squyrrl_dev
+      POSTGRES_DB: squyrrl
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U squyrrl -d squyrrl"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: squyrrl-redis
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: squyrrl-minio
+    environment:
+      MINIO_ROOT_USER: squyrrl
+      MINIO_ROOT_PASSWORD: squyrrl_dev_secret
+    command: server /data --console-address ":9001"
+    ports:
+      - "59000:9000"  # S3 API
+      - "59001:9001"  # 控制台
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    container_name: squyrrl-nats
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "54222:4222"  # 客户端
+      - "58222:8222"  # 监控 HTTP
+    volumes:
+      - nats_data:/data
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: squyrrl-mailhog
+    ports:
+      - "51025:1025"  # SMTP
+      - "58025:8025"  # Web UI
+
+volumes:
+  postgres_data:
+  minio_data:
+  nats_data:
