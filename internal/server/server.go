@@ -1,8 +1,6 @@
 package server
 
 import (
-	"context"
-	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -16,7 +14,6 @@ import (
 	"github.com/squyrrl/api/internal/features/file"
 	"github.com/squyrrl/api/internal/features/page"
 	"github.com/squyrrl/api/internal/features/parser"
-	"github.com/squyrrl/api/internal/features/search"
 	"github.com/squyrrl/api/internal/features/snippet"
 	"github.com/squyrrl/api/internal/features/subscriptions"
 	"github.com/squyrrl/api/internal/features/tag"
@@ -70,15 +67,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	pageSvc := page.NewService(page.NewRepo(pool))
 	tagRepo := tag.NewRepo(pool)
 	snipSvc := snippet.NewService(snippet.NewRepo(pool))
-	if meili := search.NewMeili(cfg.MeiliURL, cfg.MeiliKey, cfg.MeiliIndex); meili != nil {
-		snipSvc.SetIndexer(search.NewMeiliIndexer(meili))
-		// 启动时同步 index 设置；失败仅 warn，不阻塞启动
-		go func() {
-			if err := meili.EnsureIndex(context.Background()); err != nil {
-				slog.Warn("meili EnsureIndex failed", "err", err)
-			}
-		}()
-	}
 	fileSvc := file.NewService(file.NewRepo(pool), st)
 
 	// URI 解析：特殊 provider 顺序匹配；通用 OG 兜底放在最末

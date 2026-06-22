@@ -348,32 +348,6 @@ func (r *Repo) List(ctx context.Context, userID uuid.UUID, in *ListInput) ([]Sni
 	return out, rows.Err()
 }
 
-// ListByIDs 批量取，不分页；仅过滤 user_id 与 deleted_at IS NULL
-// 用于 search 引擎给定命中 id 后回填详情
-func (r *Repo) ListByIDs(ctx context.Context, userID uuid.UUID, ids []uuid.UUID) ([]Snippet, error) {
-	if len(ids) == 0 {
-		return []Snippet{}, nil
-	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+snippetCols+`
-		FROM snippets s
-		WHERE s.user_id = $1 AND s.id = ANY($2) AND s.deleted_at IS NULL`,
-		userID, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Snippet
-	for rows.Next() {
-		s, err := scanSnippet(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *s)
-	}
-	return out, rows.Err()
-}
-
 // Update 应用乐观锁；要求 expectedVersion 与当前版本一致
 // 字段为 nil 则保持不变；TagIDs 为 nil 不变，空切片清空，非空替换
 func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput) (*Snippet, error) {

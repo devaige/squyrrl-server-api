@@ -1,8 +1,8 @@
-# 开发环境依赖栈：Postgres / Redis / MinIO / NATS / Mailhog
+# 开发环境依赖栈：Postgres / MinIO / NATS / Mailhog
 # 仅用于 dev / test 环境；生产采用托管服务。
 #
 # 主机端口统一加 50000 偏移以避开常见的本地服务和 SSH 隧道：
-#   Postgres 55432  Redis 56379  NATS 54222 / 58222
+#   Postgres 55432  NATS 54222 / 58222
 #   MinIO 59000 / 59001  Mailhog 51025 / 58025
 services:
   postgres:
@@ -18,17 +18,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U squyrrl -d squyrrl"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    container_name: squyrrl-redis
-    ports:
-      - "56379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10

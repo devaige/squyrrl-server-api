@@ -65,21 +65,7 @@ func (h *Handler) list(c *gin.Context) {
 		}
 		in.TagID = &tid
 	}
-	// 全文搜索：若 indexer 支持远端搜索且 q 非空，先拿 id 集合，再 ListByIDs。
-	// 远端搜索故障时 swallow，自动回退到 repo 的 ILIKE 模式。
-	if in.Q != nil && strings.TrimSpace(*in.Q) != "" {
-		ids, hasRemote, _ := h.svc.SearchIDs(c.Request.Context(), id.UserID, *in.Q, in.Limit)
-		if hasRemote && ids != nil {
-			items, err := h.svc.ListByIDs(c.Request.Context(), id.UserID, ids)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(http.StatusOK, ListOutput{Items: items})
-			return
-		}
-	}
-
+	// 全文搜索：q 由 repo 层做 PostgreSQL ILIKE（title / description 子串匹配）。
 	out, err := h.svc.List(c.Request.Context(), id.UserID, &in)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

@@ -9,7 +9,7 @@ APP := squyrrl-api
 help:
 	@echo "可用目标："
 	@echo "  make dev              起开发依赖并运行 API"
-	@echo "  make infra            起开发依赖容器（postgres/redis/minio/nats/mailhog）"
+	@echo "  make infra            起开发依赖容器（postgres/minio/nats/mailhog）"
 	@echo "  make infra-down       停止依赖容器"
 	@echo "  make infra-clean      停止并清空依赖卷"
 	@echo "  make run              直接运行 API（依赖需先就绪）"

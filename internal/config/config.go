@@ -12,8 +12,7 @@ type Config struct {
 
 	DatabaseURL string `env:"SQUYRRL_DATABASE_URL,required"`
 
-	RedisURL string `env:"SQUYRRL_REDIS_URL"`
-	NATSURL  string `env:"SQUYRRL_NATS_URL"`
+	NATSURL string `env:"SQUYRRL_NATS_URL"`
 
 	S3Endpoint  string `env:"SQUYRRL_S3_ENDPOINT"`
 	S3Bucket    string `env:"SQUYRRL_S3_BUCKET"`
@@ -49,11 +48,6 @@ type Config struct {
 	StripeWebhookSecret string `env:"SQUYRRL_STRIPE_WEBHOOK_SECRET"`
 	AppleSharedSecret   string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
 	GooglePubsubAud     string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
-
-	// Meilisearch 全文搜索（空 URL 时退化为 ILIKE）
-	MeiliURL   string `env:"SQUYRRL_MEILI_URL"`
-	MeiliKey   string `env:"SQUYRRL_MEILI_KEY"`
-	MeiliIndex string `env:"SQUYRRL_MEILI_INDEX" envDefault:"squyrrl_snippets"`
 }
 
 func Load() (*Config, error) {
