@@ -11,6 +11,7 @@ import (
 	"github.com/squyrrl/api/internal/features/archive"
 	"github.com/squyrrl/api/internal/features/auth"
 	"github.com/squyrrl/api/internal/features/claim"
+	"github.com/squyrrl/api/internal/features/extapi"
 	"github.com/squyrrl/api/internal/features/file"
 	"github.com/squyrrl/api/internal/features/page"
 	"github.com/squyrrl/api/internal/features/parser"
@@ -38,6 +39,7 @@ type Server struct {
 	archiveSvc *archive.Service
 	subSvc     *subscriptions.Service
 	claimSvc   *claim.Service
+	extapiSvc  *extapi.Service
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
@@ -76,7 +78,8 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	registry.Register(parser.NewRedditProvider())
 	registry.Register(parser.NewGenericOGProvider())
 	walletSvc := wallet.NewService(wallet.NewRepo(pool))
-	parsSvc := parser.NewService(registry, parser.NewCache(pool), walletSvc, cfg.ParseCost)
+	extapiSvc := extapi.NewService(extapi.NewRepo(pool))
+	parsSvc := parser.NewService(registry, parser.NewCache(pool), walletSvc, extapiSvc, cfg.ParseCost)
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
@@ -93,6 +96,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		archiveSvc: archiveSvc,
 		subSvc:     subSvc,
 		claimSvc:   claimSvc,
+		extapiSvc:  extapiSvc,
 	}
 	s.routes()
 	return s
@@ -160,6 +164,7 @@ func (s *Server) routes() {
 	internal.Use(tg.InternalAuth(s.cfg.TGInternalToken))
 	tgHandler.RegisterInternal(internal.Group("/tg"))
 	walletHandler.RegisterInternal(internal.Group("/admin"))
+	extapi.NewHandler(s.extapiSvc).RegisterInternal(internal.Group("/admin"))
 
 	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）
 	subscriptions.NewHandler(

@@ -1,0 +1,200 @@
+package extapi
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Repo struct {
+	pool *pgxpool.Pool
+}
+
+func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
+
+// ListForProvider 取某 provider 下所有 enabled 的 endpoint，按 priority 升序（兜底链顺序），
+// 并附带余额（SUM(delta)）。仅供 Fetch 路径使用。
+func (r *Repo) ListForProvider(ctx context.Context, provider string) ([]Endpoint, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT e.id, e.provider, e.vendor, e.slug, e.priority, e.enabled,
+		       e.unit_price_micros, e.currency, e.config,
+		       COALESCE((SELECT SUM(delta) FROM api_cost_ledger l WHERE l.endpoint_id = e.id), 0)
+		FROM api_endpoints e
+		WHERE e.provider = $1 AND e.enabled
+		ORDER BY e.priority ASC, e.created_at ASC`, provider)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Endpoint
+	for rows.Next() {
+		var e Endpoint
+		var cfg []byte
+		if err := rows.Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
+			&e.UnitPriceMicros, &e.Currency, &cfg, &e.BalanceMicros); err != nil {
+			return nil, err
+		}
+		e.Config = json.RawMessage(cfg)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// List 返回全部 endpoint（跨 provider），附带余额 / 累计消耗 / 调用次数，供管理后台展示。
+func (r *Repo) List(ctx context.Context) ([]Endpoint, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT e.id, e.provider, e.vendor, e.slug, e.priority, e.enabled,
+		       e.unit_price_micros, e.currency, e.config, e.created_at, e.updated_at,
+		       COALESCE(SUM(l.delta), 0),
+		       COALESCE(-SUM(l.delta) FILTER (WHERE l.delta < 0), 0),
+		       COUNT(l.*) FILTER (WHERE l.reason = 'call')
+		FROM api_endpoints e
+		LEFT JOIN api_cost_ledger l ON l.endpoint_id = e.id
+		GROUP BY e.id
+		ORDER BY e.provider, e.priority ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Endpoint
+	for rows.Next() {
+		var e Endpoint
+		var cfg []byte
+		if err := rows.Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
+			&e.UnitPriceMicros, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt,
+			&e.BalanceMicros, &e.SpentMicros, &e.CallCount); err != nil {
+			return nil, err
+		}
+		e.Config = json.RawMessage(cfg)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (r *Repo) Create(ctx context.Context, in CreateEndpointInput) (*Endpoint, error) {
+	enabled := true
+	if in.Enabled != nil {
+		enabled = *in.Enabled
+	}
+	priority := in.Priority
+	if priority == 0 {
+		priority = 100
+	}
+	currency := in.Currency
+	if currency == "" {
+		currency = "USD"
+	}
+	cfg := in.Config
+	if len(cfg) == 0 {
+		cfg = json.RawMessage(`{}`)
+	}
+
+	e := &Endpoint{
+		Provider: in.Provider, Vendor: in.Vendor, Slug: in.Slug,
+		Priority: priority, Enabled: enabled,
+		UnitPriceMicros: in.UnitPriceMicros, Currency: currency, Config: cfg,
+	}
+	err := r.pool.QueryRow(ctx, `
+		INSERT INTO api_endpoints (provider, vendor, slug, priority, enabled, unit_price_micros, currency, config)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, created_at, updated_at`,
+		in.Provider, in.Vendor, in.Slug, priority, enabled, in.UnitPriceMicros, currency, []byte(cfg),
+	).Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// Update 用 COALESCE 做部分更新：nil 参数保持原值，无需拼动态 SQL。
+func (r *Repo) Update(ctx context.Context, id uuid.UUID, in UpdateEndpointInput) error {
+	var cfg []byte
+	if in.Config != nil {
+		cfg = []byte(*in.Config)
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE api_endpoints SET
+			vendor            = COALESCE($2, vendor),
+			priority          = COALESCE($3, priority),
+			enabled           = COALESCE($4, enabled),
+			unit_price_micros = COALESCE($5, unit_price_micros),
+			currency          = COALESCE($6, currency),
+			config            = COALESCE($7, config)
+		WHERE id = $1`,
+		id, in.Priority, in.Enabled, in.UnitPriceMicros, in.Currency, cfg,
+	)
+	return err
+}
+
+func (r *Repo) Get(ctx context.Context, id uuid.UUID) (*Endpoint, error) {
+	var e Endpoint
+	var cfg []byte
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, provider, vendor, slug, priority, enabled, unit_price_micros, currency, config, created_at, updated_at
+		FROM api_endpoints WHERE id = $1`, id).
+		Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
+			&e.UnitPriceMicros, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	e.Config = json.RawMessage(cfg)
+	return &e, nil
+}
+
+// RecordCost 记一笔平台成本流水（追加，不改可变余额列）。
+func (r *Repo) RecordCost(ctx context.Context, endpointID uuid.UUID, deltaMicros int64, reason, resourceID string) error {
+	var rid *string
+	if resourceID != "" {
+		rid = &resourceID
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO api_cost_ledger (endpoint_id, delta, reason, resource_id) VALUES ($1, $2, $3, $4)`,
+		endpointID, deltaMicros, reason, rid)
+	return err
+}
+
+func (r *Repo) InsertSample(ctx context.Context, endpointID uuid.UUID, kind, resourceID string,
+	request, response []byte, httpStatus, latencyMs int, note string) error {
+	var rid, nt *string
+	if resourceID != "" {
+		rid = &resourceID
+	}
+	if note != "" {
+		nt = &note
+	}
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO api_samples (endpoint_id, kind, resource_id, request, response, http_status, latency_ms, note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		endpointID, kind, rid, request, response, httpStatus, latencyMs, nt)
+	return err
+}
+
+func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, endpoint_id, kind, COALESCE(resource_id, ''), request, response,
+		       COALESCE(http_status, 0), COALESCE(latency_ms, 0), COALESCE(note, ''), created_at
+		FROM api_samples WHERE endpoint_id = $1
+		ORDER BY created_at DESC LIMIT 100`, endpointID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Sample
+	for rows.Next() {
+		var s Sample
+		var req, resp []byte
+		if err := rows.Scan(&s.ID, &s.EndpointID, &s.Kind, &s.ResourceID, &req, &resp,
+			&s.HTTPStatus, &s.LatencyMs, &s.Note, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		s.Request = json.RawMessage(req)
+		s.Response = json.RawMessage(resp)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
