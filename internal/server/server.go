@@ -24,13 +24,13 @@ import (
 )
 
 type Server struct {
-	cfg     *config.Config
-	pool    *pgxpool.Pool
-	engine  *gin.Engine
-	authSvc *auth.Service
-	pageSvc *page.Service
-	tagRepo *tag.Repo
-	snipSvc *snippet.Service
+	cfg        *config.Config
+	pool       *pgxpool.Pool
+	engine     *gin.Engine
+	authSvc    *auth.Service
+	pageSvc    *page.Service
+	tagRepo    *tag.Repo
+	snipSvc    *snippet.Service
 	fileSvc    *file.Service
 	parsSvc    *parser.Service
 	tgSvc      *tg.Service
@@ -64,7 +64,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 
 	authSvc := auth.NewService(
 		auth.NewRepo(pool),
-		auth.NewMailer(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPass, cfg.SMTPFrom),
+		auth.NewMailer(cfg.ResendAPIKey, cfg.MailFrom),
 	)
 	pageSvc := page.NewService(page.NewRepo(pool))
 	tagRepo := tag.NewRepo(pool)
@@ -159,12 +159,20 @@ func (s *Server) routes() {
 	walletHandler.RegisterUser(meGroup)
 	claim.NewHandler(s.claimSvc).Register(meGroup)
 
-	// 内部端：受 X-Internal-Token 头保护，不挂 Bearer 中间件
+	// 内部端：受 X-Internal-Token 头保护，不挂 Bearer 中间件。
+	// 按最小权限拆两个守卫（tg.InternalAuth 是通用的 header 比对器，可复用于不同 token）：
+	// Bot 只持 TG token（够用 /internal/tg）；管理后台持独立 InternalToken 才能碰 /internal/admin
+	// （发币、改 endpoint 密钥等高危）。两段互不越权，Bot 凭证泄漏不波及管理端。
 	internal := s.engine.Group("/internal")
-	internal.Use(tg.InternalAuth(s.cfg.TGInternalToken))
-	tgHandler.RegisterInternal(internal.Group("/tg"))
-	walletHandler.RegisterInternal(internal.Group("/admin"))
-	extapi.NewHandler(s.extapiSvc).RegisterInternal(internal.Group("/admin"))
+
+	tgInternal := internal.Group("/tg")
+	tgInternal.Use(tg.InternalAuth(s.cfg.TGInternalToken))
+	tgHandler.RegisterInternal(tgInternal)
+
+	adminInternal := internal.Group("/admin")
+	adminInternal.Use(tg.InternalAuth(s.cfg.InternalToken))
+	walletHandler.RegisterInternal(adminInternal)
+	extapi.NewHandler(s.extapiSvc).RegisterInternal(adminInternal)
 
 	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）
 	subscriptions.NewHandler(

@@ -12,32 +12,35 @@ type Config struct {
 
 	DatabaseURL string `env:"SQUYRRL_DATABASE_URL,required"`
 
-	NATSURL string `env:"SQUYRRL_NATS_URL"`
-
-	S3Endpoint  string `env:"SQUYRRL_S3_ENDPOINT"`
-	S3Bucket    string `env:"SQUYRRL_S3_BUCKET"`
+	S3Endpoint string `env:"SQUYRRL_S3_ENDPOINT"`
+	// bucket 名跨环境固定为 squyrrl：设成默认值而非 required，好把这一行从所有 env 模板里彻底
+	// 移除（dev MinIO 启动自动建桶，prod R2 预建同名桶即可）。真要改仍可用环境变量覆盖。
+	S3Bucket    string `env:"SQUYRRL_S3_BUCKET" envDefault:"squyrrl"`
 	S3AccessKey string `env:"SQUYRRL_S3_ACCESS_KEY"`
 	S3SecretKey string `env:"SQUYRRL_S3_SECRET_KEY"`
 	S3UseSSL    bool   `env:"SQUYRRL_S3_USE_SSL" envDefault:"false"`
 
-	SMTPHost string `env:"SQUYRRL_SMTP_HOST" envDefault:"localhost"`
-	SMTPPort int    `env:"SQUYRRL_SMTP_PORT" envDefault:"51025"`
-	SMTPUser string `env:"SQUYRRL_SMTP_USER"`
-	SMTPPass string `env:"SQUYRRL_SMTP_PASS"`
-	SMTPFrom string `env:"SQUYRRL_SMTP_FROM" envDefault:"Squyrrl <noreply@squyrrl.app>"`
+	// 邮件走 Resend HTTP API。ResendAPIKey 为空时进入本地日志模式（不外发，见 auth.Mailer）。
+	ResendAPIKey string `env:"SQUYRRL_RESEND_API_KEY"`
+	MailFrom     string `env:"SQUYRRL_MAIL_FROM" envDefault:"Squyrrl <noreply@squyrrl.app>"`
 
-	// TG Bot 与 API 之间的内部 token（仅 server-to-server，不暴露给客户端）
+	// 内部 server-to-server token，按端点分权（最小权限）：
+	//   TGInternalToken 守 /internal/tg（Bot 绑定/转发碎片）；InternalToken 守 /internal/admin
+	//   （发币、改第三方 endpoint 密钥等高危）。取不同值：Bot 凭证泄漏也碰不到管理端。
+	//   任一为空 ⇒ 对应端点组整体 401（fail-closed，见 tg.InternalAuth）。
 	TGInternalToken string `env:"SQUYRRL_TG_INTERNAL_TOKEN"`
+	InternalToken   string `env:"SQUYRRL_INTERNAL_TOKEN"`
 
 	// WebAuthn / Passkey
-	WebAuthnRPID     string   `env:"SQUYRRL_WEBAUTHN_RP_ID"     envDefault:"localhost"`
-	WebAuthnRPName   string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`
-	WebAuthnOrigins  []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:8080,http://localhost:3000"`
+	WebAuthnRPID    string   `env:"SQUYRRL_WEBAUTHN_RP_ID"     envDefault:"localhost"`
+	WebAuthnRPName  string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`
+	WebAuthnOrigins []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:8080,http://localhost:3000"`
 
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`
 
-	// URI 解析每次 cache-miss 扣减的 credits；<=0 时不强制（dev / free tier）
+	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
+	// 跨环境统一走默认值 2，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。
 	ParseCost int64 `env:"SQUYRRL_PARSE_COST" envDefault:"2"`
 
 	// URL 归档 renderer 链：'light' 单次 GET；'chromedp' headless Chrome inline 资源；

@@ -1,38 +1,34 @@
 package auth
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
-	"mime"
-	"net/mail"
-	"net/smtp"
-	"strings"
+	"net/http"
+	"time"
 )
 
-// Mailer 用 net/smtp 发邮件。dev 环境对接 Mailhog，无 auth、无 TLS。
+const resendEndpoint = "https://api.resend.com/emails"
+
+// Mailer 通过 Resend HTTP API 发送邮件。
+//
+// apiKey 为空时进入「本地日志模式」：不外发，直接把验证码打到日志。这样本地开发
+// `cp .env.example .env` 后无需任何真实密钥即可跑通登录流程（OTP 从
+// `docker compose logs api` 里读）。这也是移除 Mailhog 依赖的前提——dev 不再需要
+// 一个 SMTP 捕获容器，空 key 即等价于「不发信」。
 type Mailer struct {
-	addr        string // host:port
-	auth        smtp.Auth
-	from        string // 完整 From 头，例如 "Squyrrl <noreply@squyrrl.app>"
-	fromAddress string // 仅地址部分，作为 SMTP 信封 MAIL FROM
+	apiKey string
+	from   string // 完整 From 头，例如 "Squyrrl <noreply@squyrrl.app>"；须为 Resend 已验证发信域
+	client *http.Client
 }
 
-func NewMailer(host string, port int, user, pass, from string) *Mailer {
-	var auth smtp.Auth
-	if user != "" {
-		auth = smtp.PlainAuth("", user, pass, host)
-	}
-
-	fromAddr := from
-	if parsed, err := mail.ParseAddress(from); err == nil {
-		fromAddr = parsed.Address
-	}
-
+func NewMailer(apiKey, from string) *Mailer {
 	return &Mailer{
-		addr:        fmt.Sprintf("%s:%d", host, port),
-		auth:        auth,
-		from:        from,
-		fromAddress: fromAddr,
+		apiKey: apiKey,
+		from:   from,
+		client: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -44,26 +40,49 @@ func (m *Mailer) SendOTP(to, code string) error {
 			"该验证码 10 分钟内有效。如非本人操作请忽略本邮件。\n",
 		code,
 	)
-	msg := buildMessage(m.from, to, subject, body)
 
-	if err := smtp.SendMail(m.addr, m.auth, m.fromAddress, []string{to}, msg); err != nil {
+	// 未配置 key：本地开发退化为日志输出（含明文 code），不外发。仅在无 key 时发生，
+	// 生产必配 SQUYRRL_RESEND_API_KEY，不会走到这里。
+	if m.apiKey == "" {
+		slog.Warn("RESEND_API_KEY 未配置，OTP 改为日志输出（仅限本地开发）", "to", to, "code", code)
+		return nil
+	}
+
+	return m.send(to, subject, body)
+}
+
+func (m *Mailer) send(to, subject, text string) error {
+	payload, err := json.Marshal(map[string]any{
+		"from":    m.from,
+		"to":      []string{to},
+		"subject": subject,
+		"text":    text,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, resendEndpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+m.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.client.Do(req)
+	if err != nil {
 		slog.Error("OTP 邮件发送失败", "to", to, "err", err)
 		return err
 	}
+	defer resp.Body.Close()
+
+	// Resend 成功返回 2xx（body 携带 {"id":...}）；非 2xx 回读 body（限长）便于排错
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		slog.Error("OTP 邮件发送失败", "to", to, "status", resp.StatusCode, "body", string(msg))
+		return fmt.Errorf("resend 返回 %d: %s", resp.StatusCode, msg)
+	}
+
 	slog.Info("OTP 邮件已发送", "to", to)
 	return nil
-}
-
-// buildMessage 拼装一封 UTF-8 文本邮件，主题做 RFC 2047 编码以容纳中文
-func buildMessage(from, to, subject, body string) []byte {
-	var sb strings.Builder
-	sb.WriteString("From: " + from + "\r\n")
-	sb.WriteString("To: " + to + "\r\n")
-	sb.WriteString("Subject: " + mime.QEncoding.Encode("UTF-8", subject) + "\r\n")
-	sb.WriteString("MIME-Version: 1.0\r\n")
-	sb.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n")
-	sb.WriteString("\r\n")
-	sb.WriteString(body)
-	return []byte(sb.String())
 }

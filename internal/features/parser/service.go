@@ -17,22 +17,35 @@ type Service struct {
 	cache     *Cache
 	wallet    *wallet.Service
 	extapi    *extapi.Service // 第三方付费 API 供应层；nil 时全部走内置免费实现
-	cacheCost int64           // 每次 cache-miss 真上行解析时扣减的 credits；<=0 时不扣
+	parseCost int64           // 每次解析请求扣减的 credits（命中/未命中一致）；<=0 时不扣
 }
 
-func NewService(registry *Registry, cache *Cache, walletSvc *wallet.Service, extapiSvc *extapi.Service, cacheCost int64) *Service {
-	return &Service{registry: registry, cache: cache, wallet: walletSvc, extapi: extapiSvc, cacheCost: cacheCost}
+func NewService(registry *Registry, cache *Cache, walletSvc *wallet.Service, extapiSvc *extapi.Service, parseCost int64) *Service {
+	return &Service{registry: registry, cache: cache, wallet: walletSvc, extapi: extapiSvc, parseCost: parseCost}
 }
 
-// Parse 是 Service 主入口：先按 URI 选 provider → 命中缓存即返回 → 否则扣费 → 抓取 → 写缓存
+// Parse 是 Service 主入口：先按 URI 选 provider → 扣费 → 命中缓存即返回 → 否则抓取 → 写缓存
 //
-// cache 命中（cached=true）**不扣 credits**：跨用户复用已付过钱的解析结果。
-// cache miss → 触发上游真实调用 → 扣 cacheCost 个 credits（per ADR-013）。
+// 计费策略（2026-07-05 起）：**每次解析请求都按 parseCost 扣 credits，命中/未命中一致**。
+// 故扣费点前移到缓存查询之前——改为「按请求计价」，用户侧价格模型更简单、更可预期。
+// （原「命中免费」设计已废止，见 ADR-046 更新。）parseCost<=0 时整体不扣。
 // 余额不足返 wallet.ErrInsufficientCredits（handler 映射到 402）。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*ParseResponse, error) {
 	p, resourceID, ok := s.registry.Find(uri)
 	if !ok {
-		return nil, ErrNoParser
+		return nil, ErrNoParser // 无法解析的 URI 不产生费用
+	}
+
+	// 先扣费再查缓存：命中也计费。放在 registry.Find 之后，保证只有「可解析」的请求才扣。
+	if s.parseCost > 0 {
+		reason := "parse_uri:" + p.Provider()
+		if _, err := s.wallet.Consume(ctx, userID, s.parseCost, reason); err != nil {
+			if errors.Is(err, wallet.ErrInsufficientCredits) {
+				return nil, wallet.ErrInsufficientCredits
+			}
+			slog.Warn("parse credits 扣费失败", "err", err)
+			return nil, err
+		}
 	}
 
 	if cached, hit, err := s.cache.Get(ctx, p.Provider(), resourceID); err != nil {
@@ -44,18 +57,6 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*Par
 			Snippet:    cached,
 			Cached:     true,
 		}, nil
-	}
-
-	// cache miss → 扣费（dev 配置 cacheCost=0 时跳过）
-	if s.cacheCost > 0 {
-		reason := "parse_uri:" + p.Provider()
-		if _, err := s.wallet.Consume(ctx, userID, s.cacheCost, reason); err != nil {
-			if errors.Is(err, wallet.ErrInsufficientCredits) {
-				return nil, wallet.ErrInsufficientCredits
-			}
-			slog.Warn("parse credits 扣费失败", "err", err)
-			return nil, err
-		}
 	}
 
 	res, err := s.fetch(ctx, p, uri, resourceID)

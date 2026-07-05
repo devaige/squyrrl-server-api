@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
-DOCKER_COMPOSE := docker compose -f docker-compose.dev.yml
+# dev 依赖栈已统一归置到 server/ops/（与生产 compose 并排）
+DOCKER_COMPOSE := docker compose -f ../../ops/docker-compose.dev.yml
 BIN_DIR := bin
 APP := squyrrl-api
 
@@ -9,7 +10,7 @@ APP := squyrrl-api
 help:
 	@echo "可用目标："
 	@echo "  make dev              起开发依赖并运行 API"
-	@echo "  make infra            起开发依赖容器（postgres/minio/nats/mailhog）"
+	@echo "  make infra            起开发依赖容器（postgres/minio）"
 	@echo "  make infra-down       停止依赖容器"
 	@echo "  make infra-clean      停止并清空依赖卷"
 	@echo "  make run              直接运行 API（依赖需先就绪）"
@@ -22,8 +23,9 @@ help:
 
 dev: infra run
 
+# 只起依赖容器（应用已容器化，全套由 server/ops 的 dev compose 起；此目标供原生逃生跑 API 时用）
 infra:
-	$(DOCKER_COMPOSE) up -d
+	$(DOCKER_COMPOSE) up -d postgres minio
 	@echo "等待依赖就绪..."
 	@sleep 3
 
