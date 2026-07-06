@@ -531,45 +531,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /snippets/{id}/archive:
-    parameters:
-      - $ref: '#/components/parameters/UUIDPath'
-    post:
-      operationId: archiveSnippet
-      tags: [Snippets]
-      summary: 抓取 URL 碎片原始内容并作为附件入库
-      description: |
-        - 仅适用于 `type=url` 的碎片
-        - 服务端用 `net/http` 抓取 `payload.url` 一次（5 MiB 上限），**不执行 JS、不内联资源**
-          —— ADR-006 完整 SingleFile 留作 Phase 2（chromedp / headless Chrome）
-        - 抓到的字节作为 `text/html`（或上游 Content-Type）上传到 files 表
-        - 创建一条 element 记录挂在该 snippet 下，alt_text 固定为 `Archived HTML`
-        - snippet.version 自增 1，让客户端通过 sync 流拉到新 element
-        - 同一 URL 多次 archive：files 去重，但仍会插入新 element（用户可手动删除）
-      responses:
-        '200':
-          description: 已归档
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ArchiveResponse' }
-        '400':
-          description: snippet 非 URL 类型 / payload 缺 url 字段 / 解析 ID 失败
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '413':
-          description: 目标内容超过 5MiB
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-        '502':
-          description: 抓取上游失败
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
   # ---------------------------------------------------------------- Files
   /files/check:
     post:
@@ -1466,20 +1427,6 @@ components:
           type: string
           format: uuid
           description: 用户的「冲突收件箱」系统页面 ID
-
-    # ---------- 归档 ----------
-    ArchiveResponse:
-      type: object
-      required: [snippet_id, file_id, element_id, size_bytes, mime]
-      properties:
-        snippet_id: { type: string, format: uuid }
-        file_id: { type: string, format: uuid }
-        element_id: { type: string, format: uuid }
-        size_bytes:
-          type: integer
-          format: int64
-          description: 抓到的原始字节数（≤ 5 MiB）
-        mime: { type: string, examples: [text/html] }
 
     # ---------- 钱包 ----------
     Wallet:

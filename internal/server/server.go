@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/squyrrl/api/internal/config"
-	"github.com/squyrrl/api/internal/features/archive"
 	"github.com/squyrrl/api/internal/features/auth"
 	"github.com/squyrrl/api/internal/features/claim"
 	"github.com/squyrrl/api/internal/features/extapi"
@@ -36,7 +35,6 @@ type Server struct {
 	tgSvc      *tg.Service
 	passkeySvc *auth.PasskeyService
 	walletSvc  *wallet.Service
-	archiveSvc *archive.Service
 	subSvc     *subscriptions.Service
 	claimSvc   *claim.Service
 	extapiSvc  *extapi.Service
@@ -83,7 +81,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
-	archiveSvc := archive.NewService(pool, snipSvc, fileSvc, buildArchiveRenderers(cfg.ArchiveRenderers)...)
 	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc)
 	claimSvc := claim.NewService(pool)
 
@@ -93,7 +90,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		snipSvc: snipSvc, fileSvc: fileSvc, parsSvc: parsSvc, tgSvc: tgSvc,
 		passkeySvc: passkeySvc,
 		walletSvc:  walletSvc,
-		archiveSvc: archiveSvc,
 		subSvc:     subSvc,
 		claimSvc:   claimSvc,
 		extapiSvc:  extapiSvc,
@@ -103,24 +99,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 }
 
 func (s *Server) Handler() http.Handler { return s.engine }
-
-// buildArchiveRenderers 按 cfg.ArchiveRenderers 数组按序构造 renderer。
-// 未知名字静默忽略；空数组退化为 light。
-func buildArchiveRenderers(names []string) []archive.Renderer {
-	out := make([]archive.Renderer, 0, len(names))
-	for _, n := range names {
-		switch n {
-		case "light", "":
-			out = append(out, archive.NewLightRenderer())
-		case "chromedp":
-			out = append(out, archive.NewChromeRenderer())
-		}
-	}
-	if len(out) == 0 {
-		out = append(out, archive.NewLightRenderer())
-	}
-	return out
-}
 
 func (s *Server) routes() {
 	s.engine.GET("/health", s.handleHealth)
@@ -148,7 +126,6 @@ func (s *Server) routes() {
 	snippet.NewHandler(s.snipSvc).Register(api.Group("/snippets"))
 	file.NewHandler(s.fileSvc).Register(api.Group("/files"))
 	parser.NewHandler(s.parsSvc).Register(api.Group("/uris"))
-	archive.NewHandler(s.archiveSvc).Register(api) // 注册到 /snippets/:id/archive
 
 	tgHandler := tg.NewHandler(s.tgSvc)
 	tgHandler.RegisterUser(api.Group("/tg"))

@@ -43,10 +43,6 @@ type Config struct {
 	// 跨环境统一走默认值 2，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。
 	ParseCost int64 `env:"SQUYRRL_PARSE_COST" envDefault:"2"`
 
-	// URL 归档 renderer 链：'light' 单次 GET；'chromedp' headless Chrome inline 资源；
-	// 'chromedp,light' 优先 chromedp，失败回退 light（推荐生产配置，需系统装 Chrome）
-	ArchiveRenderers []string `env:"SQUYRRL_ARCHIVE_RENDERERS" envSeparator:"," envDefault:"light"`
-
 	// 订阅 webhook 签名密钥（任一为空表示该 provider 不启用）
 	StripeWebhookSecret string `env:"SQUYRRL_STRIPE_WEBHOOK_SECRET"`
 	AppleSharedSecret   string `env:"SQUYRRL_APPLE_SHARED_SECRET"`

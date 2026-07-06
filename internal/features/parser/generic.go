@@ -19,8 +19,8 @@ import (
 //   - Parse 抓取 HTML，解析 <title> 与 og:* / name= meta 标签
 //   - 输出的 SnippetType="url"，对应链接（URL）碎片
 //
-// 比真正的 SingleFile 存档轻：不下载图片、不内联资源；目的是给客户端一个有意义的卡片预览。
-// 完整 SingleFile（chromedp）留待 Phase 2。
+// 只提取元信息、不下载图片、不内联资源；目的是给客户端一个有意义的卡片预览。
+// （服务端完整存档已移除，见 memory.md ADR-048；完整 SingleFile 归档拟由客户端承担。）
 type GenericOGProvider struct {
 	client *http.Client
 }
