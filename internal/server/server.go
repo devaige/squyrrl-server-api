@@ -125,7 +125,10 @@ func (s *Server) routes() {
 	tag.NewHandler(s.tagRepo).Register(api.Group("/tags"))
 	snippet.NewHandler(s.snipSvc).Register(api.Group("/snippets"))
 	file.NewHandler(s.fileSvc).Register(api.Group("/files"))
-	parser.NewHandler(s.parsSvc).Register(api.Group("/uris"))
+	parserHandler := parser.NewHandler(s.parsSvc)
+	parserHandler.Register(api.Group("/uris")) // POST /uris/parse（鉴权 + 计费）
+	// GET /uris/manifest 走公开 group（无 Bearer 中间件）：匿名客户端也需要清单做本地判断
+	parserHandler.RegisterPublic(s.engine.Group("/uris"))
 
 	tgHandler := tg.NewHandler(s.tgSvc)
 	tgHandler.RegisterUser(api.Group("/tg"))

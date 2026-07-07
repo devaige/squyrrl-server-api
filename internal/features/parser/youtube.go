@@ -32,6 +32,11 @@ var ytIDPattern = regexp.MustCompile(
 func (p *YouTubeProvider) Provider() string    { return "youtube" }
 func (p *YouTubeProvider) SnippetType() string { return "special" }
 
+// MatchPatterns 导出与 Match 完全同一份正则（.String() 取源串），进 manifest 给客户端本地判断。
+func (p *YouTubeProvider) MatchPatterns() []string { return []string{ytIDPattern.String()} }
+
+var _ ManifestProvider = (*YouTubeProvider)(nil)
+
 func (p *YouTubeProvider) Match(uri string) (string, bool) {
 	m := ytIDPattern.FindStringSubmatch(uri)
 	if m == nil {
@@ -88,5 +93,7 @@ func (p *YouTubeProvider) Parse(ctx context.Context, uri, resourceID string) (*P
 		Title:      &title,
 		Payload:    payload,
 		SourceData: source,
+		// oEmbed 缩略图恒为 jpg；提出来让客户端下载→挂 element，坍塌成普通碎片后仍留存。
+		Assets: mediaAsset(raw.ThumbnailURL, "thumbnail", "image/jpeg"),
 	}, nil
 }

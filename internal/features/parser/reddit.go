@@ -30,6 +30,10 @@ var redditIDPattern = regexp.MustCompile(
 func (p *RedditProvider) Provider() string    { return "reddit" }
 func (p *RedditProvider) SnippetType() string { return "special" }
 
+func (p *RedditProvider) MatchPatterns() []string { return []string{redditIDPattern.String()} }
+
+var _ ManifestProvider = (*RedditProvider)(nil)
+
 func (p *RedditProvider) Match(uri string) (string, bool) {
 	m := redditIDPattern.FindStringSubmatch(uri)
 	if m == nil {
@@ -121,5 +125,7 @@ func (p *RedditProvider) Parse(ctx context.Context, uri, resourceID string) (*Pa
 		Description: desc,
 		Payload:     payload,
 		SourceData:  source,
+		// post.Thumbnail 常是 "self"/"default"/"nsfw"/"" 等占位串，mediaAsset 只放行真 http 地址。
+		Assets: mediaAsset(post.Thumbnail, "thumbnail", ""),
 	}, nil
 }

@@ -29,6 +29,10 @@ var gistIDPattern = regexp.MustCompile(`gist\.github\.com/[^/]+/([a-zA-Z0-9]+)`)
 func (p *GistProvider) Provider() string    { return "gist" }
 func (p *GistProvider) SnippetType() string { return "special" }
 
+func (p *GistProvider) MatchPatterns() []string { return []string{gistIDPattern.String()} }
+
+var _ ManifestProvider = (*GistProvider)(nil)
+
 func (p *GistProvider) Match(uri string) (string, bool) {
 	m := gistIDPattern.FindStringSubmatch(uri)
 	if m == nil {

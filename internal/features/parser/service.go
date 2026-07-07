@@ -24,6 +24,9 @@ func NewService(registry *Registry, cache *Cache, walletSvc *wallet.Service, ext
 	return &Service{registry: registry, cache: cache, wallet: walletSvc, extapi: extapiSvc, parseCost: parseCost}
 }
 
+// Manifest 透传 registry 的受支持解析清单，供 handler 的公开 /uris/manifest 端点导出。
+func (s *Service) Manifest() Manifest { return s.registry.Manifest() }
+
 // Parse 是 Service 主入口：先按 URI 选 provider → 扣费 → 命中缓存即返回 → 否则抓取 → 写缓存
 //
 // 计费策略（2026-07-05 起）：**每次解析请求都按 parseCost 扣 credits，命中/未命中一致**。
@@ -78,6 +81,7 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*Par
 		Payload:     res.Payload,
 		SourceType:  "upstream",
 		SourceData:  res.SourceData,
+		Assets:      res.Assets,
 	}
 
 	if err := s.cache.Put(ctx, p.Provider(), resourceID, snip); err != nil {
@@ -125,7 +129,11 @@ func fetchToResult(provider, uri, resourceID string, fr *extapi.FetchResult) *Pa
 		"author_url":  fr.AuthorURL,
 		"via":         fr.EndpointSlug,
 	})
-	res := &ParseResult{Payload: payload, SourceData: source}
+	res := &ParseResult{
+		Payload:    payload,
+		SourceData: source,
+		Assets:     mediaAsset(fr.ThumbnailURL, "thumbnail", ""),
+	}
 	if fr.Title != "" {
 		t := fr.Title
 		res.Title = &t

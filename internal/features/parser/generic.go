@@ -96,6 +96,8 @@ func (p *GenericOGProvider) Parse(ctx context.Context, uri, _ string) (*ParseRes
 		Description: toPtr(finalDesc),
 		Payload:     payload,
 		SourceData:  source,
+		// og:image 是相对/协议相对时不放行（mediaAsset 只认绝对 http(s)），避免客户端下载失败。
+		Assets: mediaAsset(meta["og:image"], "image", ""),
 	}, nil
 }
 
