@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
-# dev 依赖栈已统一归置到 server/ops/（与生产 compose 并排）
-DOCKER_COMPOSE := docker compose -f ../../ops/docker-compose.dev.yml
+# dev 依赖栈已统一归置到 server/（与生产 compose 并排）
+DOCKER_COMPOSE := docker compose -f ../../docker-compose.dev.yml
 BIN_DIR := bin
 APP := squyrrl-api
 
@@ -23,7 +23,7 @@ help:
 
 dev: infra run
 
-# 只起依赖容器（应用已容器化，全套由 server/ops 的 dev compose 起；此目标供原生逃生跑 API 时用）
+# 只起依赖容器（应用已容器化，全套由 server 的 dev compose 起；此目标供原生逃生跑 API 时用）
 infra:
 	$(DOCKER_COMPOSE) up -d postgres minio
 	@echo "等待依赖就绪..."
