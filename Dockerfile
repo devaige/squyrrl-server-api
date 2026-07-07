@@ -12,14 +12,23 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
 
+# module 代理可覆盖：默认走国内镜像(goproxy.cn)避开 proxy.golang.org 被墙/EOF；
+# 境外/CI 环境用 `--build-arg GOPROXY=https://proxy.golang.org,direct` 即可切回官方。
+# ,direct 兜底：镜像缺某模块时直连源仓库，不至于卡死。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 # 缓存依赖层
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# goose 版本钉死为与 go.mod 一致的 v3.27.1（原 @latest 每次都要向 proxy 拉 @v/list
+# 做版本解析——既不可复现，又正是本次 EOF 的触发点）。goose v3 本就是本项目库依赖，
+# 该版本已在 go mod download 时进缓存，install CLI 子包无需再联网解析。
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/squyrrl-api ./cmd/api \
- && go install github.com/pressly/goose/v3/cmd/goose@latest \
+ && go install github.com/pressly/goose/v3/cmd/goose@v3.27.1 \
  && cp "$(go env GOPATH)/bin/goose" /out/goose
 
 # -------- 运行阶段 --------
