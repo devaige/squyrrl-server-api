@@ -1,0 +1,44 @@
+# =============================================================================
+# Squyrrl API — 独立生产部署单元
+#
+# 本文件只管 api 一个服务。其余服务各有自己的 docker-compose.prod.yml，
+# 部署生命周期完全独立：重启 api 不会碰 tgbot / admin（2026-09-03 拆分）。
+#
+# 服务间通信走 external network `squyrrl`：admin / tgbot 用容器名 `api:8080`
+# 直连，流量不出宿主、不经公网、无需在 nginx 上开内部路由。网络由部署方预先
+# 创建（`make -C server net` 或 CI 自动建），故此处声明 external —— 若写成
+# 非 external，四个 compose 项目会各建一张同名网络而互相看不见。
+#
+# 端口只发布到 127.0.0.1，由宿主 nginx 反代到 api.squyrrl.app（见同目录 nginx.conf）。
+#
+# 部署（在本目录执行）：
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# 注意 --env-file 不能省：容器内的变量靠下方 env_file 注入，但 ${SQUYRRL_API_PORT}
+# 这类 compose 自身的插值只读 shell 环境和 --env-file，两者作用域不同。
+# =============================================================================
+
+# 钉死项目名：否则 compose 拿所在目录名（squyrrl）当项目名，四个服务会撞成同一个项目。
+name: squyrrl-api
+
+services:
+  api:
+    build:
+      context: .
+    container_name: squyrrl-api
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      SQUYRRL_ENV: prod
+      SQUYRRL_HTTP_ADDR: ":8080"
+      # SQUYRRL_DATABASE_URL 不在此覆盖：由 .env.prod 提供，指向外部托管云 Postgres。
+    ports:
+      - "127.0.0.1:${SQUYRRL_API_PORT:-8080}:8080"
+    networks:
+      - squyrrl
+
+networks:
+  squyrrl:
+    name: squyrrl
+    external: true

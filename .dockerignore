@@ -5,3 +5,8 @@
 bin/
 *.log
 README*.md
+
+# 部署产物不进构建上下文：它们与镜像内容无关，但 Dockerfile 的 `COPY . .`
+# 会把它们算进层哈希 —— 改一行 compose 就白白让整个编译层缓存失效。
+docker-compose*.yml
+nginx.conf
