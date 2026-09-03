@@ -1,0 +1,98 @@
+# =============================================================================
+# Squyrrl API — 本地开发编排（自带依赖，单仓库自足）
+#
+# 拆仓后（2026-09-03）不再有 server/docker-compose.dev.yml 那份「一条命令起全栈」
+# 的总编排：每个服务仓库自带 dev compose，克隆哪个就只起哪个。
+#
+# 本文件是唯一持有 postgres / minio 的 dev 编排 —— api 是全栈里唯一直连数据库和
+# 对象存储的服务，依赖跟着它走最自然。由此本机开发的启动顺序天然是「api 先起」：
+# 网络 squyrrl 由本文件创建（下方 networks 未写 external），tgbot / admin 的 dev
+# compose 以 external 方式加入。这与生产刻意不对称 —— 生产四份 compose 全部声明
+# external、网络由各自的 deploy workflow 幂等预建，因为线上不该有任何一个服务
+# 「顺带」创建全局资源（谁先起谁建 = 谁先停谁可能拆）；dev 要的则是零前置步骤。
+#
+# 用法：
+#   cp .env.example .env                                  # 首次
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml logs -f api
+#   只起依赖（配合 make run 原生跑 API）：  ... up -d postgres minio
+#
+# 端口：依赖统一 +50000 偏移避开常见本地服务；api 直用 8080。均可用 .env 覆盖。
+# =============================================================================
+
+# 钉死项目名：否则 compose 拿目录名（api）当项目名，与其他仓库的 dev 栈撞车。
+name: squyrrl-api-dev
+
+services:
+  # ============ 基础设施（dev 自托管；生产改用云 Postgres / Cloudflare R2） ============
+  postgres:
+    image: postgres:16-alpine
+    container_name: squyrrl-postgres
+    environment:
+      POSTGRES_USER: squyrrl
+      POSTGRES_PASSWORD: squyrrl_dev
+      POSTGRES_DB: squyrrl
+    ports:
+      - "${SQUYRRL_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U squyrrl -d squyrrl"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - squyrrl
+
+  minio:
+    image: minio/minio:latest
+    container_name: squyrrl-minio
+    environment:
+      MINIO_ROOT_USER: squyrrl
+      MINIO_ROOT_PASSWORD: squyrrl_dev_secret
+    command: server /data --console-address ":9001"
+    ports:
+      - "${SQUYRRL_MINIO_API_PORT:-59000}:9000"      # S3 API
+      - "${SQUYRRL_MINIO_CONSOLE_PORT:-59001}:9001"  # 控制台
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - squyrrl
+
+  # ============ 应用（与生产同一份 Dockerfile，只是喂不同的 env） ============
+  api:
+    build:
+      context: .
+    container_name: squyrrl-api
+    env_file:
+      - .env
+    environment:
+      # .env 是「原生 go run」模板，里面写的是宿主地址（localhost:55432 / :59000）。
+      # 容器里必须换成 compose 服务名，故在此覆盖 —— environment 的优先级高于
+      # env_file，一份模板因此能同时服务原生开发和容器开发，不必维护两套。
+      SQUYRRL_ENV: dev
+      SQUYRRL_DATABASE_URL: postgres://squyrrl:squyrrl_dev@postgres:5432/squyrrl?sslmode=disable
+      SQUYRRL_S3_ENDPOINT: http://minio:9000
+    ports:
+      - "${SQUYRRL_API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - squyrrl
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  # 非 external：本文件负责创建它，tgbot / admin 的 dev compose 以 external 加入。
+  squyrrl:
+    name: squyrrl

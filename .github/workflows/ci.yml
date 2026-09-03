@@ -1,0 +1,28 @@
+# =============================================================================
+# Squyrrl API · CI
+#
+# 拆仓后（2026-09-03）CI 随代码下放到本仓库：push 本仓库即触发本仓库的检查，
+# 不再需要先更新父仓库 squyrrl 的 submodule 指针。这是「独立部署」的前提。
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: API (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...

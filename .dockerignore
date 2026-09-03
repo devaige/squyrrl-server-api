@@ -10,3 +10,4 @@ README*.md
 # 会把它们算进层哈希 —— 改一行 compose 就白白让整个编译层缓存失效。
 docker-compose*.yml
 nginx.conf
+.github/

@@ -1,0 +1,78 @@
+# =============================================================================
+# Squyrrl API · 生产部署（独立，不依赖父仓库与任何跨服务编排）
+#
+# 拆仓后（2026-09-03）本仓库自持完整部署链路：push main → SSH → 拉代码 →
+# docker compose up。tgbot / admin / official 各有同构的一份，互不牵连；
+# 原先的 server/Makefile 总入口已删除。
+#
+# 所需 Secrets（本仓库 Settings → Secrets and variables → Actions）：
+#   DEPLOY_HOST     生产服务器 IP 或域名
+#   DEPLOY_PORT     SSH 端口（可不设，默认 22）
+#   DEPLOY_USER     SSH 用户（须在 docker 组）
+#   DEPLOY_SSH_KEY  部署专用私钥全文
+#   DEPLOY_PATH     本服务在服务器上的目录，如 /opt/squyrrl/server/api
+#
+# 服务器前置条件（初次部署，见父仓库 docs/readme/03-server-prod.md）：
+#   · 该目录是本仓库的一个 clone（或父仓库 submodule 检出后的 server/api）
+#   · 目录下已有填好的 .env.prod（cp .env.prod.example .env.prod && chmod 600）
+# external network 无需人工预建：下方脚本幂等创建。
+# =============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一台宿主机上并发 docker build 会互抢 CPU 与镜像层缓存；本仓库自身串行即可，
+# 与其他服务仓库的并发无法（也不必）在这里协调 —— 拆分部署换来的正是这种解耦。
+concurrency:
+  group: deploy-api-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 部署 api
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH & 部署
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_PATH }}"
+
+            COMPOSE="docker compose -f docker-compose.prod.yml --env-file .env.prod"
+
+            echo "::group::pull"
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
+            echo "::endgroup::"
+
+            # external network 由每个服务各自幂等创建：拆仓后没有「先跑一次总入口」
+            # 这个前置步骤了，哪个服务先部署哪个建，docker network create 在已存在
+            # 时会报错，故先 inspect 探测。
+            echo "::group::network"
+            docker network inspect squyrrl >/dev/null 2>&1 || docker network create squyrrl
+            echo "::endgroup::"
+
+            echo "::group::deploy"
+            $COMPOSE up -d --build
+            echo "::endgroup::"
+
+            # 迁移只跟着 api 走：schema 变更必然伴随 api 代码变更。goose 幂等，
+            # 非首次部署是空操作。连接串从容器里回读再传给 goose，而不是在宿主
+            # shell 里展开：避免生产库口令出现在 CI 日志和 shell history 里。
+            echo "::group::migrate"
+            DB_URL="$($COMPOSE exec -T api sh -c 'echo "$SQUYRRL_DATABASE_URL"' | tr -d '\r\n')"
+            $COMPOSE exec -T api goose -dir /app/migrations postgres "$DB_URL" up
+            echo "::endgroup::"
+
+            echo "::group::prune"
+            docker image prune -f
+            echo "::endgroup::"

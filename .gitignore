@@ -3,9 +3,12 @@ bin/
 *.test
 *.out
 
-# 本地配置
+# --- 环境与密钥 ---
+# 拆仓后本仓库不再受父仓库根 .gitignore 保护，必须自持完整规则：
+# 只忽略真值文件（.env / .env.prod / .env.local），放行 .env*.example 模板。
 .env
-.env.local
+.env.*
+!.env*.example
 
 # IDE
 .idea/
