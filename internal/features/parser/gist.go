@@ -55,7 +55,7 @@ func (p *GistProvider) Parse(ctx context.Context, uri, resourceID string) (*Pars
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.app)")
+	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.com)")
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := p.client.Do(req)

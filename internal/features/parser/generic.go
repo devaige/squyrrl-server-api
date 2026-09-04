@@ -51,7 +51,7 @@ func (p *GenericOGProvider) Parse(ctx context.Context, uri, _ string) (*ParseRes
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.app)")
+	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.com)")
 	req.Header.Set("Accept", "text/html,*/*;q=0.8")
 
 	resp, err := p.client.Do(req)

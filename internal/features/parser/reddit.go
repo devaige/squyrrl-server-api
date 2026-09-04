@@ -54,7 +54,7 @@ func (p *RedditProvider) Parse(ctx context.Context, uri, resourceID string) (*Pa
 		return nil, err
 	}
 	// reddit 强制要求自定义 UA，否则常常 429
-	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.app)")
+	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.com)")
 
 	resp, err := p.client.Do(req)
 	if err != nil {

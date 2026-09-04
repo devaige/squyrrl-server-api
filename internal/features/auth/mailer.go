@@ -20,7 +20,7 @@ const resendEndpoint = "https://api.resend.com/emails"
 // 一个 SMTP 捕获容器，空 key 即等价于「不发信」。
 type Mailer struct {
 	apiKey string
-	from   string // 完整 From 头，例如 "Squyrrl <noreply@squyrrl.app>"；须为 Resend 已验证发信域
+	from   string // 完整 From 头，例如 "Squyrrl <noreply@squyrrl.com>"；须为 Resend 已验证发信域
 	client *http.Client
 }
 

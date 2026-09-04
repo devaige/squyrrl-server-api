@@ -51,7 +51,7 @@ func (p *YouTubeProvider) Parse(ctx context.Context, uri, resourceID string) (*P
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.app)")
+	req.Header.Set("User-Agent", "Squyrrl/0.1 (+https://squyrrl.com)")
 
 	resp, err := p.client.Do(req)
 	if err != nil {

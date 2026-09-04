@@ -22,7 +22,7 @@ type Config struct {
 
 	// 邮件走 Resend HTTP API。ResendAPIKey 为空时进入本地日志模式（不外发，见 auth.Mailer）。
 	ResendAPIKey string `env:"SQUYRRL_RESEND_API_KEY"`
-	MailFrom     string `env:"SQUYRRL_MAIL_FROM" envDefault:"Squyrrl <noreply@squyrrl.app>"`
+	MailFrom     string `env:"SQUYRRL_MAIL_FROM" envDefault:"Squyrrl <noreply@squyrrl.com>"`
 
 	// 内部 server-to-server token，按端点分权（最小权限）：
 	//   TGInternalToken 守 /internal/tg（Bot 绑定/转发碎片）；InternalToken 守 /internal/admin

@@ -26,14 +26,14 @@ info:
     - 服务器只见混淆字节，不解密。在 JSON 中字段以 base64 出现（Go `[]byte` 默认编码）。
   contact:
     name: Squyrrl
-    url: https://squyrrl.app
+    url: https://squyrrl.com
   license:
     name: Proprietary
 
 servers:
   - url: http://localhost:8080
     description: 开发环境（本机 Docker Compose）
-  - url: https://api.squyrrl.app
+  - url: https://api.squyrrl.com
     description: 生产环境（占位）
 
 tags:

@@ -9,7 +9,7 @@
 # 创建（`make -C server net` 或 CI 自动建），故此处声明 external —— 若写成
 # 非 external，四个 compose 项目会各建一张同名网络而互相看不见。
 #
-# 端口只发布到 127.0.0.1，由宿主 nginx 反代到 api.squyrrl.app（见同目录 nginx.conf）。
+# 端口只发布到 127.0.0.1，由宿主 nginx 反代到 api.squyrrl.com（见同目录 nginx.conf）。
 #
 # 部署（在本目录执行）：
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
