@@ -17,7 +17,8 @@
 #   docker compose -f docker-compose.dev.yml logs -f api
 #   只起依赖（配合 make run 原生跑 API）：  ... up -d postgres minio
 #
-# 端口：依赖统一 +50000 偏移避开常见本地服务；api 直用 8080。均可用 .env 覆盖。
+# 端口：依赖统一 +50000 偏移避开常见本地服务；api 的宿主端口固定 10260（容器内仍 8080）。
+# 依赖端口可用 .env 覆盖；10260 是全项目约定，不要改。
 # =============================================================================
 
 # 钉死项目名：否则 compose 拿目录名（api）当项目名，与其他仓库的 dev 栈撞车。
@@ -76,10 +77,15 @@ services:
       # 容器里必须换成 compose 服务名，故在此覆盖 —— environment 的优先级高于
       # env_file，一份模板因此能同时服务原生开发和容器开发，不必维护两套。
       SQUYRRL_ENV: dev
+      # 宿主端口固定 10260 是「从本机怎么访问」的约定，与「容器里监听哪个端口」
+      # 是两件事：.env 里那份 :10260 供原生 go run 直接占用宿主端口，容器里则
+      # 必须回到 :8080，否则 ports 映射的目标端口对不上、也会和 prod 的 api:8080
+      # 容器名直连契约分叉。故此处与 prod compose 一样显式钉死。
+      SQUYRRL_HTTP_ADDR: ":8080"
       SQUYRRL_DATABASE_URL: postgres://squyrrl:squyrrl_dev@postgres:5432/squyrrl?sslmode=disable
       SQUYRRL_S3_ENDPOINT: http://minio:9000
     ports:
-      - "${SQUYRRL_API_PORT:-8080}:8080"
+      - "${SQUYRRL_API_PORT:-10260}:8080"
     depends_on:
       postgres:
         condition: service_healthy

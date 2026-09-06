@@ -34,7 +34,7 @@ type Config struct {
 	// WebAuthn / Passkey
 	WebAuthnRPID    string   `env:"SQUYRRL_WEBAUTHN_RP_ID"     envDefault:"localhost"`
 	WebAuthnRPName  string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`
-	WebAuthnOrigins []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:8080,http://localhost:3000"`
+	WebAuthnOrigins []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:10260,http://localhost:3000"`
 
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`

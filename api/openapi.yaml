@@ -31,7 +31,7 @@ info:
     name: Proprietary
 
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:10260
     description: 开发环境（本机 Docker Compose）
   - url: https://api.squyrrl.com
     description: 生产环境（占位）

@@ -33,7 +33,7 @@ cp .env.prod.example .env.prod && chmod 600 .env.prod   # 首次，填 CHANGE_ME
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ```
 
-`.github/workflows/deploy.yml` 在 push main 时自动做同样的事并跑数据库迁移。`nginx.conf` 是宿主反代配置（`api.squyrrl.com` → `127.0.0.1:8080`），安装方式见文件头注释。
+`.github/workflows/deploy.yml` 在 push main 时自动做同样的事并跑数据库迁移。`nginx.conf` 是宿主反代配置（`api.squyrrl.com` → `127.0.0.1:10260`），安装方式见文件头注释。
 
 ## 跨服务约定
 
