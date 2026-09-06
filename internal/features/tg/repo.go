@@ -17,97 +17,189 @@ type Repo struct {
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-// 不易混淆字符集合：去掉 0/O、1/I/L
+// 不易混淆字符集：去掉 0/O、1/I/L。用户要在 TG 里读出来、再敲进 App，
+// 一个读错的字符就是一次失败的绑定。
 const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 func generateCode() (string, error) {
+	out := make([]byte, BindingCodeLen)
 	buf := make([]byte, BindingCodeLen)
-	bytes := make([]byte, BindingCodeLen)
-	if _, err := rand.Read(bytes); err != nil {
+	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
 	for i := 0; i < BindingCodeLen; i++ {
-		buf[i] = codeAlphabet[int(bytes[i])%len(codeAlphabet)]
+		out[i] = codeAlphabet[int(buf[i])%len(codeAlphabet)]
 	}
-	return string(buf), nil
+	return string(out), nil
 }
 
-// CreateOrReuseTelegramDevice 为该用户在 platform=telegram 下找已撤销前的设备，否则建一个新的
-func (r *Repo) CreateOrReuseTelegramDevice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
-	var id uuid.UUID
+// =============================================================================
+// 绑定码：Bot 为 tg_user_id 签发 → 用户在 App 内兑换
+// =============================================================================
+
+// IssueCode 先找该 TG 用户手上未过期的码，有就复用。
+// 未绑定用户每发一条消息都签发新码的话，他手里会攒下一串都还有效的码，
+// 而 App 只能输一个 —— 复用让「码」在 TTL 内是稳定的一张。
+func (r *Repo) IssueCode(ctx context.Context, id TGIdentity, ttl time.Duration) (*BindingCode, error) {
+	var code string
+	var exp time.Time
 	err := r.pool.QueryRow(ctx, `
-		UPDATE devices SET last_seen_at = now()
-		WHERE user_id = $1 AND platform = 'telegram' AND revoked_at IS NULL
-		RETURNING id`, userID).Scan(&id)
+		SELECT code, expires_at FROM tg_binding_codes
+		WHERE tg_user_id = $1 AND consumed_at IS NULL AND expires_at > now()
+		ORDER BY expires_at DESC LIMIT 1`, id.TGUserID).Scan(&code, &exp)
 	if err == nil {
-		return id, nil
+		return &BindingCode{Code: code, ExpiresAt: exp}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, err
+		return nil, err
 	}
-	err = r.pool.QueryRow(ctx, `
-		INSERT INTO devices (user_id, name, platform)
-		VALUES ($1, 'Telegram', 'telegram')
-		RETURNING id`, userID).Scan(&id)
-	return id, err
-}
 
-// IssueCode 生成绑定码并写表（10 分钟 TTL）
-func (r *Repo) IssueCode(ctx context.Context, userID, deviceID uuid.UUID, ttl time.Duration) (*BindingCode, error) {
-	code, err := generateCode()
+	code, err = generateCode()
 	if err != nil {
 		return nil, err
 	}
-	exp := time.Now().Add(ttl)
+	exp = time.Now().Add(ttl)
 	if _, err := r.pool.Exec(ctx, `
-		INSERT INTO tg_binding_codes (code, user_id, device_id, expires_at)
-		VALUES ($1, $2, $3, $4)`, code, userID, deviceID, exp); err != nil {
+		INSERT INTO tg_binding_codes (code, tg_user_id, tg_username, tg_name, expires_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		code, id.TGUserID, nilIfEmpty(id.Username), nilIfEmpty(id.Name), exp); err != nil {
 		return nil, err
 	}
 	return &BindingCode{Code: code, ExpiresAt: exp}, nil
 }
 
-// ConsumeCode 原子地查找并消费一条未过期未消费的绑定码
-func (r *Repo) ConsumeCode(ctx context.Context, code string) (userID, deviceID uuid.UUID, err error) {
-	err = r.pool.QueryRow(ctx, `
+// ConsumeCode 原子地消费一条未过期未消费的码，返回它代表的 TG 身份
+func (r *Repo) ConsumeCode(ctx context.Context, code string) (TGIdentity, error) {
+	var id TGIdentity
+	var username, name *string
+	err := r.pool.QueryRow(ctx, `
 		UPDATE tg_binding_codes SET consumed_at = now()
 		WHERE code = $1 AND consumed_at IS NULL AND expires_at > now()
-		RETURNING user_id, device_id`,
-		code).Scan(&userID, &deviceID)
+		RETURNING tg_user_id, tg_username, tg_name`, code).
+		Scan(&id.TGUserID, &username, &name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		err = ErrCodeInvalid
+		return id, ErrCodeInvalid
 	}
-	return
+	if err != nil {
+		return id, err
+	}
+	id.Username, id.Name = deref(username), deref(name)
+	return id, nil
 }
 
-// CreateBinding 落库 (tg_user_id, user_id, device_id) 三元组
-// 若 tg_user_id 已绑其它用户，返回 ErrAlreadyBound
-func (r *Repo) CreateBinding(ctx context.Context, tgUserID int64, userID, deviceID uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, `
-		INSERT INTO tg_bindings (tg_user_id, user_id, device_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (tg_user_id) DO UPDATE
-			SET user_id = EXCLUDED.user_id,
-			    device_id = EXCLUDED.device_id,
-			    last_used_at = now()`,
-		tgUserID, userID, deviceID)
-	return err
+// =============================================================================
+// 绑定
+// =============================================================================
+
+// CreateTelegramDevice 每个 TG 号一台「设备」：设备名带上 TG 身份，
+// 用户在设备列表里才能分清绑了哪几个号。
+func (r *Repo) CreateTelegramDevice(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := r.pool.QueryRow(ctx, `
+		INSERT INTO devices (user_id, name, platform)
+		VALUES ($1, $2, 'telegram')
+		RETURNING id`, userID, name).Scan(&id)
+	return id, err
 }
 
-// FindByTGUser 找绑定记录；用于内部转发端点
+// CreateBinding 落 (tg_user_id, user_id, device_id)。
+// ON CONFLICT DO NOTHING 而非 DO UPDATE：一个 TG 号只能属于一个 Squyrrl 账户，
+// 想换账户必须先显式解绑。之前的 DO UPDATE 会让「拿到别人的码」变成一次静默改绑，
+// 原账户毫无感知 —— 而 ErrAlreadyBound / 409 那条链路是为拒绝而写的，一直没生效。
+func (r *Repo) CreateBinding(ctx context.Context, id TGIdentity, userID, deviceID uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx, `
+		INSERT INTO tg_bindings (tg_user_id, tg_username, tg_name, user_id, device_id)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tg_user_id) DO NOTHING`,
+		id.TGUserID, nilIfEmpty(id.Username), nilIfEmpty(id.Name), userID, deviceID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAlreadyBound
+	}
+	return nil
+}
+
 func (r *Repo) FindByTGUser(ctx context.Context, tgUserID int64) (*Binding, error) {
 	var b Binding
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, tg_user_id, user_id, device_id, created_at, last_used_at
+		SELECT id, tg_user_id, tg_username, tg_name, user_id, device_id, created_at, last_used_at
 		FROM tg_bindings WHERE tg_user_id = $1`, tgUserID).
-		Scan(&b.ID, &b.TGUserID, &b.UserID, &b.DeviceID, &b.CreatedAt, &b.LastUsedAt)
+		Scan(&b.ID, &b.TGUserID, &b.TGUsername, &b.TGName, &b.UserID, &b.DeviceID, &b.CreatedAt, &b.LastUsedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotBound
 	}
 	return &b, err
 }
 
-// TouchLastUsed 在转发消息时更新 last_used_at
+// ListByUser 列出一个 Squyrrl 账户绑定的全部 TG 号（一对多）
+func (r *Repo) ListByUser(ctx context.Context, userID uuid.UUID) ([]Binding, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, tg_user_id, tg_username, tg_name, user_id, device_id, created_at, last_used_at
+		FROM tg_bindings WHERE user_id = $1 ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Binding, 0)
+	for rows.Next() {
+		var b Binding
+		if err := rows.Scan(&b.ID, &b.TGUserID, &b.TGUsername, &b.TGName,
+			&b.UserID, &b.DeviceID, &b.CreatedAt, &b.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// DeleteByID 用户端解绑：带 user_id 条件，避免越权删别人的绑定
+func (r *Repo) DeleteByID(ctx context.Context, userID, bindingID uuid.UUID) (uuid.UUID, error) {
+	var deviceID uuid.UUID
+	err := r.pool.QueryRow(ctx, `
+		DELETE FROM tg_bindings WHERE id = $1 AND user_id = $2
+		RETURNING device_id`, bindingID, userID).Scan(&deviceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrBindingNotFound
+	}
+	return deviceID, err
+}
+
+// DeleteByTGUser Bot 端解绑（/unbind）：TG 侧只知道自己的 tg_user_id
+func (r *Repo) DeleteByTGUser(ctx context.Context, tgUserID int64) (uuid.UUID, error) {
+	var deviceID uuid.UUID
+	err := r.pool.QueryRow(ctx, `
+		DELETE FROM tg_bindings WHERE tg_user_id = $1
+		RETURNING device_id`, tgUserID).Scan(&deviceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrNotBound
+	}
+	return deviceID, err
+}
+
+// RevokeDevice 解绑后把设备标记撤销，而不是删除：devices 被 snippets.source_data
+// 之外的历史数据引用，硬删会牵动既有碎片的来源追溯。
+func (r *Repo) RevokeDevice(ctx context.Context, deviceID uuid.UUID) {
+	_, _ = r.pool.Exec(ctx,
+		`UPDATE devices SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL`, deviceID)
+}
+
 func (r *Repo) TouchLastUsed(ctx context.Context, tgUserID int64) {
 	_, _ = r.pool.Exec(ctx, `UPDATE tg_bindings SET last_used_at = now() WHERE tg_user_id = $1`, tgUserID)
+}
+
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

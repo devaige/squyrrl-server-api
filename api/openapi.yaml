@@ -691,26 +691,93 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------- Telegram Binding
-  /tg/binding/start:
-    post:
-      operationId: startTelegramBinding
+  # 绑定方向（2026-09-06 反转）：码由 Bot 在 TG 侧为一个 tg_user_id 签发，
+  # 用户带着码到 App 内兑换。旧的「App 出码 → 在 Bot 里 /bind」已移除。
+  /me/tg/bindings:
+    get:
+      operationId: listTelegramBindings
       tags: [Telegram]
-      summary: 用户端：生成 Telegram 绑定码
-      description: 8 位字符的不易混淆码，10 分钟内一次性使用。客户端展示给用户，让用户在 Bot 内输入 `/bind <code>` 完成绑定。
+      summary: 列出当前用户已绑定的 Telegram 账号
+      description: 一个 Squyrrl 账户可以绑定多个 Telegram 账号。
       responses:
         '200':
-          description: 绑定码
+          description: 绑定列表
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BindingCode' }
+              schema:
+                type: object
+                required: [bindings]
+                properties:
+                  bindings:
+                    type: array
+                    items: { $ref: '#/components/schemas/TelegramBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /internal/tg/binding/complete:
+  /me/tg/bindings/redeem:
     post:
-      operationId: completeTelegramBinding
+      operationId: redeemTelegramBindingCode
       tags: [Telegram]
-      summary: Bot 端：用绑定码完成绑定
-      description: 仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。
+      summary: 兑换 Bot 签发的绑定码
+      description: |
+        用户在 Telegram 里向 Bot 转发消息，未绑定时 Bot 回复一个 8 位绑定码，
+        用户在 App 内输入它完成绑定。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, example: ABCD2345 }
+      responses:
+        '200':
+          description: 已绑定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TelegramBinding' }
+        '400':
+          description: |
+            绑定码无效或已过期。刻意不用 401：客户端把 401 一律当作登录态失效
+            并强制登出，敲错一个码不该有这种后果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: 该 Telegram 账号已绑定其它 Squyrrl 用户（须先解绑）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /me/tg/bindings/{id}:
+    delete:
+      operationId: deleteTelegramBinding
+      tags: [Telegram]
+      summary: 解除一个 Telegram 绑定
+      description: 已保存的碎片保留；对应的 telegram 设备占位被标记撤销。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: 已解绑 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: 绑定不存在或不属于当前用户
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/binding/issue:
+    post:
+      operationId: issueTelegramBindingCode
+      tags: [Telegram]
+      summary: Bot 端：为一个 tg_user_id 签发绑定码
+      description: |
+        仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。
+        同一 TG 用户在 TTL 内重复调用会拿回同一张码，避免用户手上攒下多张有效码。
       security:
         - internalToken: []
       requestBody:
@@ -719,27 +786,85 @@ paths:
           application/json:
             schema:
               type: object
-              required: [code, tg_user_id]
+              required: [tg_user_id]
               properties:
-                code: { type: string }
                 tg_user_id: { type: integer, format: int64 }
+                tg_username: { type: string }
+                tg_name: { type: string }
       responses:
         '200':
-          description: 已绑定
+          description: 绑定码
           content:
             application/json:
-              schema:
-                type: object
-                required: [user_id]
-                properties:
-                  user_id: { type: string, format: uuid }
+              schema: { $ref: '#/components/schemas/BindingCode' }
         '401':
-          description: 内部 token 缺失或绑定码无效
+          description: 内部 token 缺失
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: 该 tg_user_id 已绑定其它用户
+          description: 该 tg_user_id 已绑定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/binding/status:
+    get:
+      operationId: getTelegramBindingStatus
+      tags: [Telegram]
+      summary: Bot 端：查询某个 tg_user_id 的绑定状态
+      description: |
+        Bot 在把消息正文发过来之前先问一次，未绑定用户的内容因此不必经过
+        创建碎片的请求体与日志。
+      security:
+        - internalToken: []
+      parameters:
+        - name: tg_user_id
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 绑定状态
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bound]
+                properties:
+                  bound: { type: boolean }
+                  tg_username: { type: string }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/binding/revoke:
+    post:
+      operationId: revokeTelegramBinding
+      tags: [Telegram]
+      summary: Bot 端：解除绑定（/unbind 命令）
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tg_user_id]
+              properties:
+                tg_user_id: { type: integer, format: int64 }
+      responses:
+        '204': { description: 已解绑 }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 该 tg_user_id 未绑定
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -749,7 +874,10 @@ paths:
       operationId: forwardTelegramSnippet
       tags: [Telegram]
       summary: Bot 端：以已绑定用户身份创建碎片
-      description: 仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。服务端按 tg_user_id 找对应 user_id 创建。
+      description: |
+        仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。
+        服务端按 tg_user_id 找到对应 user_id 后创建。
+        `text_content` 由 Bot 侧完成混淆（ADR-003/042），服务端不解读其字节。
       security:
         - internalToken: []
       requestBody:
@@ -764,11 +892,29 @@ paths:
                 snippet:
                   type: object
                   properties:
-                    type: { type: string, default: normal }
+                    type:
+                      type: string
+                      default: normal
+                      enum: [uri, url, normal, special]
+                    subtype:
+                      type: string
+                      description: special 类型的子类，如 telegram_contact / telegram_profile
                     title: { type: string }
                     description: { type: string }
-                    text_content: { type: string, format: byte }
+                    text_content:
+                      type: string
+                      format: byte
+                      description: 已混淆的字节（nonce|ciphertext|mac）
                     text_format: { type: string, default: plain }
+                    payload:
+                      type: object
+                      description: TG 富元数据，含 forward_origin / contact / profile
+                    file_ids:
+                      type: array
+                      items: { type: string, format: uuid }
+                      description: 经 /internal/tg/files 上传后拿到的附件，按序挂成 elements
+                    chat_id: { type: integer, format: int64 }
+                    message_id: { type: integer, format: int64 }
       responses:
         '201':
           description: 碎片已创建
@@ -782,6 +928,86 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: tg_user_id 未绑定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/files/check:
+    post:
+      operationId: checkTelegramFile
+      tags: [Telegram]
+      summary: Bot 端：按明文哈希查全局去重表
+      description: |
+        与用户端 `/files/check` 语义相同，只是换一道守卫 —— `/files` 那组挂着
+        Bearer 中间件，而 Bot 只有内部 token，没有用户身份。files 表本身是全局的
+        （ADR-004），与 user 无关，因此复用同一个 service，没有第二套存储逻辑。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plain_hash]
+              properties:
+                plain_hash: { type: string, description: hex(sha256) }
+      responses:
+        '200':
+          description: 查询结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [exists]
+                properties:
+                  exists: { type: boolean }
+                  file: { $ref: '#/components/schemas/File' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/files:
+    post:
+      operationId: uploadTelegramFile
+      tags: [Telegram]
+      summary: Bot 端：上传已混淆的附件字节
+      security:
+        - internalToken: []
+      parameters:
+        - { name: X-Plain-Hash,  in: header, required: true, schema: { type: string } }
+        - { name: X-Cipher-Hash, in: header, required: true, schema: { type: string } }
+        - { name: X-Size-Bytes,  in: header, required: true, schema: { type: integer } }
+        - { name: X-Mime,        in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: 已入库
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/File' }
+        '400':
+          description: 头缺失，或收到的字节与声明的哈希/大小不符
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: 超过单文件 100MiB 上限
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1475,3 +1701,21 @@ components:
           type: string
           description: 8 位不易混淆字符（去掉 0/O/1/I/L）
         expires_at: { type: string, format: date-time }
+
+    TelegramBinding:
+      type: object
+      required: [id, tg_user_id, user_id, device_id, created_at, last_used_at]
+      properties:
+        id: { type: string, format: uuid }
+        tg_user_id: { type: integer, format: int64 }
+        tg_username:
+          type: string
+          description: 绑定时由 Bot 带上，供 App 区分多个已绑账号；TG 侧改名不回流
+        tg_name: { type: string }
+        user_id: { type: string, format: uuid }
+        device_id:
+          type: string
+          format: uuid
+          description: 每个 TG 号对应一台 platform=telegram 的设备占位
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }

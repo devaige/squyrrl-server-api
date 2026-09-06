@@ -130,14 +130,16 @@ func (s *Server) routes() {
 	// GET /uris/manifest 走公开 group（无 Bearer 中间件）：匿名客户端也需要清单做本地判断
 	parserHandler.RegisterPublic(s.engine.Group("/uris"))
 
-	tgHandler := tg.NewHandler(s.tgSvc)
-	tgHandler.RegisterUser(api.Group("/tg"))
-
 	// 钱包 — 用户端在 /me/wallet；匿名数据归属在 /me/anonymous/claim
 	meGroup := api.Group("/me")
 	walletHandler := wallet.NewHandler(s.walletSvc)
 	walletHandler.RegisterUser(meGroup)
 	claim.NewHandler(s.claimSvc).Register(meGroup)
+
+	// TG 绑定归属于「我的账户设置」，故挂 /me/tg 而非顶层 /tg：
+	// 兑换码、列出已绑 TG 号、解绑，都是对当前登录用户自身的操作。
+	tgHandler := tg.NewHandler(s.tgSvc, s.fileSvc)
+	tgHandler.RegisterUser(meGroup.Group("/tg"))
 
 	// 内部端：受 X-Internal-Token 头保护，不挂 Bearer 中间件。
 	// 按最小权限拆两个守卫（tg.InternalAuth 是通用的 header 比对器，可复用于不同 token）：
