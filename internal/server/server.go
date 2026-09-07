@@ -67,7 +67,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	pageSvc := page.NewService(page.NewRepo(pool))
 	tagRepo := tag.NewRepo(pool)
 	snipSvc := snippet.NewService(snippet.NewRepo(pool))
-	fileSvc := file.NewService(file.NewRepo(pool), st)
+	fileSvc := file.NewService(file.NewRepo(pool), st, cfg.UploadEdgeBase, cfg.UploadTokenSecret)
 
 	// URI 解析：特殊 provider 顺序匹配；通用 OG 兜底放在最末
 	registry := parser.NewRegistry()
@@ -100,6 +100,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 
 func (s *Server) Handler() http.Handler { return s.engine }
 
+// FileService 供 main 启动后台任务用（上传意图清理）。
+func (s *Server) FileService() *file.Service { return s.fileSvc }
+
 func (s *Server) routes() {
 	s.engine.GET("/health", s.handleHealth)
 
@@ -116,6 +119,14 @@ func (s *Server) routes() {
 	authedPasskey := s.engine.Group("/auth/passkey")
 	authedPasskey.Use(s.authSvc.Middleware())
 	passkeyHandler.RegisterAuthed(authedPasskey)
+
+	// 内嵌边缘（ADR-069）：**仅在没配外部 Worker 时注册**。
+	// 这组端点用上传令牌认证而非 Bearer，故挂在公开 group 上。
+	// 生产配了 files.squyrrl.com 之后它根本不存在 —— 否则就等于留了一条
+	// 「绕开 CDN、改吃服务器带宽」的上传路径，与直传的初衷相悖。
+	if s.cfg.UploadEdgeBase == "" {
+		file.NewEdgeHandler(s.fileSvc).Register(s.engine.Group("/edge"))
+	}
 
 	// 业务路由统一挂在已鉴权的根 group 下
 	api := s.engine.Group("/")

@@ -9,6 +9,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"github.com/squyrrl/api/internal/features/auth"
 )
 
 type Handler struct {
@@ -19,10 +21,88 @@ func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
 func (h *Handler) Register(g *gin.RouterGroup) {
 	g.POST("/check", h.check)
-	g.POST("", h.upload)
+	// 直传两步（ADR-069）：签发 → 客户端把字节分片送进边缘 Worker → 收尾
+	g.POST("/intent", h.intent)
+	g.POST("/commit", h.commit)
 	g.GET("/:id", h.metadata)
 	g.GET("/:id/download", h.download)
 	g.GET("/:id/thumb", h.thumbnail)
+}
+
+// intent 签发直传令牌。命中全局去重时回包只有 exists+file，客户端一个字节都不用传。
+func (h *Handler) intent(c *gin.Context) {
+	id := auth.MustIdentity(c)
+
+	var in IntentInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	plain, err := hex.DecodeString(in.PlainHash)
+	if err != nil || len(plain) != 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "plain_hash 必须是 64 位 hex 的 SHA-256"})
+		return
+	}
+	cipher, err := hex.DecodeString(in.CipherHash)
+	if err != nil || len(cipher) != 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cipher_hash 必须是 64 位 hex 的 SHA-256"})
+		return
+	}
+	if in.SizeBytes > MaxUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "单文件超过 100MiB 上限"})
+		return
+	}
+	mime := in.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+
+	resp, err := h.svc.IssueIntent(c.Request.Context(), id.UserID, plain, cipher, in.SizeBytes, mime)
+	if err != nil {
+		if errors.Is(err, ErrEdgeDisabled) {
+			// 503 而不是 500：这是「本部署没配直传」，客户端应回退到中转上传，
+			// 而不是把它当成一次可重试的偶发故障。
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用直传"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// commit 收尾直传：合并分片、核对 R2 实际字节数、写 files 行。
+func (h *Handler) commit(c *gin.Context) {
+	id := auth.MustIdentity(c)
+
+	var in CommitInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	iid, err := uuid.Parse(in.IntentID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 intent_id"})
+		return
+	}
+
+	f, err := h.svc.Commit(c.Request.Context(), id.UserID, iid, in.Parts)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrIntentNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "上传意图不存在或不属于当前用户"})
+		case errors.Is(err, ErrIntentState):
+			c.JSON(http.StatusConflict, gin.H{"error": "该上传意图已收尾或已作废"})
+		case errors.Is(err, ErrPartsMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "分片清单与签发时的数量/序号不符"})
+		case errors.Is(err, ErrSizeMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "R2 中的实际字节数与申请时声明的不符"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, UploadResponse{File: f})
 }
 
 func (h *Handler) metadata(c *gin.Context) {
@@ -65,50 +145,6 @@ func (h *Handler) check(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, CheckResponse{Exists: exists, File: f})
-}
-
-func (h *Handler) upload(c *gin.Context) {
-	plainHashHex := c.GetHeader("X-Plain-Hash")
-	cipherHashHex := c.GetHeader("X-Cipher-Hash")
-	mime := c.GetHeader("X-Mime")
-	if mime == "" {
-		mime = "application/octet-stream"
-	}
-
-	plain, err := hex.DecodeString(plainHashHex)
-	if err != nil || len(plain) != 32 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Plain-Hash 缺失或非法（需 SHA-256 hex）"})
-		return
-	}
-	cipher, err := hex.DecodeString(cipherHashHex)
-	if err != nil || len(cipher) != 32 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Cipher-Hash 缺失或非法"})
-		return
-	}
-
-	size, err := strconv.ParseInt(c.GetHeader("X-Size-Bytes"), 10, 64)
-	if err != nil || size <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Size-Bytes 缺失或非法"})
-		return
-	}
-	if size > MaxUploadBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "单文件超过 100MiB 上限"})
-		return
-	}
-
-	f, err := h.svc.Upload(c.Request.Context(), plain, cipher, size, mime, c.Request.Body)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrCipherMismatch):
-			c.JSON(http.StatusBadRequest, gin.H{"error": "上传字节哈希与 X-Cipher-Hash 不匹配"})
-		case errors.Is(err, ErrSizeMismatch):
-			c.JSON(http.StatusBadRequest, gin.H{"error": "上传字节大小与 X-Size-Bytes 不匹配"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
-		return
-	}
-	c.JSON(http.StatusOK, UploadResponse{File: f})
 }
 
 // thumbnail 返回服务端预生成的 JPEG 缩略图。

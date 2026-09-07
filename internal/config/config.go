@@ -45,6 +45,16 @@ type Config struct {
 	WebAuthnRPName  string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`
 	WebAuthnOrigins []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:10260,http://localhost:3000"`
 
+	// 客户端直传（ADR-069）。
+	//   UploadEdgeBase：边缘 Worker 基址（如 https://files.squyrrl.com）。
+	//     **留空 = 用 api 自带的 /edge 内嵌边缘**，dev 接 MinIO 时正是如此
+	//     （Worker 的 R2 binding 连不到 MinIO，wrangler dev 的本地 R2 是另一套存储）。
+	//   UploadTokenSecret：api 与 Worker 共享的 HMAC 密钥，两侧必须同值否则边缘一律 401。
+	//     为空 ⇒ 直传整体不可用（fail-closed），故给 dev 默认值、生产必须覆盖。
+	// TG 的服务端中转（/internal/tg/files）不依赖这两项，永远可用。
+	UploadEdgeBase    string `env:"SQUYRRL_UPLOAD_EDGE_BASE"`
+	UploadTokenSecret string `env:"SQUYRRL_UPLOAD_TOKEN_SECRET" envDefault:"dev-upload-token-secret"`
+
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`
 

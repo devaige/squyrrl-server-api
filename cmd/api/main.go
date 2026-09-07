@@ -62,6 +62,13 @@ func main() {
 	go gc.Run(rootCtx)
 
 	srv := server.New(cfg, pool, st)
+
+	// 后台任务：清理过期未收尾的直传意图（ADR-069）。
+	// 与上面的 file GC 是两类垃圾：GC 收的是 files 表里 ref_count 归零的行，
+	// 这里收的是「客户端拿了令牌却没 commit」——那些字节在 R2 里，files 表却没有行，
+	// 唯一的线索就是意图表。
+	go srv.FileService().RunIntentSweeper(rootCtx, cfg.FileGCInterval)
+
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler(),
