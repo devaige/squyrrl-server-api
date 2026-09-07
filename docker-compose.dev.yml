@@ -17,8 +17,8 @@
 #   docker compose -f docker-compose.dev.yml logs -f api
 #   只起依赖（配合 make run 原生跑 API）：  ... up -d postgres minio
 #
-# 端口：依赖统一 +50000 偏移避开常见本地服务；api 的宿主端口固定 10260（容器内仍 8080）。
-# 依赖端口可用 .env 覆盖；10260 是全项目约定，不要改。
+# 端口：依赖统一 +50000 偏移避开常见本地服务，可用 .env 覆盖；api 的宿主端口
+# 固定 10260（容器内仍 8080），作为全项目约定直接写死在 compose 里，不留 env 开关。
 # =============================================================================
 
 # 钉死项目名：否则 compose 拿目录名（api）当项目名，与其他仓库的 dev 栈撞车。
@@ -85,7 +85,10 @@ services:
       SQUYRRL_DATABASE_URL: postgres://squyrrl:squyrrl_dev@postgres:5432/squyrrl?sslmode=disable
       SQUYRRL_S3_ENDPOINT: http://minio:9000
     ports:
-      - "${SQUYRRL_API_PORT:-10260}:8080"
+      # 左值 10260 写死：宿主端口是全项目共享的约定（nginx、各客户端默认值、文档
+      # 都按它对齐），留成 env 变量只会让「改了一处就与其余全部分叉」变得可能。
+      # 真要临时换口就在命令行覆盖这一行，而不是给它一个长期存在的配置入口。
+      - "10260:8080"
     depends_on:
       postgres:
         condition: service_healthy

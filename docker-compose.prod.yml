@@ -14,8 +14,8 @@
 # 部署（在本目录执行）：
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 #
-# 注意 --env-file 不能省：容器内的变量靠下方 env_file 注入，但 ${SQUYRRL_API_PORT}
-# 这类 compose 自身的插值只读 shell 环境和 --env-file，两者作用域不同。
+# 本文件已无 ${} 插值（发布端口写死 10260），--env-file 仅为四个服务命令一致而保留；
+# 容器内的变量一律靠下方 env_file 注入。
 # =============================================================================
 
 # 钉死项目名：否则 compose 拿所在目录名（squyrrl）当项目名，四个服务会撞成同一个项目。
@@ -34,7 +34,8 @@ services:
       SQUYRRL_HTTP_ADDR: ":8080"
       # SQUYRRL_DATABASE_URL 不在此覆盖：由 .env.prod 提供，指向外部托管云 Postgres。
     ports:
-      - "127.0.0.1:${SQUYRRL_API_PORT:-10260}:8080"
+      # 10260 写死，须与同目录 nginx.conf 的 proxy_pass 对齐（见 dev compose 注释）。
+      - "127.0.0.1:10260:8080"
     networks:
       - squyrrl
 
