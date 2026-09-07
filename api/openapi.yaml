@@ -570,9 +570,12 @@ paths:
 
         `exists=true` 时其余字段全部缺省：命中全局去重，一个字节都不用传。
 
-        `upload_url` **为空串表示用 api 自带的 `/edge` 内嵌边缘**（dev 接 MinIO 时如此，
-        因为 Worker 的 R2 binding 连不到 MinIO）。两者契约一致，客户端只需换终点。
-        `SQUYRRL_UPLOAD_TOKEN_SECRET` 为空时直传整体不可用，返回 **503**（fail-closed）。
+        `upload_url` 恒为非空：生产指向 Worker 自定义域，dev 指向 api 自带的 `/edge`
+        内嵌边缘（Worker 的 R2 binding 连不到 MinIO）。两者契约一致，客户端只需换终点。
+
+        `SQUYRRL_UPLOAD_EDGE_BASE` / `SQUYRRL_UPLOAD_TOKEN_SECRET` 任一为空 ⇒ **503**
+        （fail-closed）。**没有服务端中转回退**：漏配的代价是传不了文件，而不是让文件字节
+        穿过 api 产生出网带宽费用。
       requestBody:
         required: true
         content:
@@ -635,9 +638,9 @@ paths:
       summary: 内嵌边缘 — 单片写入（仅 dev）
       description: |
         与 `server/edge/upload` 的 Cloudflare Worker **契约完全一致**的一份 Go 实现，
-        挂在 api 自身。**仅当 `SQUYRRL_UPLOAD_EDGE_BASE` 为空时注册** —— 生产配了
-        `files.squyrrl.com` 之后本端点不存在，否则等于留了一条绕开 CDN、改吃服务器
-        带宽的上传路径。
+        挂在 api 自身。**仅在 `SQUYRRL_ENV != prod` 时注册**，生产环境本端点不存在 ——
+        门闩按环境而非「是否配了 Worker」开，否则漏配一个环境变量就等于悄悄留下一条
+        绕开 CDN、改吃服务器出网带宽的上传路径。
 
         存在的理由是 dev：本地接 MinIO，而 Worker 的 R2 binding 连不到 MinIO
         （`wrangler dev` 的本地 R2 是另一套存储，commit 时 `StatObject` 必然找不到对象）。
@@ -1698,7 +1701,7 @@ components:
         intent_id:  { type: string, format: uuid }
         upload_url:
           type: string
-          description: 边缘 Worker 基址；分片 PUT 到 `{upload_url}/v1/part/{n}`，单片 PUT 到 `{upload_url}/v1/single`
+          description: 边缘基址，恒非空；分片 PUT 到 `{upload_url}/v1/part/{n}`，单片 PUT 到 `{upload_url}/v1/single`
         token:
           type: string
           description: 'HMAC 上传令牌，格式 `base64url(payload).base64url(mac)`；以 `Authorization: Bearer` 送给边缘'

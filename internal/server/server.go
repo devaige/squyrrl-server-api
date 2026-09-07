@@ -120,11 +120,13 @@ func (s *Server) routes() {
 	authedPasskey.Use(s.authSvc.Middleware())
 	passkeyHandler.RegisterAuthed(authedPasskey)
 
-	// 内嵌边缘（ADR-069）：**仅在没配外部 Worker 时注册**。
+	// 内嵌边缘（ADR-069）：**只在非 prod 注册**，且这是硬门闩，不看任何其它配置。
 	// 这组端点用上传令牌认证而非 Bearer，故挂在公开 group 上。
-	// 生产配了 files.squyrrl.com 之后它根本不存在 —— 否则就等于留了一条
-	// 「绕开 CDN、改吃服务器带宽」的上传路径，与直传的初衷相悖。
-	if s.cfg.UploadEdgeBase == "" {
+	//
+	// 门闩按 Env 而非「是否配了 Worker」来开：后者意味着漏配一个环境变量就悄悄
+	// 打开一条「绕开 CDN、改吃服务器出网带宽」的上传路径 —— 功能全对，只是每个字节
+	// 都在计费，而且没有任何报错提示。生产要么走 Worker，要么传不了，没有中间态。
+	if !s.cfg.IsProd() {
 		file.NewEdgeHandler(s.fileSvc).Register(s.engine.Group("/edge"))
 	}
 

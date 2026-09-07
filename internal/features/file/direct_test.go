@@ -115,3 +115,22 @@ func TestOrderParts(t *testing.T) {
 		}
 	}
 }
+
+// 直传必须两项配齐才算可用：只有令牌密钥而没有边缘地址时若判为「可用」，
+// IssueIntent 会签出一个 upload_url 为空的回包，把「往哪传」的决定权推给客户端。
+func TestDirectUploadEnabledRequiresBoth(t *testing.T) {
+	cases := []struct {
+		base, secret string
+		want         bool
+	}{
+		{"", "", false},
+		{"https://files.squyrrl.com", "", false},
+		{"", "secret", false},
+		{"https://files.squyrrl.com", "secret", true},
+	}
+	for _, c := range cases {
+		if got := NewService(nil, nil, c.base, c.secret).DirectUploadEnabled(); got != c.want {
+			t.Errorf("base=%q secret=%q ⇒ %v, want %v", c.base, c.secret, got, c.want)
+		}
+	}
+}

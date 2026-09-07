@@ -27,6 +27,10 @@ func main() {
 		logger.Error("加载配置失败", "err", err)
 		os.Exit(1)
 	}
+	if err := cfg.Validate(); err != nil {
+		logger.Error("配置校验失败", "err", err)
+		os.Exit(1)
+	}
 
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	defer cancelRoot()

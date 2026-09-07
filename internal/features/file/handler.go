@@ -60,8 +60,9 @@ func (h *Handler) intent(c *gin.Context) {
 	resp, err := h.svc.IssueIntent(c.Request.Context(), id.UserID, plain, cipher, in.SizeBytes, mime)
 	if err != nil {
 		if errors.Is(err, ErrEdgeDisabled) {
-			// 503 而不是 500：这是「本部署没配直传」，客户端应回退到中转上传，
-			// 而不是把它当成一次可重试的偶发故障。
+			// 503 而不是 500：这是配置缺失，不是偶发故障，重试不会好。
+			// 客户端此时**没有**回退路径 —— 中转上传已随 ADR-069 删除，
+			// 这正是想要的：漏配的后果是传不了文件，而不是账单上多一笔出网流量。
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用直传"})
 			return
 		}

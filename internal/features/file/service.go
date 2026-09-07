@@ -21,10 +21,9 @@ type Service struct {
 	repo    *Repo
 	storage *storage.Client
 
-	// 直传（ADR-069）配置。
-	//   edgeBase 为空 ⇒ 回包里 upload_url 也为空，客户端理解为「用 api 自己的
-	//     /edge 内嵌边缘」——dev 接 MinIO、没有 Cloudflare Worker 时走这条。
-	//   tokenSecret 为空 ⇒ 无法签令牌，直传整体不可用（fail-closed）。
+	// 直传（ADR-069）配置，两项都必填。任一为空 ⇒ 直传整体不可用（fail-closed）：
+	// 签发端点返回 503，客户端上传失败 —— 而**不是**退回让字节穿过 api。
+	// 那种回退档位一旦存在，漏配就等于持续付出网带宽费用，且毫无报错。
 	edgeBase    string
 	tokenSecret string
 }
@@ -33,9 +32,12 @@ func NewService(repo *Repo, st *storage.Client, edgeBase, tokenSecret string) *S
 	return &Service{repo: repo, storage: st, edgeBase: edgeBase, tokenSecret: tokenSecret}
 }
 
-// DirectUploadEnabled 报告直传是否可用。只取决于令牌密钥：
-// edgeBase 缺省时退到内嵌边缘，而不是退到「没有直传」。
-func (s *Service) DirectUploadEnabled() bool { return s.tokenSecret != "" }
+// DirectUploadEnabled 报告直传是否可用：边缘地址与令牌密钥缺一不可。
+// dev 也要显式配 edgeBase（指向 api 自己的 /edge），好让「有没有直传」是一个
+// 二值问题，而不是「有直传 / 有个悄悄改吃服务器带宽的替身」。
+func (s *Service) DirectUploadEnabled() bool {
+	return s.edgeBase != "" && s.tokenSecret != ""
+}
 
 // VerifyUploadToken 供内嵌边缘校验令牌；生产由 Worker 用同一套算法自行校验。
 func (s *Service) VerifyUploadToken(token string) (*UploadClaims, error) {
@@ -251,8 +253,8 @@ func (s *Service) IssueIntent(
 	return &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
-		// 空串 = 用 api 自身的 /edge（dev）。客户端据此拼 baseUrl，
-		// 于是两种环境共用同一条上传代码路径，只是终点不同。
+		// 恒为非空（DirectUploadEnabled 已挡住空值）。dev 指向 api 自身的 /edge、
+		// 生产指向 Worker 自定义域，客户端两种环境共用同一条代码路径，只是终点不同。
 		UploadURL: s.edgeBase,
 		Token:     token,
 		PartSize:  PartSize,
