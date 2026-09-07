@@ -647,6 +647,8 @@ paths:
 
         认证用 `POST /files/intent` 签发的**上传令牌**，不是 Bearer access token。
         请求体为该对象的全部混淆字节；服务端校验大小与整体 `cipher_hash` 后才写入。
+
+        上传令牌与下载令牌共用同一把密钥但用途不同，签名互不通用（见 `/edge/v1/blob`）。
       security: []
       parameters:
         - in: header
@@ -720,6 +722,53 @@ paths:
         '401':
           description: 令牌缺失、签名不符或已过期
 
+  /edge/v1/blob:
+    get:
+      operationId: edgeGetBlob
+      tags: [Files]
+      summary: 内嵌边缘 — 凭票读对象（仅 dev）
+      description: |
+        见 `/edge/v1/single` 的门闩说明，同样**仅在 `SQUYRRL_ENV != prod` 时注册**。
+        生产由 `server/edge/upload` 的 Worker 在自定义域上承担同一条路由。
+
+        认证用 `GET /files/{id}/ticket` 签发的**下载令牌**，不是 Bearer access token。
+        令牌两种取法都认：`?t=` 查询参数或 `Authorization: Bearer`。
+
+        **下载令牌与上传令牌签名互不通用**：用途字符串参与 HMAC 计算。否则一张下载票
+        （没有 `sz`/`ch`）就能拿去打 `/edge/v1/single`，边缘会解出「期望 0 字节、
+        无需校验哈希」，把那个内容寻址的 key 覆盖成空对象。
+
+        `Content-Type` 取自令牌而非 R2 元数据：直传是用 binding 的 `put(key, body)` 写的、
+        没带 httpMetadata，从 R2 读只会得到 `application/octet-stream`。
+      security: []
+      parameters:
+        - in: query
+          name: t
+          schema: { type: string }
+          description: '下载令牌；也可改用 `Authorization: Bearer <token>` 头'
+        - in: header
+          name: If-None-Match
+          schema: { type: string }
+          description: 命中则回 304，不传字节
+      responses:
+        '200':
+          description: 对象字节
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string }
+              description: '`private, max-age=31536000, immutable`（key 是内容寻址的，字节永不改变）'
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '304':
+          description: 与 If-None-Match 一致，未变更
+        '401':
+          description: 令牌缺失、签名不符、用途不对或已过期
+        '404':
+          description: 对象不存在
+
   /files/{id}:
     parameters:
       - $ref: '#/components/parameters/UUIDPath'
@@ -729,7 +778,8 @@ paths:
       summary: 获取文件元数据
       description: |
         仅返回 file 元数据 JSON（id / plain_hash / cipher_hash / size / mime），不传字节。
-        客户端在显示已附附件预览前先调此端点拿 mime，再根据 mime 决定是否调 `download` 拉缩略图字节。
+        只需要 mime / size 时用这个；要真取字节请用 `/files/{id}/ticket`，
+        它在同一次往返里把元数据和边缘直读 URL 一起给你。
       responses:
         '200':
           description: 文件元数据
@@ -739,29 +789,41 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /files/{id}/download:
+  /files/{id}/ticket:
     parameters:
       - $ref: '#/components/parameters/UUIDPath'
     get:
-      operationId: downloadFile
+      operationId: issueFileTicket
       tags: [Files]
-      summary: 下载混淆字节
+      summary: 签发下载票（边缘直读 URL）
       description: |
-        返回客户端混淆字节流；客户端用应用静态密钥解混淆得到原文。
-        响应头携带 X-Plain-Hash / X-Cipher-Hash 便于校验。
+        返回文件元数据 + 一组**短期**边缘直读 URL（ADR-070）。api 在这里只查库和签名，
+        不接触任何字节：字节走 `R2 → Worker → 客户端`，全程在 Cloudflare 内部。
+
+        取代了此前 `GET /files/{id}/download` 与 `GET /files/{id}/thumb` 两个
+        `io.Copy` 字节的端点 —— 那两个端点每次读都要把整个对象从 R2 拉进 api 再推给
+        客户端，同一份流量付两次钱，而读的次数天然远多于写。
+
+        `thumb_url` 缺省即「没有缩略图」，客户端据此 fallback 到 `blob_url` 拉原始混淆
+        字节自行解混淆；不必再打一次 `/thumb` 去吃 404。
+
+        令牌签在 URL 的 `t` 查询参数里，为的是 URL 自包含、能直接喂给 `<img src>`。
+        代价是令牌会进访问日志，由很短的 TTL（10 分钟）兜住。
+
+        未配置边缘时返回 503：**没有**回退到服务端中转的档位。
       responses:
         '200':
-          description: 混淆字节
-          headers:
-            X-Plain-Hash:
-              schema: { type: string }
-            X-Cipher-Hash:
-              schema: { type: string }
+          description: 票据
           content:
-            application/octet-stream:
-              schema: { type: string, format: binary }
+            application/json:
+              schema: { $ref: '#/components/schemas/FileTicket' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: 本服务未启用边缘（`SQUYRRL_UPLOAD_EDGE_BASE` / `SQUYRRL_UPLOAD_TOKEN_SECRET` 缺失）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------- URIs
   /uris/parse:
@@ -1670,7 +1732,33 @@ components:
         cipher_hash: { type: string, description: 混淆字节 SHA-256 hex }
         size_bytes: { type: integer, format: int64 }
         mime: { type: string }
+        has_thumbnail:
+          type: boolean
+          description: |
+            服务端是否存有预生成的 JPEG 缩略图。仅中转上传时代（ADR-069 之前）的图片
+            才会有：直传后 api 手里没有字节，要生成就得把整个对象从 R2 拉回来，
+            恰好抵消掉直传省下的带宽；而客户端混淆后的字节本来也解不出图。
         created_at: { type: string, format: date-time }
+
+    FileTicket:
+      type: object
+      required: [file, blob_url, expires_at]
+      properties:
+        file: { $ref: '#/components/schemas/File' }
+        blob_url:
+          type: string
+          format: uri
+          description: 边缘直读原始混淆字节的 URL，令牌已签在 `t` 查询参数里
+        thumb_url:
+          type: string
+          format: uri
+          description: 缩略图直读 URL；**缺省即没有缩略图**，客户端应回退到 `blob_url`
+        expires_at:
+          type: integer
+          format: int64
+          description: |
+            两个 URL 共同的失效时刻（Unix 秒）。窗口很短（10 分钟），
+            不要把票据跟着列表数据长期缓存 —— 过期后边缘回 401，重新取票即可。
 
     FileCheckInput:
       type: object

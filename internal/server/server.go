@@ -120,12 +120,12 @@ func (s *Server) routes() {
 	authedPasskey.Use(s.authSvc.Middleware())
 	passkeyHandler.RegisterAuthed(authedPasskey)
 
-	// 内嵌边缘（ADR-069）：**只在非 prod 注册**，且这是硬门闩，不看任何其它配置。
-	// 这组端点用上传令牌认证而非 Bearer，故挂在公开 group 上。
+	// 内嵌边缘（ADR-069 上传 / ADR-070 下载）：**只在非 prod 注册**，且这是硬门闩，
+	// 不看任何其它配置。这组端点用边缘令牌认证而非 Bearer，故挂在公开 group 上。
 	//
 	// 门闩按 Env 而非「是否配了 Worker」来开：后者意味着漏配一个环境变量就悄悄
-	// 打开一条「绕开 CDN、改吃服务器出网带宽」的上传路径 —— 功能全对，只是每个字节
-	// 都在计费，而且没有任何报错提示。生产要么走 Worker，要么传不了，没有中间态。
+	// 打开一条「绕开 CDN、改吃服务器出网带宽」的收发路径 —— 功能全对，只是每个字节
+	// 都在计费，而且没有任何报错提示。生产要么走 Worker，要么传不了取不到，没有中间态。
 	if !s.cfg.IsProd() {
 		file.NewEdgeHandler(s.fileSvc).Register(s.engine.Group("/edge"))
 	}

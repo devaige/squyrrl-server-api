@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -21,8 +22,8 @@ type Service struct {
 	repo    *Repo
 	storage *storage.Client
 
-	// 直传（ADR-069）配置，两项都必填。任一为空 ⇒ 直传整体不可用（fail-closed）：
-	// 签发端点返回 503，客户端上传失败 —— 而**不是**退回让字节穿过 api。
+	// 边缘配置（ADR-069 上传 / ADR-070 下载），两项都必填。任一为空 ⇒ 上传与下载
+	// 一起不可用（fail-closed）：签发端点返回 503 —— 而**不是**退回让字节穿过 api。
 	// 那种回退档位一旦存在，漏配就等于持续付出网带宽费用，且毫无报错。
 	edgeBase    string
 	tokenSecret string
@@ -32,10 +33,13 @@ func NewService(repo *Repo, st *storage.Client, edgeBase, tokenSecret string) *S
 	return &Service{repo: repo, storage: st, edgeBase: edgeBase, tokenSecret: tokenSecret}
 }
 
-// DirectUploadEnabled 报告直传是否可用：边缘地址与令牌密钥缺一不可。
-// dev 也要显式配 edgeBase（指向 api 自己的 /edge），好让「有没有直传」是一个
-// 二值问题，而不是「有直传 / 有个悄悄改吃服务器带宽的替身」。
-func (s *Service) DirectUploadEnabled() bool {
+// EdgeEnabled 报告边缘是否可用：边缘地址与令牌密钥缺一不可。上传与下载共用这一个
+// 开关，因为它们共用同一个 Worker、同一个密钥、同一个自定义域 —— 拆成两个开关就多出
+// 「能传不能取」这类没人想要的中间态。
+//
+// dev 也要显式配 edgeBase（指向 api 自己的 /edge），好让「有没有边缘」是一个二值问题，
+// 而不是「有边缘 / 有个悄悄改吃服务器带宽的替身」。
+func (s *Service) EdgeEnabled() bool {
 	return s.edgeBase != "" && s.tokenSecret != ""
 }
 
@@ -45,6 +49,14 @@ func (s *Service) VerifyUploadToken(token string) (*UploadClaims, error) {
 		return nil, ErrEdgeDisabled
 	}
 	return VerifyUploadToken(s.tokenSecret, token)
+}
+
+// VerifyDownloadToken 同上，用途为下载。两种令牌签名互不通用（见 token.go 的用途常量）。
+func (s *Service) VerifyDownloadToken(token string) (*DownloadClaims, error) {
+	if s.tokenSecret == "" {
+		return nil, ErrEdgeDisabled
+	}
+	return VerifyDownloadToken(s.tokenSecret, token)
 }
 
 // 缩略图对象 key 前缀
@@ -150,33 +162,53 @@ func (s *Service) GetMetadata(ctx context.Context, id [16]byte) (*File, error) {
 	return s.repo.Get(ctx, id)
 }
 
-// Download 取流；caller 负责 Close
-func (s *Service) Download(ctx context.Context, id [16]byte) (io.ReadCloser, *File, error) {
+// IssueTicket 签发一组短期边缘直读 URL（ADR-070）。
+//
+// api 在这里只做「查库 + 签名」两件事，**不碰字节**。旧的 /download、/thumb 是
+// io.Copy(c.Writer, storage.Get(...))：功能上没问题，但每一次预览、每一次打开附件
+// 都要把整个对象从 R2 拉进 api 再推给客户端，同一份流量付两次钱（R2 出网 + 服务器出网），
+// 而读的次数天然远多于写。改成签票据后，字节只走 R2 → Worker → 客户端，
+// 这段路径在 Cloudflare 内部且 Worker 出网不计费。
+func (s *Service) IssueTicket(ctx context.Context, id [16]byte) (*TicketResponse, error) {
+	if !s.EdgeEnabled() {
+		return nil, ErrEdgeDisabled
+	}
 	f, err := s.repo.Get(ctx, id)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	rc, err := s.storage.Get(ctx, f.StorageKey)
+
+	// 两个 URL 共用同一个到期时刻，客户端只需要记一个数就能判断整张票是否还新鲜
+	expiresAt := time.Now().Add(downloadTTL)
+	blob, err := s.signBlobURL(f.StorageKey, f.Mime, expiresAt)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return rc, f, nil
+	resp := &TicketResponse{File: f, BlobURL: blob, ExpiresAt: expiresAt.Unix()}
+
+	if f.ThumbnailKey != "" {
+		// 缩略图是服务端生成的真 JPEG（没混淆），mime 恒定，不跟随原文件
+		thumb, err := s.signBlobURL(f.ThumbnailKey, "image/jpeg", expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		resp.ThumbURL = thumb
+	}
+	return resp, nil
 }
 
-// DownloadThumbnail 取缩略图字节流；没有缩略图返回 ErrNoThumbnail
-func (s *Service) DownloadThumbnail(ctx context.Context, id [16]byte) (io.ReadCloser, *File, error) {
-	f, err := s.repo.Get(ctx, id)
+// signBlobURL 把令牌放在查询串而不是要求调用方设 Authorization 头：
+// 这样 URL 自包含，能直接喂给 Image.network / <img src> / 浏览器下载，
+// 不必每个消费点都改成「先构造带头的请求」。代价是令牌会进访问日志，
+// 由 downloadTTL 的短窗口兜住 —— 边缘两种取法都认（见 edge_handler.go）。
+func (s *Service) signBlobURL(key, mime string, expiresAt time.Time) (string, error) {
+	tok, err := SignDownloadToken(s.tokenSecret, DownloadClaims{
+		Key: key, Mime: mime, ExpiresAt: expiresAt.Unix(),
+	})
 	if err != nil {
-		return nil, nil, err
+		return "", err
 	}
-	if f.ThumbnailKey == "" {
-		return nil, f, ErrNoThumbnail
-	}
-	rc, err := s.storage.Get(ctx, f.ThumbnailKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	return rc, f, nil
+	return s.edgeBase + "/v1/blob?t=" + url.QueryEscape(tok), nil
 }
 
 // =============================================================================
@@ -196,7 +228,7 @@ func (s *Service) IssueIntent(
 	size int64,
 	mime string,
 ) (*IntentResponse, error) {
-	if !s.DirectUploadEnabled() {
+	if !s.EdgeEnabled() {
 		return nil, ErrEdgeDisabled
 	}
 
@@ -253,7 +285,7 @@ func (s *Service) IssueIntent(
 	return &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
-		// 恒为非空（DirectUploadEnabled 已挡住空值）。dev 指向 api 自身的 /edge、
+		// 恒为非空（EdgeEnabled 已挡住空值）。dev 指向 api 自身的 /edge、
 		// 生产指向 Worker 自定义域，客户端两种环境共用同一条代码路径，只是终点不同。
 		UploadURL: s.edgeBase,
 		Token:     token,
@@ -396,8 +428,8 @@ func (s *Service) SweepExpiredIntents(ctx context.Context, limit int) (int, erro
 // 没有并进 storage.GC：那个包位于 file 之下（file 依赖 storage），把意图清理塞进去
 // 会造成反向依赖。两个循环各跑各的，共用同一个 interval 配置。
 func (s *Service) RunIntentSweeper(ctx context.Context, interval time.Duration) {
-	if !s.DirectUploadEnabled() {
-		slog.Info("未启用直传，跳过上传意图清理循环")
+	if !s.EdgeEnabled() {
+		slog.Info("未启用边缘，跳过上传意图清理循环")
 		return
 	}
 	if interval <= 0 {

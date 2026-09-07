@@ -13,7 +13,7 @@ import (
 )
 
 // EdgeHandler 是内嵌边缘：与 server/edge/upload 的 Cloudflare Worker **契约完全一致**
-// 的一份 Go 实现，挂在 api 自己身上。
+// 的一份 Go 实现（上传两个端点 + 下载一个），挂在 api 自己身上。
 //
 // 存在的理由是 dev：本地接 MinIO，而 Worker 的 R2 binding 连不到 MinIO
 // （`wrangler dev` 的本地 R2 是另一套存储，commit 时 StatObject 必然找不到对象）。
@@ -28,29 +28,76 @@ type EdgeHandler struct {
 
 func NewEdgeHandler(svc *Service) *EdgeHandler { return &EdgeHandler{svc: svc} }
 
-// Register 挂在**公开** group：这组端点用上传令牌认证，不是 Bearer。
+// Register 挂在**公开** group：这组端点用边缘令牌认证，不是 Bearer。
 func (h *EdgeHandler) Register(g *gin.RouterGroup) {
 	g.PUT("/v1/single", h.single)
 	g.PUT("/v1/part/:n", h.part)
+	g.GET("/v1/blob", h.blob)
 }
 
-// claimsFrom 校验 Authorization 头里的上传令牌
+// bearerOrQuery 取边缘令牌。上传走 Authorization 头，下载走查询串 `?t=`
+// （见 service.signBlobURL：URL 要能直接喂给 Image.network），两种都接受。
+func bearerOrQuery(c *gin.Context) string {
+	if raw := c.GetHeader("Authorization"); len(raw) > 7 && raw[:7] == "Bearer " {
+		return raw[7:]
+	}
+	return c.Query("t")
+}
+
+// tokenErrStatus 把令牌错误映射到状态码：密钥没配是服务端问题（503），
+// 其余（签名不符、过期、用途不对）都是客户端拿了张不能用的票（401）。
+func tokenErrStatus(err error) int {
+	if errors.Is(err, ErrEdgeDisabled) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusUnauthorized
+}
+
+// claimsFrom 校验上传令牌
 func (h *EdgeHandler) claimsFrom(c *gin.Context) (*UploadClaims, bool) {
-	raw := c.GetHeader("Authorization")
-	if len(raw) < 8 || raw[:7] != "Bearer " {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 Bearer 令牌"})
+	tok := bearerOrQuery(c)
+	if tok == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少边缘令牌"})
 		return nil, false
 	}
-	claims, err := h.svc.VerifyUploadToken(raw[7:])
+	claims, err := h.svc.VerifyUploadToken(tok)
 	if err != nil {
-		status := http.StatusUnauthorized
-		if errors.Is(err, ErrEdgeDisabled) {
-			status = http.StatusServiceUnavailable
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
+		c.JSON(tokenErrStatus(err), gin.H{"error": err.Error()})
 		return nil, false
 	}
 	return claims, true
+}
+
+// blob 是下载侧的内嵌边缘（ADR-070），对应 Worker 的 GET /v1/blob。
+//
+// 这里的 io.Copy 确实让字节穿过了 api —— 但这组端点只在非 prod 注册，走的是
+// localhost 到 MinIO，不产生任何出网费用。生产上同一条路由由 Worker 承担，
+// R2 → Worker → 客户端全程在 Cloudflare 内部。
+func (h *EdgeHandler) blob(c *gin.Context) {
+	tok := bearerOrQuery(c)
+	if tok == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少边缘令牌"})
+		return
+	}
+	claims, err := h.svc.VerifyDownloadToken(tok)
+	if err != nil {
+		c.JSON(tokenErrStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+
+	rc, err := h.svc.storage.Get(c.Request.Context(), claims.Key)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "对象不存在"})
+		return
+	}
+	defer rc.Close()
+
+	// key 是内容寻址的，同一个 key 的字节永不改变 —— 可以放心 immutable。
+	// private 而非 public：URL 里带着令牌，不该被任何共享缓存按 URL 存下来。
+	c.Header("Content-Type", claims.Mime)
+	c.Header("Cache-Control", "private, max-age=31536000, immutable")
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, rc)
 }
 
 // readAndVerify 读满一片并校验大小与哈希。与 Worker 侧同名函数一一对应：

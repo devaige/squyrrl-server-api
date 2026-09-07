@@ -47,14 +47,16 @@ type Config struct {
 	WebAuthnRPName  string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`
 	WebAuthnOrigins []string `env:"SQUYRRL_WEBAUTHN_ORIGINS"   envSeparator:"," envDefault:"http://localhost:10260,http://localhost:3000"`
 
-	// 客户端直传（ADR-069）。两项**都必填**，任一为空 ⇒ 直传整体不可用（fail-closed）。
+	// 客户端与边缘之间的直连（ADR-069 上传 / ADR-070 下载）。两项**都必填**，
+	// 任一为空 ⇒ 上传与下载一起不可用（fail-closed）。
 	//   UploadEdgeBase：边缘基址。生产填 Worker 的自定义域（https://files.squyrrl.com）；
 	//     dev 填 api 自己的内嵌边缘（http://localhost:10260/edge，宿主端口而非容器内的
-	//     8080：这个值原样发给客户端当上传终点）——Worker 的 R2 binding
+	//     8080：这个值原样发给客户端当收发终点）——Worker 的 R2 binding
 	//     连不到 MinIO，wrangler dev 的本地 R2 是另一套存储，所以本地跑 Worker 走不通。
 	//     刻意**没有**「留空则回退到服务器中转」这一档：那一档会让文件字节穿过 api，
 	//     一次配置疏漏就变成持续的出网带宽账单，而它坏得毫无声响。宁可传不了，不可悄悄花钱。
 	//   UploadTokenSecret：api 与边缘共享的 HMAC 密钥，两侧必须同值否则边缘一律 401。
+	//     上传票与下载票同密钥不同用途，签名互不通用（见 file/token.go）。
 	// TG 的服务端中转（/internal/tg/files）不依赖这两项，永远可用。
 	UploadEdgeBase string `env:"SQUYRRL_UPLOAD_EDGE_BASE"`
 	// envDefault 与下方 devUploadTokenSecret 必须同值（Go 的 tag 只能写字面量）。
@@ -87,8 +89,8 @@ const devUploadTokenSecret = "dev-upload-token-secret"
 
 // Validate 拦截「能正常启动、却会悄悄失效或悄悄花钱」的生产配置组合。
 //
-// 直传的 fail-closed 设计意味着漏配 EDGE_BASE 只会让上传 503，不会退回服务器中转 ——
-// 安全，但也安静：不在启动时喊出来，就要等第一个用户传不了文件才发现。
+// 边缘的 fail-closed 设计意味着漏配 EDGE_BASE 只会让上传/下载 503，不会退回服务器中转 ——
+// 安全，但也安静：不在启动时喊出来，就要等第一个用户传不了/打不开文件才发现。
 // 只在 prod 收紧，dev 沿用默认值即可开箱即用。
 func (c *Config) Validate() error {
 	if !c.IsProd() {
@@ -96,7 +98,7 @@ func (c *Config) Validate() error {
 	}
 	var bad []string
 	if c.UploadEdgeBase == "" {
-		bad = append(bad, "SQUYRRL_UPLOAD_EDGE_BASE 未设置：客户端直传将整体不可用")
+		bad = append(bad, "SQUYRRL_UPLOAD_EDGE_BASE 未设置：客户端上传与下载将整体不可用")
 	}
 	if c.UploadTokenSecret == "" || c.UploadTokenSecret == devUploadTokenSecret {
 		bad = append(bad, "SQUYRRL_UPLOAD_TOKEN_SECRET 未覆盖 dev 默认值")

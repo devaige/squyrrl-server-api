@@ -116,9 +116,10 @@ func TestOrderParts(t *testing.T) {
 	}
 }
 
-// 直传必须两项配齐才算可用：只有令牌密钥而没有边缘地址时若判为「可用」，
-// IssueIntent 会签出一个 upload_url 为空的回包，把「往哪传」的决定权推给客户端。
-func TestDirectUploadEnabledRequiresBoth(t *testing.T) {
+// 边缘必须两项配齐才算可用：只有令牌密钥而没有边缘地址时若判为「可用」，
+// IssueIntent 会签出一个 upload_url 为空的回包，把「往哪传」的决定权推给客户端；
+// IssueTicket 同理会签出一个 "/v1/blob?t=..." 这样没有 host 的下载 URL。
+func TestEdgeEnabledRequiresBoth(t *testing.T) {
 	cases := []struct {
 		base, secret string
 		want         bool
@@ -129,8 +130,59 @@ func TestDirectUploadEnabledRequiresBoth(t *testing.T) {
 		{"https://files.squyrrl.com", "secret", true},
 	}
 	for _, c := range cases {
-		if got := NewService(nil, nil, c.base, c.secret).DirectUploadEnabled(); got != c.want {
+		if got := NewService(nil, nil, c.base, c.secret).EdgeEnabled(); got != c.want {
 			t.Errorf("base=%q secret=%q ⇒ %v, want %v", c.base, c.secret, got, c.want)
 		}
+	}
+}
+
+// 上传令牌与下载令牌共用一个 secret，但签名输入里混了用途，所以互不通用。
+//
+// 这条不是形式主义：下载令牌没有 sz/ch 字段，若能当上传令牌用，边缘解出的
+// claims 会是「期望 0 字节、无需校验哈希」，于是把那个内容寻址的 key 覆盖成空对象 ——
+// 而该 key 的字节是全体引用者共享的。
+func TestTokenPurposesAreNotInterchangeable(t *testing.T) {
+	const secret = "s3cr3t"
+	exp := time.Now().Add(time.Minute).Unix()
+
+	up, err := SignUploadToken(secret, UploadClaims{Key: "k", SizeBytes: 1, ExpiresAt: exp})
+	if err != nil {
+		t.Fatalf("签上传令牌失败：%v", err)
+	}
+	down, err := SignDownloadToken(secret, DownloadClaims{Key: "k", Mime: "image/png", ExpiresAt: exp})
+	if err != nil {
+		t.Fatalf("签下载令牌失败：%v", err)
+	}
+
+	if _, err := VerifyUploadToken(secret, down); err != ErrBadToken {
+		t.Errorf("下载令牌被当成上传令牌接受了：%v", err)
+	}
+	if _, err := VerifyDownloadToken(secret, up); err != ErrBadToken {
+		t.Errorf("上传令牌被当成下载令牌接受了：%v", err)
+	}
+}
+
+func TestDownloadTokenRoundTrip(t *testing.T) {
+	const secret = "s3cr3t"
+	in := DownloadClaims{Key: "beef", Mime: "image/jpeg", ExpiresAt: time.Now().Add(time.Minute).Unix()}
+
+	tok, err := SignDownloadToken(secret, in)
+	if err != nil {
+		t.Fatalf("签发失败：%v", err)
+	}
+	out, err := VerifyDownloadToken(secret, tok)
+	if err != nil {
+		t.Fatalf("校验失败：%v", err)
+	}
+	if *out != in {
+		t.Errorf("往返后不一致：%+v != %+v", *out, in)
+	}
+
+	if _, err := VerifyDownloadToken("wrong-secret", tok); err != ErrBadToken {
+		t.Errorf("换密钥应判 ErrBadToken，得到 %v", err)
+	}
+	expired, _ := SignDownloadToken(secret, DownloadClaims{Key: "k", ExpiresAt: time.Now().Add(-time.Second).Unix()})
+	if _, err := VerifyDownloadToken(secret, expired); err != ErrTokenExpired {
+		t.Errorf("过期应判 ErrTokenExpired，得到 %v", err)
 	}
 }

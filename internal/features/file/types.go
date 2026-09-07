@@ -11,11 +11,10 @@ var (
 	ErrNotFound       = errors.New("file not found")
 	ErrCipherMismatch = errors.New("cipher hash does not match uploaded bytes")
 	ErrSizeMismatch   = errors.New("declared size does not match uploaded bytes")
-	ErrNoThumbnail    = errors.New("file has no thumbnail")
 	ErrIntentNotFound = errors.New("upload intent not found")
 	ErrIntentState    = errors.New("upload intent is not pending")
 	ErrPartsMismatch  = errors.New("committed parts do not match the intent")
-	ErrEdgeDisabled   = errors.New("direct upload is not configured")
+	ErrEdgeDisabled   = errors.New("edge is not configured")
 )
 
 // 上传体积上限：100 MiB；后续按订阅档位放宽。
@@ -31,6 +30,13 @@ const MaxUploadBytes = 100 * 1024 * 1024
 // 取 8 MiB 是在「请求数（每片一次 Class A 计费）」和「单片重传代价」之间折中：
 // 100 MiB 文件 13 片，即便撞上 Free plan 的 100 MB 上限也有一个数量级的余量。
 const PartSize int64 = 8 * 1024 * 1024
+
+// downloadTTL 是下载令牌的存活时间。
+//
+// 比 intentTTL 短两个数量级：下载票据在客户端真要读字节时才签发，签完立刻用，
+// 没有「弱网下传几十分钟」那种长尾。短 TTL 的代价只是「元数据缓存久了要重签」，
+// 收益是票据一旦随日志/截图外泄，可用窗口只有几分钟。
+const downloadTTL = 10 * time.Minute
 
 // intentTTL 是上传令牌与意图行的存活时间。
 // 必须显著长于最慢的预期上传（弱网下 100 MiB 可能要几十分钟），
@@ -107,6 +113,18 @@ type File struct {
 	StorageKey    string `json:"-"`
 	ThumbnailKey  string `json:"-"`
 	RefCount      int    `json:"-"`
+}
+
+// TicketResponse 是 GET /files/{id}/ticket 的回包：文件元数据 + 一组短期边缘直读 URL。
+//
+// 把元数据一起回来是为了省一次往返：调用方（附件预览）本来就要先拿 mime 才知道
+// 该读缩略图还是原图。ThumbURL 为空即「没有缩略图」—— 旧接口是让客户端打一次
+// /thumb 吃 404 才知道，那一次 404 现在被这个字段消掉了。
+type TicketResponse struct {
+	File      *File  `json:"file"`
+	BlobURL   string `json:"blob_url"`
+	ThumbURL  string `json:"thumb_url,omitempty"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 type CheckInput struct {

@@ -3,9 +3,7 @@ package file
 import (
 	"encoding/hex"
 	"errors"
-	"io"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -25,8 +23,8 @@ func (h *Handler) Register(g *gin.RouterGroup) {
 	g.POST("/intent", h.intent)
 	g.POST("/commit", h.commit)
 	g.GET("/:id", h.metadata)
-	g.GET("/:id/download", h.download)
-	g.GET("/:id/thumb", h.thumbnail)
+	// 下载票据（ADR-070）：回一组短期边缘 URL，字节不经 api
+	g.GET("/:id/ticket", h.ticket)
 }
 
 // intent 签发直传令牌。命中全局去重时回包只有 exists+file，客户端一个字节都不用传。
@@ -63,7 +61,7 @@ func (h *Handler) intent(c *gin.Context) {
 			// 503 而不是 500：这是配置缺失，不是偶发故障，重试不会好。
 			// 客户端此时**没有**回退路径 —— 中转上传已随 ADR-069 删除，
 			// 这正是想要的：漏配的后果是传不了文件，而不是账单上多一笔出网流量。
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用直传"})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用边缘"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -148,55 +146,29 @@ func (h *Handler) check(c *gin.Context) {
 	c.JSON(http.StatusOK, CheckResponse{Exists: exists, File: f})
 }
 
-// thumbnail 返回服务端预生成的 JPEG 缩略图。
-// 没有缩略图（非图片 / 解码失败 / 仍在异步生成中）→ 404，由客户端按需 fallback 到 /download。
-func (h *Handler) thumbnail(c *gin.Context) {
+// ticket 签发短期边缘直读 URL（ADR-070）。取代了此前 io.Copy 字节的
+// GET /:id/download 与 /:id/thumb —— 那两个端点每次读都要让整个对象穿过 api，
+// 而读的次数远多于写，是三条服务器出网通道里最贵的一条。
+//
+// 回包里 thumb_url 缺省即「没有缩略图」，客户端据此决定回退到原图，
+// 不必再打一次 /thumb 去吃 404。
+func (h *Handler) ticket(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 id"})
 		return
 	}
-	rc, _, err := h.svc.DownloadThumbnail(c.Request.Context(), id)
+	t, err := h.svc.IssueTicket(c.Request.Context(), id)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "文件不存在"})
-		case errors.Is(err, ErrNoThumbnail):
-			c.JSON(http.StatusNotFound, gin.H{"error": "无缩略图"})
+		case errors.Is(err, ErrEdgeDisabled):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用边缘"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
 		return
 	}
-	defer rc.Close()
-
-	c.Header("Content-Type", "image/jpeg")
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, rc)
-}
-
-func (h *Handler) download(c *gin.Context) {
-	id, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 id"})
-		return
-	}
-	rc, f, err := h.svc.Download(c.Request.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "文件不存在"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer rc.Close()
-
-	c.Header("Content-Type", f.Mime)
-	c.Header("Content-Length", strconv.FormatInt(f.SizeBytes, 10))
-	c.Header("X-Plain-Hash", f.PlainHash)
-	c.Header("X-Cipher-Hash", f.CipherHash)
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, rc)
+	c.JSON(http.StatusOK, t)
 }
