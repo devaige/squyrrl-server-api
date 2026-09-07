@@ -12,34 +12,45 @@ import (
 	"github.com/squyrrl/api/internal/features/snippet"
 )
 
-const codeTTL = 10 * time.Minute
+// tokenTTL 比手输码时代的 10 分钟更短：deep link 是「点开就用」的，
+// 用户不需要在两个应用之间搬运字符串，5 分钟足够走完唤起 TG 的全程，
+// 而更短的窗口意味着截图外流的链接更快失效。
+const tokenTTL = 5 * time.Minute
 
 type Service struct {
-	repo    *Repo
-	snipSvc *snippet.Service
+	repo        *Repo
+	snipSvc     *snippet.Service
+	botUsername string
 }
 
-func NewService(repo *Repo, snipSvc *snippet.Service) *Service {
-	return &Service{repo: repo, snipSvc: snipSvc}
+func NewService(repo *Repo, snipSvc *snippet.Service, botUsername string) *Service {
+	return &Service{repo: repo, snipSvc: snipSvc, botUsername: botUsername}
 }
 
 // =============================================================================
-// 绑定：Bot 签发码 → 用户在 App 内兑换
+// 绑定：App 签发令牌 → 用户点 deep link → Bot 核销
 // =============================================================================
 
-// IssueCode Bot 端调用：为一个尚未绑定的 TG 用户签发绑定码
-func (s *Service) IssueCode(ctx context.Context, id TGIdentity) (*BindingCode, error) {
-	if _, err := s.repo.FindByTGUser(ctx, id.TGUserID); err == nil {
-		return nil, ErrAlreadyBound
-	} else if !errors.Is(err, ErrNotBound) {
+// IssueBindingLink 用户端调用：为已登录用户签发一枚令牌并拼成 deep link。
+// 链接由服务端拼装，客户端只负责渲染二维码 —— 换 Bot 只改一处环境变量。
+func (s *Service) IssueBindingLink(ctx context.Context, userID uuid.UUID) (*BindingLink, error) {
+	if s.botUsername == "" {
+		return nil, ErrBotUnconfigured
+	}
+	token, exp, err := s.repo.IssueToken(ctx, userID, tokenTTL)
+	if err != nil {
 		return nil, err
 	}
-	return s.repo.IssueCode(ctx, id, codeTTL)
+	return &BindingLink{
+		Token:     token,
+		URL:       fmt.Sprintf("https://t.me/%s?start=%s", s.botUsername, token),
+		ExpiresAt: exp,
+	}, nil
 }
 
-// Redeem 用户端调用：已登录用户输入码，把码代表的 TG 号绑到自己账户
-func (s *Service) Redeem(ctx context.Context, userID uuid.UUID, code string) (*Binding, error) {
-	id, err := s.repo.ConsumeCode(ctx, code)
+// Bind Bot 端调用：核销令牌，把提交上来的 TG 号绑到令牌所属的 Squyrrl 账户。
+func (s *Service) Bind(ctx context.Context, token string, id TGIdentity) (*Binding, error) {
+	userID, err := s.repo.ConsumeToken(ctx, token)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +60,7 @@ func (s *Service) Redeem(ctx context.Context, userID uuid.UUID, code string) (*B
 		return nil, err
 	}
 	if err := s.repo.CreateBinding(ctx, id, userID, deviceID); err != nil {
-		// 绑定失败（码有效但该 TG 号已被别人抢先绑走）时回收刚建的设备占位，
+		// 绑定失败（令牌有效但该 TG 号已绑到别的账户）时回收刚建的设备占位，
 		// 否则用户的设备列表里会留下一台永远不会被使用的「Telegram」。
 		s.repo.RevokeDevice(ctx, deviceID)
 		return nil, err

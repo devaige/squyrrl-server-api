@@ -3,6 +3,7 @@ package tg
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"time"
 
@@ -17,74 +18,64 @@ type Repo struct {
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-// 不易混淆字符集：去掉 0/O、1/I/L。用户要在 TG 里读出来、再敲进 App，
-// 一个读错的字符就是一次失败的绑定。
-const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-
-func generateCode() (string, error) {
-	out := make([]byte, BindingCodeLen)
-	buf := make([]byte, BindingCodeLen)
+// generateToken 产出 base64url 无填充的随机串。选这个编码不是为了紧凑，
+// 而是因为它的字符集恰好是 Telegram deep link payload 允许的 [A-Za-z0-9_-]，
+// 拼进 ?start= 不需要任何转义；标准 base64 的 +/= 会被 TG 截断或拒绝。
+func generateToken() (string, error) {
+	buf := make([]byte, BindingTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	for i := 0; i < BindingCodeLen; i++ {
-		out[i] = codeAlphabet[int(buf[i])%len(codeAlphabet)]
-	}
-	return string(out), nil
+	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // =============================================================================
-// 绑定码：Bot 为 tg_user_id 签发 → 用户在 App 内兑换
+// 绑定令牌：App 为已登录用户签发 → Bot 在 /start <token> 时核销
 // =============================================================================
 
-// IssueCode 先找该 TG 用户手上未过期的码，有就复用。
-// 未绑定用户每发一条消息都签发新码的话，他手里会攒下一串都还有效的码，
-// 而 App 只能输一个 —— 复用让「码」在 TTL 内是稳定的一张。
-func (r *Repo) IssueCode(ctx context.Context, id TGIdentity, ttl time.Duration) (*BindingCode, error) {
-	var code string
+// IssueToken 先找该用户手上未核销的令牌，有就复用。
+// 绑定页每次重建都会请求一次，不复用的话二维码会在用户正扫的时候换掉；
+// 复用让令牌在 TTL 内是稳定的一张。
+func (r *Repo) IssueToken(ctx context.Context, userID uuid.UUID, ttl time.Duration) (string, time.Time, error) {
+	var token string
 	var exp time.Time
 	err := r.pool.QueryRow(ctx, `
-		SELECT code, expires_at FROM tg_binding_codes
-		WHERE tg_user_id = $1 AND consumed_at IS NULL AND expires_at > now()
-		ORDER BY expires_at DESC LIMIT 1`, id.TGUserID).Scan(&code, &exp)
+		SELECT token, expires_at FROM tg_binding_tokens
+		WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()
+		ORDER BY expires_at DESC LIMIT 1`, userID).Scan(&token, &exp)
 	if err == nil {
-		return &BindingCode{Code: code, ExpiresAt: exp}, nil
+		return token, exp, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, err
+		return "", time.Time{}, err
 	}
 
-	code, err = generateCode()
+	token, err = generateToken()
 	if err != nil {
-		return nil, err
+		return "", time.Time{}, err
 	}
 	exp = time.Now().Add(ttl)
 	if _, err := r.pool.Exec(ctx, `
-		INSERT INTO tg_binding_codes (code, tg_user_id, tg_username, tg_name, expires_at)
-		VALUES ($1, $2, $3, $4, $5)`,
-		code, id.TGUserID, nilIfEmpty(id.Username), nilIfEmpty(id.Name), exp); err != nil {
-		return nil, err
+		INSERT INTO tg_binding_tokens (token, user_id, expires_at)
+		VALUES ($1, $2, $3)`, token, userID, exp); err != nil {
+		return "", time.Time{}, err
 	}
-	return &BindingCode{Code: code, ExpiresAt: exp}, nil
+	return token, exp, nil
 }
 
-// ConsumeCode 原子地消费一条未过期未消费的码，返回它代表的 TG 身份
-func (r *Repo) ConsumeCode(ctx context.Context, code string) (TGIdentity, error) {
-	var id TGIdentity
-	var username, name *string
+// ConsumeToken 原子地核销一枚未过期未使用的令牌，返回它代表的 Squyrrl 用户。
+// UPDATE ... RETURNING 一步完成判定与标记：两个 Bot 实例同时收到同一个
+// token（用户连点两次链接）时，只有一个会拿到行。
+func (r *Repo) ConsumeToken(ctx context.Context, token string) (uuid.UUID, error) {
+	var userID uuid.UUID
 	err := r.pool.QueryRow(ctx, `
-		UPDATE tg_binding_codes SET consumed_at = now()
-		WHERE code = $1 AND consumed_at IS NULL AND expires_at > now()
-		RETURNING tg_user_id, tg_username, tg_name`, code).
-		Scan(&id.TGUserID, &username, &name)
+		UPDATE tg_binding_tokens SET consumed_at = now()
+		WHERE token = $1 AND consumed_at IS NULL AND expires_at > now()
+		RETURNING user_id`, token).Scan(&userID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return id, ErrCodeInvalid
+		return uuid.Nil, ErrTokenInvalid
 	}
-	if err != nil {
-		return id, err
-	}
-	id.Username, id.Name = deref(username), deref(name)
-	return id, nil
+	return userID, err
 }
 
 // =============================================================================

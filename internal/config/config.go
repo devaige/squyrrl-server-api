@@ -31,6 +31,12 @@ type Config struct {
 	TGInternalToken string `env:"SQUYRRL_TG_INTERNAL_TOKEN"`
 	InternalToken   string `env:"SQUYRRL_INTERNAL_TOKEN"`
 
+	// Bot 的 @username（不带 @），用于拼绑定 deep link t.me/<name>?start=<token>。
+	// 由服务端拼而不是客户端硬编码：换 Bot 只改一处环境变量，不用发三端的版本。
+	// 留空 ⇒ 签发绑定链接的端点返回 503（见 tg.Service.IssueBindingLink），
+	// 其余 TG 功能不受影响。
+	TGBotUsername string `env:"SQUYRRL_TG_BOT_USERNAME"`
+
 	// WebAuthn / Passkey
 	WebAuthnRPID    string   `env:"SQUYRRL_WEBAUTHN_RP_ID"     envDefault:"localhost"`
 	WebAuthnRPName  string   `env:"SQUYRRL_WEBAUTHN_RP_NAME"   envDefault:"Squyrrl"`

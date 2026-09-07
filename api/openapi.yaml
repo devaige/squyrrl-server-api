@@ -691,8 +691,10 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------- Telegram Binding
-  # 绑定方向（2026-09-06 反转）：码由 Bot 在 TG 侧为一个 tg_user_id 签发，
-  # 用户带着码到 App 内兑换。旧的「App 出码 → 在 Bot 里 /bind」已移除。
+  # 绑定载体是 Telegram deep link（2026-09-06）：App 为已登录用户签发一枚令牌，
+  # 拼成 t.me/<bot>?start=<token> 渲染成二维码 / 可点链接；用户点开后 Bot 收到
+  # /start <token> 并调内部端核销。用户不搬运任何字符串，令牌也不以人眼可读的
+  # 形式出现，因而不会被顺手粘进群聊。
   /me/tg/bindings:
     get:
       operationId: listTelegramBindings
@@ -713,39 +715,25 @@ paths:
                     items: { $ref: '#/components/schemas/TelegramBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /me/tg/bindings/redeem:
+  /me/tg/binding/link:
     post:
-      operationId: redeemTelegramBindingCode
+      operationId: issueTelegramBindingLink
       tags: [Telegram]
-      summary: 兑换 Bot 签发的绑定码
+      summary: 签发绑定 deep link
       description: |
-        用户在 Telegram 里向 Bot 转发消息，未绑定时 Bot 回复一个 8 位绑定码，
-        用户在 App 内输入它完成绑定。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [code]
-              properties:
-                code: { type: string, example: ABCD2345 }
+        为当前用户签发一枚一次性令牌并拼成 `t.me/<bot>?start=<token>`。
+        TTL 内重复调用返回同一枚令牌，避免用户正在扫码时二维码变化。
+        令牌是 base64url(32B)，43 字符，落在 deep link payload 的 64 字符
+        与 `[A-Za-z0-9_-]` 限制内。
       responses:
         '200':
-          description: 已绑定
+          description: 绑定链接
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TelegramBinding' }
-        '400':
-          description: |
-            绑定码无效或已过期。刻意不用 401：客户端把 401 一律当作登录态失效
-            并强制登出，敲错一个码不该有这种后果。
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/TelegramBindingLink' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '409':
-          description: 该 Telegram 账号已绑定其它 Squyrrl 用户（须先解绑）
+        '503':
+          description: 服务端未配置 `SQUYRRL_TG_BOT_USERNAME`，功能暂未开放
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -770,14 +758,15 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /internal/tg/binding/issue:
+  /internal/tg/binding/consume:
     post:
-      operationId: issueTelegramBindingCode
+      operationId: consumeTelegramBindingToken
       tags: [Telegram]
-      summary: Bot 端：为一个 tg_user_id 签发绑定码
+      summary: Bot 端：核销 deep link 令牌完成绑定
       description: |
         仅 Squyrrl Telegram Bot 调用，受 `X-Internal-Token` 头保护。
-        同一 TG 用户在 TTL 内重复调用会拿回同一张码，避免用户手上攒下多张有效码。
+        Bot 收到 `/start <token>` 后提交令牌与它观察到的 TG 身份；
+        核销是原子的，同一令牌重复提交只有第一次成功。
       security:
         - internalToken: []
       requestBody:
@@ -786,24 +775,30 @@ paths:
           application/json:
             schema:
               type: object
-              required: [tg_user_id]
+              required: [token, tg_user_id]
               properties:
+                token: { type: string }
                 tg_user_id: { type: integer, format: int64 }
                 tg_username: { type: string }
                 tg_name: { type: string }
       responses:
         '200':
-          description: 绑定码
+          description: 已绑定
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/BindingCode' }
+              schema: { $ref: '#/components/schemas/TelegramBinding' }
+        '400':
+          description: 令牌无效或已过期
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: 内部 token 缺失
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: 该 tg_user_id 已绑定
+          description: 该 tg_user_id 已绑定其它 Squyrrl 用户
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1693,13 +1688,18 @@ components:
         expires_at: { type: string, format: date-time }
 
     # ---------- Telegram 绑定 ----------
-    BindingCode:
+    TelegramBindingLink:
       type: object
-      required: [code, expires_at]
+      required: [token, url, expires_at]
       properties:
-        code:
+        token:
           type: string
-          description: 8 位不易混淆字符（去掉 0/O/1/I/L）
+          description: base64url(32B)，43 字符；单独回传供无法唤起 TG 时兜底复制
+        url:
+          type: string
+          format: uri
+          description: 由服务端拼装的 deep link，客户端直接渲染二维码
+          example: https://t.me/SquyrrlBot?start=fT3n9-xQ...
         expires_at: { type: string, format: date-time }
 
     TelegramBinding:

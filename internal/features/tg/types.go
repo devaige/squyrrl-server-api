@@ -9,17 +9,22 @@ import (
 )
 
 var (
-	ErrCodeInvalid     = errors.New("绑定码无效或已过期")
+	ErrTokenInvalid    = errors.New("绑定链接无效或已过期")
 	ErrAlreadyBound    = errors.New("该 Telegram 账号已绑定其它 Squyrrl 用户")
 	ErrNotBound        = errors.New("Telegram 账号未绑定")
 	ErrBindingNotFound = errors.New("绑定不存在")
+	ErrBotUnconfigured = errors.New("服务端未配置 Telegram Bot 用户名")
 )
 
-// 绑定码长度（去掉易混淆字符的 base32 变体）
-const BindingCodeLen = 8
+// BindingTokenBytes 是令牌的随机字节数。base64url 编码后 43 字符，
+// 落在 Telegram deep link payload 的 64 字符上限与 [A-Za-z0-9_-] 字符集内。
+const BindingTokenBytes = 32
 
-type BindingCode struct {
-	Code      string    `json:"code"`
+// BindingLink 是 App 侧展示的绑定入口：URL 渲染成二维码 + 可点链接，
+// Token 单独回传是为了在无法唤起 TG 的环境里给一个兜底的复制项。
+type BindingLink struct {
+	Token     string    `json:"token"`
+	URL       string    `json:"url"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -34,7 +39,7 @@ type Binding struct {
 	LastUsedAt time.Time `json:"last_used_at"`
 }
 
-// TGIdentity 是 Bot 观察到的 TG 用户身份，签发绑定码与建立绑定时一并带上，
+// TGIdentity 是 Bot 观察到的 TG 用户身份，核销令牌建立绑定时一并带上，
 // 仅用于 App 端展示（「你绑的是哪个号」）。TG 侧改名不回流。
 type TGIdentity struct {
 	TGUserID int64  `json:"tg_user_id" binding:"required"`
@@ -43,18 +48,13 @@ type TGIdentity struct {
 }
 
 // =============================================================================
-// 用户端（Bearer）
-// =============================================================================
-
-type RedeemInput struct {
-	Code string `json:"code" binding:"required"`
-}
-
-// =============================================================================
 // 内部端（X-Internal-Token，仅 Bot）
 // =============================================================================
 
-type IssueCodeInput struct {
+// ConsumeTokenInput Bot 收到 /start <token> 后提交：令牌换 Squyrrl 账户，
+// 连同它观察到的 TG 身份一起落成绑定。
+type ConsumeTokenInput struct {
+	Token string `json:"token" binding:"required"`
 	TGIdentity
 }
 

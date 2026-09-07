@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -28,33 +27,25 @@ func NewHandler(svc *Service, fileSvc *file.Service) *Handler {
 // =============================================================================
 
 func (h *Handler) RegisterUser(g *gin.RouterGroup) {
-	g.POST("/bindings/redeem", h.redeem)
+	g.POST("/binding/link", h.issueLink)
 	g.GET("/bindings", h.listBindings)
 	g.DELETE("/bindings/:id", h.unbind)
 }
 
-func (h *Handler) redeem(c *gin.Context) {
+func (h *Handler) issueLink(c *gin.Context) {
 	id := auth.MustIdentity(c)
-	var in RedeemInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	b, err := h.svc.Redeem(c.Request.Context(), id.UserID, normalizeCode(in.Code))
+	link, err := h.svc.IssueBindingLink(c.Request.Context(), id.UserID)
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrCodeInvalid):
-			// 刻意不用 401：客户端的 dio 拦截器把 401 一律当作「登录态失效」并强制登出，
-			// 一个敲错的绑定码不该把用户踢下线。
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		case errors.Is(err, ErrAlreadyBound):
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if errors.Is(err, ErrBotUnconfigured) {
+			// 503 而非 500：这是部署缺一个环境变量，不是代码出错，
+			// 客户端据此提示「功能暂未开放」而不是「出错了，重试」。
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, b)
+	c.JSON(http.StatusOK, link)
 }
 
 func (h *Handler) listBindings(c *gin.Context) {
@@ -90,7 +81,7 @@ func (h *Handler) unbind(c *gin.Context) {
 // =============================================================================
 
 func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
-	g.POST("/binding/issue", h.issueCode)
+	g.POST("/binding/consume", h.consumeToken)
 	g.POST("/binding/revoke", h.revokeBinding)
 	g.GET("/binding/status", h.bindingStatus)
 	g.POST("/snippet", h.forwardSnippet)
@@ -101,22 +92,25 @@ func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 	g.POST("/files", h.uploadFile)
 }
 
-func (h *Handler) issueCode(c *gin.Context) {
-	var in IssueCodeInput
+func (h *Handler) consumeToken(c *gin.Context) {
+	var in ConsumeTokenInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	code, err := h.svc.IssueCode(c.Request.Context(), in.TGIdentity)
+	b, err := h.svc.Bind(c.Request.Context(), in.Token, in.TGIdentity)
 	if err != nil {
-		if errors.Is(err, ErrAlreadyBound) {
+		switch {
+		case errors.Is(err, ErrTokenInvalid):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrAlreadyBound):
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			return
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, code)
+	c.JSON(http.StatusOK, b)
 }
 
 func (h *Handler) revokeBinding(c *gin.Context) {
@@ -243,16 +237,4 @@ func InternalAuth(token string) gin.HandlerFunc {
 		}
 		c.Next()
 	}
-}
-
-// normalizeCode 容忍用户从 TG 里复制过来的码带上空格、连字符或小写 ——
-// 码本身只用大写字母数字，这里统一归一化，省掉一类「明明看着对却提示无效」的投诉。
-func normalizeCode(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToUpper(s) {
-		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }
