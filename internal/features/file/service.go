@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -59,12 +60,30 @@ func (s *Service) VerifyDownloadToken(token string) (*DownloadClaims, error) {
 	return VerifyDownloadToken(s.tokenSecret, token)
 }
 
-// 缩略图对象 key 前缀
-const thumbPrefix = "thumb/"
+// 对象 key 的前缀。**用前缀区分类型，而不是分桶**（2026-09-08 用户决策）：
+// key 是内容寻址的（hex(cipher_hash)，SHA-256），本就不存在命名冲突，分桶换不来隔离；
+// 而多桶会逼 files 行多存一列「在哪个桶」，还要把桶选择器塞进上传令牌 —— 那个令牌刚做过
+// 用途域分离（ADR-070），不该再长出可被外部影响的字段。R2 的生命周期规则支持前缀过滤，
+// 「不同类型不同保留策略」这个常见的分桶理由在这里也不成立。
+// 真正值得单开一个桶的只有备份 / 导出这类 **file GC 绝不该看见** 的对象。
+const (
+	blobPrefix  = "blob/"
+	thumbPrefix = "thumb/"
+)
 
-// ThumbnailKeyFor 生成缩略图在对象存储中的 key
+// StorageKeyFor 由 cipher_hash 推导文件本体的对象 key。
+// 全局唯一由哈希保证，前缀只承担分类。
+func StorageKeyFor(cipherHash []byte) string {
+	return blobPrefix + hex.EncodeToString(cipherHash)
+}
+
+// ThumbnailKeyFor 由文件本体的 key 推导缩略图 key。
+//
+// 取 path.Base 而不是直接拼接：storage_key 带 blob/ 前缀，直接拼会得到
+// thumb/blob/<hex>.jpg —— 两类对象的前缀嵌套起来，按前缀配生命周期规则时会互相打架。
+// 顺带兼容不带前缀的历史 key。
 func ThumbnailKeyFor(storageKey string) string {
-	return thumbPrefix + storageKey + ".jpg"
+	return thumbPrefix + path.Base(storageKey) + ".jpg"
 }
 
 // Check 仅查重，不上传
@@ -110,7 +129,7 @@ func (s *Service) Upload(
 		return nil, ErrCipherMismatch
 	}
 
-	storageKey := hex.EncodeToString(cipherHash)
+	storageKey := StorageKeyFor(cipherHash)
 	if err := s.storage.Put(ctx, storageKey, bytes.NewReader(data), declaredSize, mime); err != nil {
 		return nil, err
 	}
@@ -217,7 +236,7 @@ func (s *Service) signBlobURL(key, mime string, expiresAt time.Time) (string, er
 
 // IssueIntent 是直传的第一步：去重命中就直接返回既有文件，未命中才开意图并签令牌。
 //
-// 刻意**不**检查「同一 plain_hash 是否正在上传中」。storage_key = hex(cipher_hash)
+// 刻意**不**检查「同一 plain_hash 是否正在上传中」。storage_key = blob/hex(cipher_hash)
 // 是内容寻址，两个客户端并发写同一 key 的结果逐字节相同，重复只多花一次带宽；
 // 而阻塞式的 in-flight 检查要引入租约、等待方轮询、上传方猝死后的接管，
 // 复杂度远超它省下的那点流量。
@@ -238,7 +257,7 @@ func (s *Service) IssueIntent(
 		return &IntentResponse{Exists: true, File: existing}, nil
 	}
 
-	storageKey := hex.EncodeToString(cipherHash)
+	storageKey := StorageKeyFor(cipherHash)
 	partCount := PartCountFor(size)
 
 	var r2UploadID string

@@ -79,7 +79,7 @@ CREATE TABLE files (
     size_bytes      BIGINT      NOT NULL,                          -- 原始字节大小，用于配额
     mime            TEXT        NOT NULL DEFAULT 'application/octet-stream',
     storage_bucket  TEXT        NOT NULL,
-    storage_key     TEXT        NOT NULL,                          -- 通常为 cipher_hash 的 hex 字符串
+    storage_key     TEXT        NOT NULL,                          -- `blob/<cipher_hash 的 hex>`；前缀见 file.StorageKeyFor
     ref_count       INT         NOT NULL DEFAULT 0,                -- 引用计数；归零后由 GC 删除
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

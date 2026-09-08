@@ -186,3 +186,30 @@ func TestDownloadTokenRoundTrip(t *testing.T) {
 		t.Errorf("过期应判 ErrTokenExpired，得到 %v", err)
 	}
 }
+
+func TestStorageKeyFor_PrefixedAndContentAddressed(t *testing.T) {
+	h := []byte{0xde, 0xad, 0xbe, 0xef}
+	if got, want := StorageKeyFor(h), "blob/deadbeef"; got != want {
+		t.Fatalf("StorageKeyFor = %q, want %q", got, want)
+	}
+}
+
+// 缩略图 key 必须与本体 key **平级**，不能嵌套成 thumb/blob/…。
+// 两类对象靠前缀区分保留策略，前缀一旦嵌套，按 blob/ 配的生命周期规则会把缩略图
+// 一并扫进去。这正是 ThumbnailKeyFor 取 path.Base 而不是直接拼接的原因。
+func TestThumbnailKeyFor_NotNestedUnderBlobPrefix(t *testing.T) {
+	got := ThumbnailKeyFor(StorageKeyFor([]byte{0xde, 0xad, 0xbe, 0xef}))
+	if want := "thumb/deadbeef.jpg"; got != want {
+		t.Fatalf("ThumbnailKeyFor = %q, want %q", got, want)
+	}
+	if strings.Contains(got, blobPrefix) {
+		t.Fatalf("缩略图 key %q 嵌套了 blob/ 前缀", got)
+	}
+}
+
+// 不带前缀的历史 key 也要能推出正确的缩略图 key（path.Base 顺带兼容）。
+func TestThumbnailKeyFor_LegacyUnprefixedKey(t *testing.T) {
+	if got, want := ThumbnailKeyFor("deadbeef"), "thumb/deadbeef.jpg"; got != want {
+		t.Fatalf("ThumbnailKeyFor = %q, want %q", got, want)
+	}
+}
