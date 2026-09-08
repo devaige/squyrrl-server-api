@@ -10,7 +10,7 @@
 #   DEPLOY_PORT     SSH 端口（可不设，默认 22）
 #   DEPLOY_USER     SSH 用户（须在 docker 组）
 #   DEPLOY_SSH_KEY  部署专用私钥全文
-#   DEPLOY_PATH     本服务在服务器上的目录，如 /opt/squyrrl/server/api
+#   DEPLOY_PATH     本服务在服务器上的目录，如 /home/ecs-user/api.squyrrl.com
 #
 # 服务器前置条件（初次部署，见父仓库 docs/readme/03-server-prod.md）：
 #   · 该目录是本仓库的一个 clone（或父仓库 submodule 检出后的 server/api）
