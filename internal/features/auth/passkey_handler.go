@@ -11,12 +11,14 @@ import (
 // PasskeyHandler 注册 4 个端点：
 //
 // 公开（不要求 Bearer）：
-//   POST /auth/passkey/login/begin
-//   POST /auth/passkey/login/finish
+//
+//	POST /auth/passkey/login/begin
+//	POST /auth/passkey/login/finish
 //
 // 鉴权（要求 Bearer）：
-//   POST /auth/passkey/register/begin
-//   POST /auth/passkey/register/finish
+//
+//	POST /auth/passkey/register/begin
+//	POST /auth/passkey/register/finish
 type PasskeyHandler struct {
 	svc *PasskeyService
 }

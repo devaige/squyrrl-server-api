@@ -5,20 +5,26 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/squyrrl/api/internal/infra/ratelimit"
 )
 
 // 上下文 key：经鉴权中间件后将 Identity 写入 Gin Context
 const ctxKeyIdentity = "auth.identity"
 
 type Handler struct {
-	svc *Service
+	svc        *Service
+	otpLimiter *ratelimit.Limiter
 }
 
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+func NewHandler(svc *Service, otpLimiter *ratelimit.Limiter) *Handler {
+	return &Handler{svc: svc, otpLimiter: otpLimiter}
+}
 
 // RegisterPublic 挂载公开路由（不需要鉴权）
 func (h *Handler) RegisterPublic(g *gin.RouterGroup) {
-	g.POST("/email/request", h.requestEmailOTP)
+	// 只有这一条挂限流：它是全站唯一「无鉴权 + 直接触发第三方付费调用」的端点。
+	g.POST("/email/request", OTPRateLimit(h.otpLimiter), h.requestEmailOTP)
 	g.POST("/email/verify", h.verifyEmailOTP)
 	g.POST("/refresh", h.refresh)
 	g.POST("/qr/redeem", h.redeemQR)

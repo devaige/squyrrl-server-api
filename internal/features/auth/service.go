@@ -16,18 +16,70 @@ const (
 	refreshTokenTTL = 30 * 24 * time.Hour
 )
 
+// OTPGuard 是 OTP 发信的防滥用参数（三层里的第 ① ③ 层；第 ② 层按 IP 限流在中间件里）。
+//
+// 三层各挡一类，缺一层漏一类：
+//
+//	① Cooldown    —— 同一邮箱狂点
+//	② 按 IP 限流   —— 枚举不同邮箱（① 对这类完全无效）
+//	③ DailyBudget —— 前两层都被绕过时，保住发信配额本身
+//
+// 为什么必须由服务端承担：Cloudflare 免费版的限流规则周期与封禁时长都固定 10 秒，
+// 最严的 1 次/10 秒也等于 8,640 次/天，而 Resend 免费版是 100 封/天 —— 差 86 倍。
+// 那条边缘规则挡的是「客户端重试循环写错」这类手滑，不是攻击。详见 ADR-074。
+type OTPGuard struct {
+	Cooldown    time.Duration // <=0 关闭
+	DailyBudget int           // <=0 关闭；按滚动 24 小时计
+}
+
 type Service struct {
 	repo   *Repo
 	mailer *Mailer
+	guard  OTPGuard
 }
 
-func NewService(repo *Repo, mailer *Mailer) *Service {
-	return &Service{repo: repo, mailer: mailer}
+func NewService(repo *Repo, mailer *Mailer, guard OTPGuard) *Service {
+	return &Service{repo: repo, mailer: mailer, guard: guard}
 }
 
 // RequestEmailOTP 生成 OTP 落库并发邮件
 // 不区分"邮箱不存在"错误，永远返回 nil 给上游，避免泄漏邮箱存在性
+//
+// 两道闸门都以 nil 返回（与正常路径无法区分），因为这个端点的返回值本来就刻意
+// 不携带任何状态 —— 一旦让「被冷却」和「已发送」看起来不同，它就重新变成一个
+// 邮箱存在性与限流状态的探测器。
 func (s *Service) RequestEmailOTP(ctx context.Context, email string) error {
+	// ① 按邮箱冷却。窗口内已有未消费的 OTP 就什么都不做 —— **不是重发那一封**：
+	// 库里只存 SHA-256，明文取不回来。用户手上那封在 otpTTL(10min) 内仍然有效，
+	// 所以「不做任何事」对真实用户是无损的，对刷子则是零成本。
+	if s.guard.Cooldown > 0 {
+		recent, err := s.repo.HasRecentOTP(ctx, email, "login", s.guard.Cooldown)
+		if err != nil {
+			return err
+		}
+		if recent {
+			return nil
+		}
+	}
+
+	// ③ 全局发信预算。只在真会消耗配额时检查（dev 无 key 时不计）。
+	// 放在冷却之后：冷却是一次索引命中，能挡掉的请求就不必再做一次全表 count。
+	if s.guard.DailyBudget > 0 && s.mailer.Enabled() {
+		sent, err := s.repo.CountOTPsSince(ctx, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if sent >= s.guard.DailyBudget {
+			// 熔断时**既不建行也不发信**：建了行不发信只会让表继续膨胀，
+			// 而这张表的规模正是靠「超预算就不建行」自我限幅的。
+			// 这里必须吵 —— 熔断意味着真实用户此刻也登不进来，是需要人介入的状态，
+			// 而对外仍返回 nil，不给攻击者「打穿了」的信号。
+			slog.Error("OTP 发信预算已耗尽，本次不发信也不建 OTP，真实用户将无法登录",
+				"sent_24h", sent, "budget", s.guard.DailyBudget)
+			return nil
+		}
+	}
+
 	code, err := newOTPCode()
 	if err != nil {
 		return err

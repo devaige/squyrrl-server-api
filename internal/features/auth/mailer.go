@@ -32,6 +32,10 @@ func NewMailer(apiKey, from string) *Mailer {
 	}
 }
 
+// Enabled 报告是否会真的外发邮件。发信预算只在「真会消耗配额」时才检查 ——
+// dev 无 key 时 SendOTP 只打日志，不该占用预算，否则本地开发跑几十次就把自己锁死。
+func (m *Mailer) Enabled() bool { return m.apiKey != "" }
+
 // SendOTP 发送登录 OTP 邮件
 func (m *Mailer) SendOTP(to, code string) error {
 	subject := "Squyrrl 登录验证码"

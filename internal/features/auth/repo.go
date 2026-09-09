@@ -30,6 +30,38 @@ func (r *Repo) CreateEmailOTP(ctx context.Context, email string, codeHash []byte
 	return err
 }
 
+// HasRecentOTP 报告该邮箱在 within 内是否已有一条未消费的 OTP（第 ① 层：按邮箱冷却）。
+//
+// 命中既有的 idx_email_otps_lookup(email, purpose, created_at DESC) WHERE consumed_at IS NULL，
+// 无需新增索引 —— 那条部分索引本来就是为「查这个邮箱最近的未消费 OTP」建的。
+func (r *Repo) HasRecentOTP(ctx context.Context, email, purpose string, within time.Duration) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM email_otps
+			WHERE email = $1 AND purpose = $2
+			  AND consumed_at IS NULL
+			  AND created_at > now() - make_interval(secs => $3)
+		)`, email, purpose, within.Seconds()).Scan(&exists)
+	return exists, err
+}
+
+// CountOTPsSince 统计最近 window 内创建的 OTP 条数，作为全局发信预算的读数（第 ③ 层）。
+//
+// 用**滚动 24 小时**而不是自然日：自然日要先回答「谁的时区」（服务器？Resend 的配额按
+// UTC 重置？），而滚动窗口对任何时区都成立，且严格更保守 —— 滚动 24h 内不超预算，
+// 则任何自然日内也必不超。
+//
+// 刻意不为它加索引：这张表的规模恰恰被本预算本身限制住了（超预算就不再建行），
+// 一年满打满算也就几万行，count 的顺序扫描是微秒级；为一个自我限幅的表加索引不划算。
+func (r *Repo) CountOTPsSince(ctx context.Context, window time.Duration) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx, `
+		SELECT count(*) FROM email_otps
+		WHERE created_at > now() - make_interval(secs => $1)`, window.Seconds()).Scan(&n)
+	return n, err
+}
+
 // ConsumeEmailOTP 原子地查找并消费一条匹配的未过期 OTP
 // 找不到（含 OTP 错误、已过期、已消费）一律返回 ErrNotFound
 func (r *Repo) ConsumeEmailOTP(ctx context.Context, email string, codeHash []byte, purpose string) error {

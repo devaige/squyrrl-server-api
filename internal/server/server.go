@@ -19,6 +19,7 @@ import (
 	"github.com/squyrrl/api/internal/features/tag"
 	"github.com/squyrrl/api/internal/features/tg"
 	"github.com/squyrrl/api/internal/features/wallet"
+	"github.com/squyrrl/api/internal/infra/ratelimit"
 	"github.com/squyrrl/api/internal/infra/storage"
 )
 
@@ -63,6 +64,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	authSvc := auth.NewService(
 		auth.NewRepo(pool),
 		auth.NewMailer(cfg.ResendAPIKey, cfg.MailFrom),
+		auth.OTPGuard{Cooldown: cfg.OTPCooldown, DailyBudget: cfg.OTPDailyBudget},
 	)
 	pageSvc := page.NewService(page.NewRepo(pool))
 	tagRepo := tag.NewRepo(pool)
@@ -107,7 +109,8 @@ func (s *Server) routes() {
 	s.engine.GET("/health", s.handleHealth)
 
 	// auth：公开 + 鉴权两组
-	authHandler := auth.NewHandler(s.authSvc)
+	authHandler := auth.NewHandler(s.authSvc,
+		ratelimit.New(s.cfg.OTPIPLimit, s.cfg.OTPIPWindow))
 	authHandler.RegisterPublic(s.engine.Group("/auth"))
 	authedAuth := s.engine.Group("/auth")
 	authedAuth.Use(s.authSvc.Middleware())

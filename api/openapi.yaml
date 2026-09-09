@@ -103,8 +103,17 @@ paths:
       tags: [Auth]
       summary: 请求邮箱登录验证码
       description: |
-        生成 6 位数字 OTP，10 分钟有效，通过 SMTP 邮件投递。
-        无论邮箱是否存在均返回 204，避免邮箱枚举。
+        生成 6 位数字 OTP，10 分钟有效，通过 Resend 投递。
+
+        **204 不代表一定发出了邮件。** 三层防滥用中有两层以 204 静默生效，
+        以免这个端点变成邮箱存在性与限流状态的探测器：
+        - 按邮箱冷却：窗口内已有未消费的 OTP 则不重发（用户手上那封仍有效）。
+          库里只存 SHA-256，明文取不回来，所以是「不做任何事」而非「重发」。
+        - 全局发信预算：滚动 24 小时的发信量触顶时熔断，不建 OTP 也不发信，
+          仅在服务端日志告警。此状态下真实用户同样无法登录，需人工介入。
+
+        第三层按 IP 限流则返回 **429** —— 它拦的是明确的滥用，不涉及邮箱存在性，
+        没有需要隐藏的信息，而客户端需要这个状态码才能实现退避。
       security: []
       requestBody:
         required: true
@@ -116,8 +125,13 @@ paths:
               properties:
                 email: { type: string, format: email }
       responses:
-        '204': { description: 已（尝试）发送 }
+        '204': { description: 已（尝试）发送；也可能因冷却或预算熔断而未实际发信 }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '429':
+          description: 该来源 IP 请求过于频繁，请退避后重试
+          content:
+            application/json:
+              schema: { type: object, properties: { error: { type: string } } }
 
   /auth/email/verify:
     post:

@@ -62,6 +62,17 @@ type Config struct {
 	// envDefault 与下方 devUploadTokenSecret 必须同值（Go 的 tag 只能写字面量）。
 	UploadTokenSecret string `env:"SQUYRRL_UPLOAD_TOKEN_SECRET" envDefault:"dev-upload-token-secret"`
 
+	// OTP 发信防滥用三层（ADR-074）。全部走 envDefault、不进 .env 模板 ——
+	// 与 SQUYRRL_PARSE_COST 同例：跨环境统一，要调时显式覆盖即可。任一项 <=0 即关闭该层。
+	//   Cooldown    同一邮箱的冷却窗口
+	//   IPLimit/Window  单 IP 在窗口内允许的请求数（进程内计数，重启清零）
+	//   DailyBudget 滚动 24 小时的发信上限。Resend 免费版 100 封/天，留 20 封余量。
+	//     熔断时真实用户也登不进来，所以它是最后一道而非第一道 —— 触发即需人工介入。
+	OTPCooldown    time.Duration `env:"SQUYRRL_OTP_COOLDOWN"     envDefault:"60s"`
+	OTPIPLimit     int           `env:"SQUYRRL_OTP_IP_LIMIT"     envDefault:"10"`
+	OTPIPWindow    time.Duration `env:"SQUYRRL_OTP_IP_WINDOW"    envDefault:"1h"`
+	OTPDailyBudget int           `env:"SQUYRRL_OTP_DAILY_BUDGET" envDefault:"80"`
+
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`
 
