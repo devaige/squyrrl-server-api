@@ -47,7 +47,12 @@ jobs:
             set -euo pipefail
             cd "${{ secrets.DEPLOY_PATH }}"
 
-            COMPOSE="docker compose -f docker-compose.prod.yml --env-file .env.prod"
+            # 用**函数**而不是变量。zsh 不对参数展开做单词切分（bash 会），于是
+            # `compose up -d --build` 在 zsh 下被整体当成一个命令名，报
+            # `command not found: docker compose -f ...`。ssh-action 走的是登录 shell，
+            # 而本机部署用户的登录 shell 是 zsh —— 这类差异在本地 bash 上永远复现不出来。
+            # 函数在 bash / zsh / dash 下行为一致，也不依赖服务器装了哪个 shell。
+            compose() { docker compose -f docker-compose.prod.yml --env-file .env.prod "$@"; }
 
             echo "::group::pull"
             git fetch --depth 1 origin main
@@ -62,15 +67,15 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::deploy"
-            $COMPOSE up -d --build
+            compose up -d --build
             echo "::endgroup::"
 
             # 迁移只跟着 api 走：schema 变更必然伴随 api 代码变更。goose 幂等，
             # 非首次部署是空操作。连接串从容器里回读再传给 goose，而不是在宿主
             # shell 里展开：避免生产库口令出现在 CI 日志和 shell history 里。
             echo "::group::migrate"
-            DB_URL="$($COMPOSE exec -T api sh -c 'echo "$SQUYRRL_DATABASE_URL"' | tr -d '\r\n')"
-            $COMPOSE exec -T api goose -dir /app/migrations postgres "$DB_URL" up
+            DB_URL="$(compose exec -T api sh -c 'echo "$SQUYRRL_DATABASE_URL"' | tr -d '\r\n')"
+            compose exec -T api goose -dir /app/migrations postgres "$DB_URL" up
             echo "::endgroup::"
 
             echo "::group::prune"
