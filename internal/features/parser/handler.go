@@ -34,9 +34,18 @@ func (h *Handler) manifest(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "manifest encode failed"})
 		return
 	}
-	// 混淆下发（防一眼抓包，非加密，见 manifest_obfuscate.go）。确定性输出，容 CDN 短缓存。
+	// 混淆下发（防一眼抓包，非加密，见 manifest_obfuscate.go）。确定性输出，容 CDN 缓存。
 	// 客户端反混淆后读内部 version 决定是否换本地缓存。
-	c.Header("Cache-Control", "public, max-age=300")
+	//
+	// 4 小时是与边缘对齐的结果，不是随手取的值：这个头决定 Cloudflare 的**边缘** TTL，
+	// 而发给浏览器的 max-age 另由 zone 的 Browser Cache TTL 决定，其默认值就是 4 小时且会
+	// 覆盖本头。原先这里写 300，于是「代码说 5 分钟、客户端实际缓存 4 小时」——
+	// 边缘 TTL 短一点并不能让客户端更快拿到新版本（浏览器那层才是瓶颈），只是白白多打源站。
+	// 两边取同一个值，代码与现实一致，也少一次回源。
+	//
+	// 代价：解析清单变更后，最坏情况客户端约 8 小时（边缘 4h + 浏览器 4h）才看到新版本。
+	// 对这份数据可以接受 —— 它只在 parser 的匹配正则变动时才变，而那是低频事件。
+	c.Header("Cache-Control", "public, max-age=14400")
 	c.String(http.StatusOK, obfuscateManifest(plain))
 }
 

@@ -106,7 +106,11 @@ func (s *Server) Handler() http.Handler { return s.engine }
 func (s *Server) FileService() *file.Service { return s.fileSvc }
 
 func (s *Server) routes() {
+	// GET 与 HEAD 都要注册：**Gin 不会为 GET 路由自动响应 HEAD**（httprouter 的行为，
+	// 与 net/http 的 ServeMux 不同），漏了这条 HEAD /health 会返回 404。
+	// 而多数拨测服务默认就发 HEAD —— 那会表现为「服务明明是好的，监控一直报宕机」。
 	s.engine.GET("/health", s.handleHealth)
+	s.engine.HEAD("/health", s.handleHealth)
 
 	// auth：公开 + 鉴权两组
 	authHandler := auth.NewHandler(s.authSvc,
