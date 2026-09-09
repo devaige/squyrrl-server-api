@@ -23,11 +23,12 @@ type Config struct {
 	S3UseSSL    bool   `env:"SQUYRRL_S3_USE_SSL" envDefault:"false"`
 
 	// 邮件走 Resend HTTP API。ResendAPIKey 为空时进入本地日志模式（不外发，见 auth.Mailer）。
-	// 发信域刻意用组织级的 lumixord.com 而非产品域 squyrrl.com：Resend 免费版只能验证一个域，
-	// 组织域可被后续产品共用；品牌辨识靠 From 的显示名承载，与域名解耦。代价是 SPF/DKIM/DMARC
-	// 要配在 lumixord.com 的 DNS 区。改回产品域只需覆盖这一个环境变量。
+	// 发信域用产品域 squyrrl.com（2026-09-09 改回）：Resend 免费版现已支持验证多个域，
+	// 当初改用组织级 lumixord.com 的唯一理由（免费版只能验一个域）不再成立。
+	// SPF / DKIM / DMARC 三条记录相应配在 squyrrl.com 区 —— From 域与验证域不一致时
+	// 邮件直接进垃圾箱，这是换域时唯一会咬人的地方。
 	ResendAPIKey string `env:"SQUYRRL_RESEND_API_KEY"`
-	MailFrom     string `env:"SQUYRRL_MAIL_FROM" envDefault:"Squyrrl <noreply@lumixord.com>"`
+	MailFrom     string `env:"SQUYRRL_MAIL_FROM" envDefault:"Squyrrl <noreply@squyrrl.com>"`
 
 	// 内部 server-to-server token，按端点分权（最小权限）：
 	//   TGInternalToken 守 /internal/tg（Bot 绑定/转发碎片）；InternalToken 守 /internal/admin
