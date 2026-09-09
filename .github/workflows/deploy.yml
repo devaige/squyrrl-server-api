@@ -70,13 +70,13 @@ jobs:
             compose up -d --build
             echo "::endgroup::"
 
-            # 迁移只跟着 api 走：schema 变更必然伴随 api 代码变更。goose 幂等，
-            # 非首次部署是空操作。连接串从容器里回读再传给 goose，而不是在宿主
-            # shell 里展开：避免生产库口令出现在 CI 日志和 shell history 里。
-            echo "::group::migrate"
-            DB_URL="$(compose exec -T api sh -c 'echo "$SQUYRRL_DATABASE_URL"' | tr -d '\r\n')"
-            compose exec -T api goose -dir /app/migrations postgres "$DB_URL" up
-            echo "::endgroup::"
+            # 这里**没有**迁移步骤：api 在 cmd/api/main.go 启动时就调 db.Migrate(pool)，
+            # 上面的 `compose up -d` 一起来就已经迁完了（容器日志里那串 `OK 000001_init.sql`
+            # 就是它打的）。原先这里另跑一遍 goose，是一次必然的空操作，却要额外依赖镜像里
+            # 存在 goose 二进制、并把生产库连接串经 shell 回读一趟 —— 净增失败点而无收益。
+            #
+            # 代价要清楚：迁移失败现在表现为**容器起不来**（启动即 fatal），而不是一个单独
+            # 变红的步骤。排查入口相应变成 `docker compose logs api`，deploy 本身可能是绿的。
 
             echo "::group::prune"
             docker image prune -f
