@@ -50,7 +50,7 @@ func VerifyGoogleOIDC(bearer, expectedAud string) error {
 // googlePushEnvelope Pub/Sub push 的外层结构
 type googlePushEnvelope struct {
 	Message struct {
-		Data       string            `json:"data"`        // base64-encoded
+		Data       string            `json:"data"` // base64-encoded
 		Attributes map[string]string `json:"attributes"`
 	} `json:"message"`
 	Subscription string `json:"subscription"`
@@ -61,16 +61,18 @@ type googleRTDN struct {
 	PackageName              string `json:"packageName"`
 	EventTimeMillis          int64  `json:"eventTimeMillis,string"`
 	SubscriptionNotification *struct {
-		NotificationType  int    `json:"notificationType"`
-		PurchaseToken     string `json:"purchaseToken"`
-		SubscriptionID    string `json:"subscriptionId"` // 'squyrrl_basic_monthly'
+		NotificationType int    `json:"notificationType"`
+		PurchaseToken    string `json:"purchaseToken"`
+		SubscriptionID   string `json:"subscriptionId"` // 'squyrrl_basic_monthly'
 	} `json:"subscriptionNotification"`
 }
 
 // Google RTDN notificationType:
-//   1 RECOVERED  2 RENEWED  3 CANCELED  4 PURCHASED
-//   5 ON_HOLD    6 IN_GRACE 7 RESTARTED 8 PRICE_CHANGE
-//  10 PAUSED    12 REVOKED 13 EXPIRED
+//
+//	 1 RECOVERED  2 RENEWED  3 CANCELED  4 PURCHASED
+//	 5 ON_HOLD    6 IN_GRACE 7 RESTARTED 8 PRICE_CHANGE
+//	10 PAUSED    12 REVOKED 13 EXPIRED
+//
 // 我们只关心 status 映射：
 var googleStatus = map[int]string{
 	1: "active", 2: "active", 4: "active", 7: "active",

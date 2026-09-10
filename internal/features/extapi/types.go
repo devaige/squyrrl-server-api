@@ -35,9 +35,10 @@ type Endpoint struct {
 // EndpointConfig 是 config JSONB 的强类型形态，驱动据此构造请求、映射响应。
 //
 // 占位符在 url_template / query / headers / body 中生效：
-//   ${resource_id}  被解析资源在 provider 命名空间内的 ID（视频 ID 等）
-//   ${uri}          原始 URI
-//   ${env:VARNAME}  运行时读环境变量（用于 API key —— 密钥永远只在 env，不落库）
+//
+//	${resource_id}  被解析资源在 provider 命名空间内的 ID（视频 ID 等）
+//	${uri}          原始 URI
+//	${env:VARNAME}  运行时读环境变量（用于 API key —— 密钥永远只在 env，不落库）
 type EndpointConfig struct {
 	Method      string            `json:"method"`       // 默认 GET
 	URLTemplate string            `json:"url_template"` // 必填；为空视为「无驱动配置」，Fetch 跳过

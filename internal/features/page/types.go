@@ -23,7 +23,7 @@ type Page struct {
 }
 
 type CreateInput struct {
-	ID       *uuid.UUID `json:"id,omitempty"`                                    // 客户端可指定（离线生成）
+	ID       *uuid.UUID `json:"id,omitempty"` // 客户端可指定（离线生成）
 	Name     string     `json:"name" binding:"required,min=1,max=100"`
 	IsHidden bool       `json:"is_hidden"`
 	OrderIdx int        `json:"order_idx"`

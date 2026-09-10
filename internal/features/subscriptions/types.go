@@ -27,17 +27,17 @@ const (
 // SubscriptionEvent 是统一的内部事件结构，三家 webhook 各自映射到这里。
 // 这样 service 层只关心「该激活 / 该续期 / 该取消」三种语义，与具体 provider 解耦。
 type SubscriptionEvent struct {
-	Provider              Provider
-	ProviderSubscriptionID string  // Stripe sub_xxx / Apple originalTransactionId / Google purchaseToken
-	UserID                uuid.UUID // 必填：从 metadata / external account 取
-	Kind                  string    // 'plan' | 'storage'
-	Tier                  string    // 'basic'|'standard'|'premium'|'maximum' 或 storage tier
-	BillingPeriod         string    // 'monthly' | 'yearly'
-	Status                string    // 'active' | 'past_due' | 'canceled' | 'expired'
-	PeriodStart           time.Time
-	PeriodEnd             time.Time
-	CanceledAt            *time.Time
-	BonusStorageGB        *int      // storage 类型时填入
+	Provider               Provider
+	ProviderSubscriptionID string    // Stripe sub_xxx / Apple originalTransactionId / Google purchaseToken
+	UserID                 uuid.UUID // 必填：从 metadata / external account 取
+	Kind                   string    // 'plan' | 'storage'
+	Tier                   string    // 'basic'|'standard'|'premium'|'maximum' 或 storage tier
+	BillingPeriod          string    // 'monthly' | 'yearly'
+	Status                 string    // 'active' | 'past_due' | 'canceled' | 'expired'
+	PeriodStart            time.Time
+	PeriodEnd              time.Time
+	CanceledAt             *time.Time
+	BonusStorageGB         *int // storage 类型时填入
 }
 
 // 这里原本有一张 CreditsByTier 表，webhook 收到 active / 续期时按档位赠送 credits。

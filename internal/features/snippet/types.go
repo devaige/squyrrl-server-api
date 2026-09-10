@@ -25,8 +25,8 @@ type ConflictError struct {
 	CurrentVersion int64
 }
 
-func (e *ConflictError) Error() string             { return "version conflict" }
-func (e *ConflictError) Is(target error) bool      { return target == ErrVersionConflict }
+func (e *ConflictError) Error() string        { return "version conflict" }
+func (e *ConflictError) Is(target error) bool { return target == ErrVersionConflict }
 
 type Element struct {
 	ID        uuid.UUID `json:"id"`
@@ -84,7 +84,8 @@ type CreateInput struct {
 
 // UpdateInput 采用「字段存在即更新」语义。version 字段做乐观锁。
 // 限制：本接口暂不支持把 page_id / title / description / text_lang 显式置空（pointer 无法区分 omit 与 null）。
-//      若需清空，使用专用端点（待后续实现）或重建碎片。
+//
+//	若需清空，使用专用端点（待后续实现）或重建碎片。
 type UpdateInput struct {
 	Version int64 `json:"version" binding:"required"`
 
@@ -95,7 +96,7 @@ type UpdateInput struct {
 	TextFormat  *string         `json:"text_format,omitempty" binding:"omitempty,oneof=plain markdown code"`
 	TextLang    *string         `json:"text_lang,omitempty"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
-	TagIDs      *[]uuid.UUID    `json:"tag_ids,omitempty"` // nil = 不变；空切片 = 清空所有标签
+	TagIDs      *[]uuid.UUID    `json:"tag_ids,omitempty"`  // nil = 不变；空切片 = 清空所有标签
 	Elements    *[]ElementInput `json:"elements,omitempty"` // nil = 不变；空切片 = 清空所有元素
 }
 

@@ -76,15 +76,15 @@ func (p *GenericOGProvider) Parse(ctx context.Context, uri, _ string) (*ParseRes
 	finalDesc := firstNonEmpty(meta["og:description"], meta["twitter:description"], meta["description"])
 
 	payload, _ := json.Marshal(map[string]any{
-		"url":             uri,
-		"og_title":        meta["og:title"],
-		"og_description":  meta["og:description"],
-		"og_image":        meta["og:image"],
-		"og_site_name":    meta["og:site_name"],
-		"og_type":         meta["og:type"],
-		"twitter_card":    meta["twitter:card"],
-		"final_url":       resp.Request.URL.String(),
-		"http_status":     resp.StatusCode,
+		"url":            uri,
+		"og_title":       meta["og:title"],
+		"og_description": meta["og:description"],
+		"og_image":       meta["og:image"],
+		"og_site_name":   meta["og:site_name"],
+		"og_type":        meta["og:type"],
+		"twitter_card":   meta["twitter:card"],
+		"final_url":      resp.Request.URL.String(),
+		"http_status":    resp.StatusCode,
 	})
 	source, _ := json.Marshal(map[string]any{
 		"provider": "url",

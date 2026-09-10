@@ -10,10 +10,10 @@ import (
 )
 
 type Handler struct {
-	svc                 *Service
-	stripeSecret        string
-	appleSecret         string
-	googlePubsubAud     string
+	svc             *Service
+	stripeSecret    string
+	appleSecret     string
+	googlePubsubAud string
 }
 
 func NewHandler(svc *Service, stripeSecret, appleSecret, googlePubsubAud string) *Handler {
@@ -27,9 +27,10 @@ func NewHandler(svc *Service, stripeSecret, appleSecret, googlePubsubAud string)
 
 // Register 挂在公网根上 —— webhook 不能走 Bearer 中间件
 // 路径：
-//   POST /webhooks/stripe
-//   POST /webhooks/apple
-//   POST /webhooks/google
+//
+//	POST /webhooks/stripe
+//	POST /webhooks/apple
+//	POST /webhooks/google
 func (h *Handler) Register(g *gin.RouterGroup) {
 	g.POST("/stripe", h.stripe)
 	g.POST("/apple", h.apple)

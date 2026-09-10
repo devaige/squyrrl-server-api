@@ -22,9 +22,10 @@ func NewService(repo *Repo) *Service {
 }
 
 // Fetch 按 provider 的兜底链依次尝试 endpoint：
-//   跳过：config 缺 url_template（尚未接好）/ 有单价但余额 <= 0
-//   失败：网络错 / 非 2xx / 响应非 JSON —— 记录并尝试下一个
-//   成功：记一笔平台成本（= 单价）+ 可选采样存档，立即返回
+//
+//	跳过：config 缺 url_template（尚未接好）/ 有单价但余额 <= 0
+//	失败：网络错 / 非 2xx / 响应非 JSON —— 记录并尝试下一个
+//	成功：记一笔平台成本（= 单价）+ 可选采样存档，立即返回
 //
 // 返回 ErrNoEndpoint 表示「没有任何可尝试的 endpoint」，上层据此回退到内置免费实现。
 // 全链尝试后仍失败则返回聚合错误（上层同样可回退）。

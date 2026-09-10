@@ -38,11 +38,11 @@ type appleNotification struct {
 	Data             struct {
 		// 业务约定：在 App Store Connect 配置 App Account Token =/= UUID 形式的 user_id
 		// 这样 webhook 不用回查 receipt verification 即可定位用户
-		AppAccountToken        string `json:"appAccountToken"`
-		ProductID              string `json:"productId"`           // 'squyrrl.basic.monthly' …
-		OriginalTransactionID  string `json:"originalTransactionId"`
-		ExpiresDate            int64  `json:"expiresDate"`         // ms epoch
-		PurchaseDate           int64  `json:"purchaseDate"`        // ms epoch
+		AppAccountToken       string `json:"appAccountToken"`
+		ProductID             string `json:"productId"` // 'squyrrl.basic.monthly' …
+		OriginalTransactionID string `json:"originalTransactionId"`
+		ExpiresDate           int64  `json:"expiresDate"`  // ms epoch
+		PurchaseDate          int64  `json:"purchaseDate"` // ms epoch
 	} `json:"data"`
 }
 

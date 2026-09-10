@@ -12,10 +12,10 @@ import (
 )
 
 var (
-	ErrPayloadTooLarge   = errors.New("claim payload exceeds size limits")
-	ErrFileNotFound      = errors.New("one or more referenced file_ids do not exist")
-	ErrInvalidPageRef    = errors.New("snippet.page_id references a page not in the claim and not owned by user")
-	ErrDuplicateName     = errors.New("tag name collision could not be resolved")
+	ErrPayloadTooLarge = errors.New("claim payload exceeds size limits")
+	ErrFileNotFound    = errors.New("one or more referenced file_ids do not exist")
+	ErrInvalidPageRef  = errors.New("snippet.page_id references a page not in the claim and not owned by user")
+	ErrDuplicateName   = errors.New("tag name collision could not be resolved")
 )
 
 // 上限：单次 claim 单次扁平最多多少条；超过返回 ErrPayloadTooLarge。
