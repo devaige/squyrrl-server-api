@@ -74,6 +74,11 @@ type Config struct {
 	OTPIPWindow    time.Duration `env:"SQUYRRL_OTP_IP_WINDOW"    envDefault:"1h"`
 	OTPDailyBudget int           `env:"SQUYRRL_OTP_DAILY_BUDGET" envDefault:"80"`
 
+	// 验证侧的闸门（与上面三层不同轴：那三层管发信，这个管猜解）。
+	// 单个邮箱在一个码周期内允许猜错的次数，用尽即销毁该邮箱下所有存活的码。
+	// 取 5：6 位码猜中概率 5/10^6，而真实用户连错 5 次已属罕见。
+	OTPMaxAttempts int `env:"SQUYRRL_OTP_MAX_ATTEMPTS" envDefault:"5"`
+
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`
 

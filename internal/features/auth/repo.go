@@ -89,6 +89,48 @@ func (r *Repo) ConsumeEmailOTP(ctx context.Context, email string, codeHash []byt
 	return nil
 }
 
+// RecordFailedOTPAttempt 记一次验证失败，并销毁已经用尽尝试次数的验证码。
+// 返回本次被销毁的条数（>0 意味着有人在猜，是需要被看见的信号）。
+//
+// **计数是按邮箱而非按行**：冷却窗口 60s、TTL 10min，同一邮箱最多可有 10 个码同时有效，
+// 若各自独立计数，攻击者就拿到了 10 × maxAttempts 次机会。所以一次失败让该邮箱下**全部**
+// 存活的码各加一次 —— 无论攻击者当时想猜哪一个，总预算恒为 maxAttempts。
+//
+// **必须是单条 UPDATE，不能 SELECT 出来再改**：并发的两次错误猜测下，
+// `attempts = attempts + 1` 由 Postgres 的行锁串行化，第二个事务会在锁释放后重读到
+// 已提交的新值；先读后写则两者都基于同一个旧值，计数会丢。
+//
+// **也不能带 SKIP LOCKED**（隔壁 ConsumeEmailOTP 有）：那里跳过是为了让并发核销互不阻塞，
+// 而这里跳过等于漏计——攻击者只要把请求打并发就能把计数器绕过去。阻塞才是对的。
+func (r *Repo) RecordFailedOTPAttempt(ctx context.Context, email, purpose string, maxAttempts int) (int, error) {
+	rows, err := r.pool.Query(ctx, `
+		UPDATE email_otps
+		SET attempts    = attempts + 1,
+		    consumed_at = CASE WHEN attempts + 1 >= $3 THEN now() ELSE NULL END
+		WHERE email = $1
+		  AND purpose = $2
+		  AND consumed_at IS NULL
+		  AND expires_at > now()
+		RETURNING consumed_at IS NOT NULL`,
+		email, purpose, maxAttempts)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	burned := 0
+	for rows.Next() {
+		var isBurned bool
+		if err := rows.Scan(&isBurned); err != nil {
+			return 0, err
+		}
+		if isBurned {
+			burned++
+		}
+	}
+	return burned, rows.Err()
+}
+
 // =============================================================================
 // users
 // =============================================================================

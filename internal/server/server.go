@@ -64,7 +64,11 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	authSvc := auth.NewService(
 		auth.NewRepo(pool),
 		auth.NewMailer(cfg.ResendAPIKey, cfg.MailFrom),
-		auth.OTPGuard{Cooldown: cfg.OTPCooldown, DailyBudget: cfg.OTPDailyBudget},
+		auth.OTPGuard{
+			Cooldown:    cfg.OTPCooldown,
+			DailyBudget: cfg.OTPDailyBudget,
+			MaxAttempts: cfg.OTPMaxAttempts,
+		},
 	)
 	pageSvc := page.NewService(page.NewRepo(pool))
 	tagRepo := tag.NewRepo(pool)
