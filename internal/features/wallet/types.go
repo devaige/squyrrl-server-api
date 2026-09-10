@@ -30,6 +30,13 @@ type GrantInput struct {
 	UserID uuid.UUID `json:"user_id" binding:"required"`
 	Delta  int64     `json:"delta" binding:"required"` // 正数入账，负数也可（罚扣）
 	Reason string    `json:"reason" binding:"required"`
+
+	// IdempotencyKey 可选。给定后，同一个键重复提交只会落一笔流水，
+	// 后续请求原样返回首次的结果并把 Replayed 置为 true。
+	//
+	// 支付回调必须传（网关重试是常态而非异常），后台手工发放建议传
+	// （客服重复点提交是最常见的重复发放来源）。运营一次性调账可以不传。
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type GrantResponse struct {
@@ -37,4 +44,8 @@ type GrantResponse struct {
 	Delta        int64     `json:"delta"`
 	BalanceAfter int64     `json:"balance_after"`
 	LedgerID     uuid.UUID `json:"ledger_id"`
+
+	// Replayed 为 true 表示这次请求命中了既有的幂等键，没有产生新流水。
+	// 调用方据此区分「刚扣成功」与「之前就扣过了」—— 两者都是成功，但含义不同。
+	Replayed bool `json:"replayed,omitempty"`
 }

@@ -1254,6 +1254,11 @@ paths:
                 reason:
                   type: string
                   description: 流水原因，例如 'purchase' / 'admin_grant' / 'parse_uri' / 'refund'
+                idempotency_key:
+                  type: string
+                  description: |
+                    可选。同一个键重复提交只落一笔流水，后续请求原样返回首次结果并带 `replayed: true`。
+                    支付回调**必须**传（网关重试是常态）；后台手工发放建议传（客服重复点提交是最常见的重复发放来源）。
       responses:
         '200':
           description: 流水记录已生成
@@ -1953,6 +1958,12 @@ components:
           format: int64
           description: 该笔写入后的余额（写入瞬间的诊断字段；真实余额以 Wallet.credits_balance 为准）
         ledger_id: { type: string, format: uuid }
+        replayed:
+          type: boolean
+          description: |
+            为 true 表示本次请求命中了既有的 `idempotency_key`，没有产生新流水，
+            返回的是首次写入的结果。两种情况都算成功，但含义不同：
+            调用方据此区分「刚扣成功」与「之前就扣过了」。
 
     # ---------- QR 扫码绑定 ----------
     QRCode:

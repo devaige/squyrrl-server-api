@@ -24,8 +24,10 @@ func (s *Service) GetWallet(ctx context.Context, userID uuid.UUID) (*Wallet, err
 	return &Wallet{Plan: plan, CreditsBalance: bal}, nil
 }
 
-func (s *Service) Grant(ctx context.Context, userID uuid.UUID, delta int64, reason string) (*GrantResponse, error) {
-	return s.repo.Grant(ctx, userID, delta, reason)
+// Grant 落一笔 credits 流水。idemKey 为空表示不参与幂等；
+// 非空时同一个键重复调用只落一笔，后续调用返回首次结果且 Replayed=true。
+func (s *Service) Grant(ctx context.Context, userID uuid.UUID, delta int64, reason, idemKey string) (*GrantResponse, error) {
+	return s.repo.Grant(ctx, userID, delta, reason, idemKey)
 }
 
 // Consume 试扣 cost 个 credits；余额不足返 ErrInsufficientCredits。
