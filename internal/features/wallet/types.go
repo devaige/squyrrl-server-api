@@ -50,9 +50,21 @@ type Wallet struct {
 	// （比如碎片列表到达上限时提前置灰新建按钮，而不是等服务端回 402）。
 	Limits entitlement.Tier `json:"limits"`
 
+	// Usage 是当前占用。与 Limits 成对下发 —— 只有上限而不知道已用了多少，
+	// 客户端就算不出「还能再加多少」，而那正是匿名数据迁移界面要实时显示的数字。
+	Usage UsageView `json:"usage"`
+
 	// Storage 与 plan 完全无关 —— 它来自独立购买的 storage 订阅，可叠加。
 	// 未购买时 quota_bytes 为 0，此时任何文件上传都会被拒。
 	Storage StorageView `json:"storage"`
+}
+
+// UsageView 是各项资源的当前占用，字段与 Limits 一一对应。
+type UsageView struct {
+	Snippets int `json:"snippets"`
+	Pages    int `json:"pages"`
+	Tags     int `json:"tags"`
+	Devices  int `json:"devices"`
 }
 
 // StorageView 是云存储的配额与占用，字节为单位。

@@ -95,7 +95,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
 	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool))
-	claimSvc := claim.NewService(pool)
+	claimSvc := claim.NewService(pool, quotaSvc)
 
 	s := &Server{
 		cfg: cfg, pool: pool, engine: engine,

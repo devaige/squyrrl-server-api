@@ -11,11 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Service struct {
-	pool *pgxpool.Pool
+// QuotaChecker 校验这一批数据落库后是否仍在档位配额内。由 quota.Service 实现。
+type QuotaChecker interface {
+	CheckBatch(ctx context.Context, userID uuid.UUID, addSnippets, addPages, addTags int) error
 }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+type Service struct {
+	pool  *pgxpool.Pool
+	quota QuotaChecker
+}
+
+func NewService(pool *pgxpool.Pool, q QuotaChecker) *Service {
+	return &Service{pool: pool, quota: q}
+}
 
 // Apply 在单一事务里把 in 全部内容写入 userID 名下。
 // 流程：
@@ -24,7 +32,16 @@ func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
 //  3. 开事务：先 pages → 再 tags（带 name 冲突 remap）→ 再 snippets → 再 elements + snippet_tags
 //  4. 写 anonymous_claims 记录本次完成
 func (s *Service) Apply(ctx context.Context, userID uuid.UUID, in *ClaimInput) (*ClaimResult, error) {
+	// 两道校验，管的是两件不同的事，缺一不可：
+	//   validateLimits —— 单个请求的体积上限，防超大 payload 撑爆内存，与档位无关；
+	//   quota.CheckBatch —— 落库后是否仍在该用户的档位配额内，与请求大小无关。
+	//
+	// 后者是**防御性**的：正常流程下客户端已在迁移界面按实时余量约束了用户的勾选，
+	// 走到这里就该通过。它存在只因为服务端不能信任客户端。
 	if err := validateLimits(in); err != nil {
+		return nil, err
+	}
+	if err := s.quota.CheckBatch(ctx, userID, len(in.Snippets), len(in.Pages), len(in.Tags)); err != nil {
 		return nil, err
 	}
 

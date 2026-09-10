@@ -20,6 +20,7 @@ import (
 // 那时两者都已就绪 —— 用构造顺序解开依赖，而不是引入 setter 注入。
 type StorageReader interface {
 	Storage(ctx context.Context, userID uuid.UUID) (quota.StorageStatus, error)
+	CurrentUsage(ctx context.Context, userID uuid.UUID) (quota.Usage, error)
 }
 
 type Handler struct {
@@ -54,8 +55,17 @@ func (h *Handler) getWallet(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	use, err := h.storage.CurrentUsage(ctx, id.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	w.Storage = StorageView{QuotaBytes: st.QuotaBytes, UsedBytes: st.UsedBytes}
 	w.Limits = entitlement.MustOf(w.Plan)
+	w.Usage = UsageView{
+		Snippets: use.Snippets, Pages: use.Pages,
+		Tags: use.Tags, Devices: use.Devices,
+	}
 	c.JSON(http.StatusOK, w)
 }
 

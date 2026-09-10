@@ -18,8 +18,14 @@ var (
 	ErrDuplicateName   = errors.New("tag name collision could not be resolved")
 )
 
-// 上限：单次 claim 单次扁平最多多少条；超过返回 ErrPayloadTooLarge。
-// 防止恶意客户端通过单一 claim 撑爆账户。可由配置覆盖（暂未走 cfg，硬编码）。
+// 单次请求的**体积**上限，超过返回 ErrPayloadTooLarge。
+//
+// 它防的是「一个巨大的 payload 把服务端内存撑爆」，**不是配额** ——
+// 档位配额由 quota.CheckBatch 独立校验（ADR-075）。两者不可互相替代：
+// 一个 basic 用户（碎片上限 10000）即便分十次、每次一千条提交，
+// 体积检查全程放行，而配额检查会在总量越界时拒绝。
+//
+// 也正因为它只管体积，这几个数字不需要跟着档位表变动。
 const (
 	MaxPages    = 1_000
 	MaxTags     = 1_000

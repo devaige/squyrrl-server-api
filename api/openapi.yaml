@@ -1206,11 +1206,16 @@ paths:
     get:
       operationId: getWallet
       tags: [Wallet]
-      summary: 当前用户的订阅 plan + 代币余额
+      summary: 当前用户的三块增值服务状态
       description: |
-        Phase 1.5 只读视图：
-        - `plan` = 用户当前 active 的会员订阅 tier；无活跃订阅时返 `"free"`。
-        - `credits_balance` = `SUM(delta)` over `credits_ledger`，永远以此为准。
+        一次返回基础订阅、代币、云存储三块（ADR-075，三者互相独立购买）：
+        - `plan` / `limits` = 当前档位与它的完整门槛表；无活跃订阅时为 `"free"`。
+        - `usage` = 各项当前占用，与 `limits` 成对使用算出剩余额度。
+        - `credits_balance` = `SUM(delta)` over `credits_ledger`，永不过期，不会为负。
+        - `storage` = 独立购买的云存储配额与占用，**与 plan 无关**，未购买时配额为 0。
+
+        客户端应在冷启动后缓存本响应用于本地预判（提前置灰超限操作），
+        但**不可**据此跳过服务端校验 —— 两者的关系是「预判」与「裁决」。
       responses:
         '200':
           description: 钱包视图
@@ -1936,7 +1941,10 @@ components:
     # ---------- 钱包 ----------
     Wallet:
       type: object
-      required: [plan, credits_balance]
+      required: [plan, credits_balance, limits, usage, storage]
+      description: |
+        三块增值服务各自的状态（ADR-075）。必须一起下发：客户端要在同一处解释
+        「为什么这个操作被拒了」，只拿到其中两块就无法区分 402 是余额不足还是配额已满。
       properties:
         plan:
           type: string
@@ -1945,7 +1953,60 @@ components:
         credits_balance:
           type: integer
           format: int64
-          description: SUM(delta) over credits_ledger；可为负（罚扣 / 退款冲销）
+          description: |
+            SUM(delta) over credits_ledger，永不过期。**不会为负** —— 会使余额变负的
+            扣减在 /internal/admin/credits/grant 处即被拒（400）。
+        limits:
+          $ref: '#/components/schemas/PlanLimits'
+        usage:
+          $ref: '#/components/schemas/PlanUsage'
+        storage:
+          $ref: '#/components/schemas/StorageStatus'
+
+    PlanLimits:
+      type: object
+      description: |
+        当前档位的门槛表。与 usage 成对使用，客户端据此在本地预判
+        （到达上限时提前置灰新建按钮，而不是等服务端回 402），
+        以及在匿名数据迁移界面实时计算「还能再选多少条」。
+      properties:
+        key: { type: string }
+        price_usd_monthly: { type: integer, description: 月付价；年付 = 该值 × 10 }
+        sync:
+          type: boolean
+          description: |
+            碎片是否同步到服务端。free 为 false —— 免费档是纯本地应用，
+            服务端不存它的任何碎片。为 false 时 devices / trash_days 无意义。
+        snippets: { type: integer }
+        pages: { type: integer }
+        tags: { type: integer }
+        devices: { type: integer, description: sync 为 false 时为 0，表示「不适用」而非「零台」 }
+        bindings_per_platform: { type: integer, description: 每个平台各自计数，不是总数 }
+        trash_days: { type: integer }
+        hidden_pages: { type: boolean }
+        rules: { type: boolean }
+        import: { type: boolean }
+        parse_priority: { type: boolean }
+
+    PlanUsage:
+      type: object
+      description: 各项资源的当前占用，字段与 PlanLimits 一一对应。
+      properties:
+        snippets: { type: integer }
+        pages: { type: integer, description: 系统页面（冲突收件箱）不计入 }
+        tags: { type: integer }
+        devices: { type: integer }
+
+    StorageStatus:
+      type: object
+      description: |
+        云存储与 plan **完全无关** —— 它来自独立购买、可叠加的 storage 订阅。
+        未购买时 quota_bytes 为 0，此时任何文件上传都会被拒。
+        占用按「每个引用者全额计」口径：同一用户的多条碎片引用同一文件只算一次，
+        跨用户各算各的（全局去重省下的字节留在成本侧）。
+      properties:
+        quota_bytes: { type: integer, format: int64 }
+        used_bytes: { type: integer, format: int64 }
 
     CreditsGrantResponse:
       type: object

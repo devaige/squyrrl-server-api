@@ -169,3 +169,68 @@ func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus,
 
 	return st, nil
 }
+
+// Usage 是用户当前的资源占用，与 entitlement.Tier 的同名字段对应。
+type Usage struct {
+	Snippets int `json:"snippets"`
+	Pages    int `json:"pages"`
+	Tags     int `json:"tags"`
+	Devices  int `json:"devices"`
+}
+
+// CurrentUsage 一次查回全部用量。
+//
+// 用单条多子查询而不是四次往返：客户端需要「已用 / 上限」来在本地预判
+// （比如迁移界面里实时算「还能再选多少条」），这条路径会被频繁调用，
+// 四次 round-trip 的延迟在移动网络上是能感知的。
+func (s *Service) CurrentUsage(ctx context.Context, userID uuid.UUID) (Usage, error) {
+	var u Usage
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM snippets WHERE user_id = $1 AND deleted_at IS NULL),
+			(SELECT count(*) FROM pages    WHERE user_id = $1 AND deleted_at IS NULL AND is_system = FALSE),
+			(SELECT count(*) FROM tags     WHERE user_id = $1),
+			(SELECT count(*) FROM devices  WHERE user_id = $1 AND revoked_at IS NULL)`,
+		userID).Scan(&u.Snippets, &u.Pages, &u.Tags, &u.Devices)
+	return u, err
+}
+
+// CheckBatch 校验一次批量写入（匿名数据迁移）是否会让任一资源越过档位上限。
+//
+// 这是**防御性**校验，不是用户体验的一部分：正常流程下客户端已经在迁移界面里
+// 按实时余量约束了用户的选择，走到这里就该是通过的。它存在是因为服务端不能
+// 信任客户端 —— 一个改造过的客户端可以直接提交超量数据。
+//
+// 三项分别报错而不是合并成一条：用户需要知道是碎片超了还是标签超了，
+// 两者的处理方式完全不同（少选几条 vs 合并几个标签）。
+func (s *Service) CheckBatch(ctx context.Context, userID uuid.UUID, addSnippets, addPages, addTags int) error {
+	t, plan, err := s.tierOf(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !t.Sync {
+		return ErrSyncRequired(plan)
+	}
+
+	u, err := s.CurrentUsage(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range []struct {
+		limit   Limit
+		current int
+		add     int
+		max     int
+	}{
+		{LimitSnippets, u.Snippets, addSnippets, t.Snippets},
+		{LimitPages, u.Pages, addPages, t.Pages},
+		{LimitTags, u.Tags, addTags, t.Tags},
+	} {
+		if c.add > 0 && c.current+c.add > c.max {
+			// 报「加完之后会是多少」而不是当前值：用户要判断的是这一批能不能放下。
+			return newLimitError(c.limit, plan, c.max, c.current+c.add)
+		}
+	}
+	return nil
+}
