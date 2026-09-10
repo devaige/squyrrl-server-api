@@ -69,6 +69,14 @@ const (
 var Order = []string{Free, Basic, Standard, Premium, Maximum}
 
 var table = map[string]Tier{
+	// Free 的数量上限**只在客户端执行**，服务端永远比对不到它们：Sync = false 让
+	// quota.checkCount 在取上限之前就返回 sync_required，免费档的数据根本不进库。
+	// 这不是 bug，不要把 checkCount 里的顺序「修」成先比数量 —— 免费档正确的
+	// 拒绝点就是 0 条，而不是 1000 条。这里的数字是客户端 LocalLimits 的权威副本，
+	// 也由公开的 GET /pricing 对外发布；改动必须两边同步。
+	//
+	// 游客（未登录）与 free 共用同一份门槛（2026-09-10 用户决策）：
+	// 两者唯一的区别是数据有没有归属，配额上不作区分。
 	Free: {
 		Key: Free, PriceUSDMonthly: 0,
 		Sync:     false,
