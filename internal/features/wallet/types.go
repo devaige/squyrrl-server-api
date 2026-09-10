@@ -2,13 +2,32 @@ package wallet
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
+
+	"github.com/squyrrl/api/internal/features/entitlement"
 )
 
 // ErrInsufficientCredits 由 Consume 在余额 < cost 时返回。
 // 上层 handler 应映射到 HTTP 402 Payment Required。
 var ErrInsufficientCredits = errors.New("insufficient credits")
+
+// InsufficientCreditsError 在余额不足时携带具体数字，供 handler 构造结构化 402
+// （客户端要显示「还差多少」并引导充值）。
+//
+// Unwrap 到 ErrInsufficientCredits，所以既有的 errors.Is 判断一律不受影响 ——
+// 新增的详情是可选信息，不是新的错误类别。
+type InsufficientCreditsError struct {
+	Balance  int64
+	Required int64
+}
+
+func (e *InsufficientCreditsError) Error() string {
+	return fmt.Sprintf("insufficient credits: have %d, need %d", e.Balance, e.Required)
+}
+
+func (e *InsufficientCreditsError) Unwrap() error { return ErrInsufficientCredits }
 
 // ErrNegativeBalance 由 Grant 在扣减会使余额变负时返回。
 // 上层 handler 应映射到 HTTP 400 —— 这是请求参数的问题（扣得太多），不是服务端故障。
@@ -19,10 +38,27 @@ var ErrNegativeBalance = errors.New("grant would drive balance negative")
 // 它防的是手滑或恶意填入的极端值 —— 而回绕恰好能穿过负余额检查，所以必须单独挡。
 var ErrGrantOverflow = errors.New("grant would overflow balance")
 
-// Wallet 是 /me/wallet 端点的响应：当前活跃 plan + 代币余额
+// Wallet 是 /me/wallet 的响应，覆盖三块商品各自的状态（ADR-075）。
+//
+// 三块必须一起下发：客户端要在同一个界面解释「为什么这个操作被拒了」，
+// 只看到其中两块就无法区分 402 是余额不足还是配额已满。
 type Wallet struct {
 	Plan           string `json:"plan"`            // 'free' / 'basic' / 'standard' / 'premium' / 'maximum'
-	CreditsBalance int64  `json:"credits_balance"` // SUM(delta) over credits_ledger
+	CreditsBalance int64  `json:"credits_balance"` // SUM(delta) over credits_ledger，永不过期
+
+	// Limits 是当前档位的完整门槛表，客户端据此在本地预判
+	// （比如碎片列表到达上限时提前置灰新建按钮，而不是等服务端回 402）。
+	Limits entitlement.Tier `json:"limits"`
+
+	// Storage 与 plan 完全无关 —— 它来自独立购买的 storage 订阅，可叠加。
+	// 未购买时 quota_bytes 为 0，此时任何文件上传都会被拒。
+	Storage StorageView `json:"storage"`
+}
+
+// StorageView 是云存储的配额与占用，字节为单位。
+type StorageView struct {
+	QuotaBytes int64 `json:"quota_bytes"`
+	UsedBytes  int64 `json:"used_bytes"`
 }
 
 // GrantInput 由内部端调用（管理后台 / 运营批处理 / 支付回调）

@@ -12,6 +12,13 @@ type Service struct {
 
 func NewService(repo *Repo) *Service { return &Service{repo: repo} }
 
+// ActivePlan 取用户当前生效的档位；无活跃订阅时返回 "free"。
+// quota.PlanReader 的实现 —— 门槛检查每次都要用它，单独暴露避免走 GetWallet
+// 白查一次余额。
+func (s *Service) ActivePlan(ctx context.Context, userID uuid.UUID) (string, error) {
+	return s.repo.ActivePlan(ctx, userID)
+}
+
 func (s *Service) GetWallet(ctx context.Context, userID uuid.UUID) (*Wallet, error) {
 	plan, err := s.repo.ActivePlan(ctx, userID)
 	if err != nil {

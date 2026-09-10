@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/squyrrl/api/internal/features/auth"
+	"github.com/squyrrl/api/internal/features/quota"
 	"github.com/squyrrl/api/internal/features/wallet"
 )
 
@@ -62,7 +63,14 @@ func (h *Handler) parse(c *gin.Context) {
 		case errors.Is(err, ErrNoParser):
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		case errors.Is(err, wallet.ErrInsufficientCredits):
-			c.JSON(http.StatusPaymentRequired, gin.H{"error": "余额不足，请充值后重试"})
+			// 与档位门槛共用一套 402 形状：客户端靠 reason 分流（去充值 / 去升级），
+			// 而不是匹配文案。文案本身也交还给客户端 —— 它有三语 arb，服务端没有。
+			var ie *wallet.InsufficientCreditsError
+			if errors.As(err, &ie) {
+				c.JSON(http.StatusPaymentRequired, quota.ErrInsufficientCredits(ie.Balance, ie.Required))
+			} else {
+				c.JSON(http.StatusPaymentRequired, quota.ErrInsufficientCredits(0, 0))
+			}
 		default:
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		}

@@ -1,19 +1,35 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/auth"
+	"github.com/squyrrl/api/internal/features/entitlement"
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
-type Handler struct {
-	svc *Service
+// StorageReader 提供存储配额与占用。由 quota.Service 实现。
+//
+// 聚合放在 handler 而不是 Service：quota 构造时需要 wallet（读档位），
+// wallet 若反过来在构造期依赖 quota 就成了环。handler 在路由装配阶段才组装，
+// 那时两者都已就绪 —— 用构造顺序解开依赖，而不是引入 setter 注入。
+type StorageReader interface {
+	Storage(ctx context.Context, userID uuid.UUID) (quota.StorageStatus, error)
 }
 
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+type Handler struct {
+	svc     *Service
+	storage StorageReader
+}
+
+func NewHandler(svc *Service, storage StorageReader) *Handler {
+	return &Handler{svc: svc, storage: storage}
+}
 
 // RegisterUser 用户端 — 受 Bearer 中间件保护
 func (h *Handler) RegisterUser(g *gin.RouterGroup) {
@@ -27,11 +43,19 @@ func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 
 func (h *Handler) getWallet(c *gin.Context) {
 	id := auth.MustIdentity(c)
-	w, err := h.svc.GetWallet(c.Request.Context(), id.UserID)
+	ctx := c.Request.Context()
+	w, err := h.svc.GetWallet(ctx, id.UserID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	st, err := h.storage.Storage(ctx, id.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	w.Storage = StorageView{QuotaBytes: st.QuotaBytes, UsedBytes: st.UsedBytes}
+	w.Limits = entitlement.MustOf(w.Plan)
 	c.JSON(http.StatusOK, w)
 }
 

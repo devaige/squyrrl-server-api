@@ -16,11 +16,11 @@ package entitlement
 // 因为碎片会落进 Postgres（≈2 KB/条），是这张表里唯一真实随用量增长的成本项。
 // 声称无限就等于把最坏情况写成了无限。
 type Tier struct {
-	Key string
+	Key string `json:"key"`
 
 	// PriceUSDMonthly 月付价（美元）。年付 = 该值 × 10（省两个月）。
 	// 暂时硬编码：调价目前需要发版，后续由 GET /pricing 从 DB 覆盖（ADR-075 待办 ⑥）。
-	PriceUSDMonthly int
+	PriceUSDMonthly int `json:"price_usd_monthly"`
 
 	// Sync 决定碎片元数据是否同步到服务端。
 	//
@@ -31,27 +31,27 @@ type Tier struct {
 	// 这也是本表里唯一一个「关掉之后其它字段大多失去意义」的开关：
 	// Sync 为 false 时 Snippets/Pages/Tags 只能由客户端自检（服务端看不到数据），
 	// Devices 更是完全不构成约束（各设备之间本就互不相通）。
-	Sync bool
+	Sync bool `json:"sync"`
 
-	Snippets int
-	Pages    int
-	Tags     int
+	Snippets int `json:"snippets"`
+	Pages    int `json:"pages"`
+	Tags     int `json:"tags"`
 
 	// Devices 允许的同步设备数。Sync 为 false 时该值为 0，表示「不适用」而非「零台」——
 	// 免费用户想在几台设备上装就装几台，只是数据不互通。UI 应显示「本地使用」，不要显示台数。
-	Devices int
+	Devices int `json:"devices"`
 
 	// BindingsPerPlatform 是**每个平台**可绑定的账号数，不是总数。
 	// Telegram / 微信 / 抖音各自独立计数（对应 platform_bindings 的泛化，ADR-075 待办 ⑩）。
-	BindingsPerPlatform int
+	BindingsPerPlatform int `json:"bindings_per_platform"`
 
 	// TrashDays 回收站保留天数。Sync 为 false 时为 0（回收站也只在本地）。
-	TrashDays int
+	TrashDays int `json:"trash_days"`
 
-	HiddenPages   bool // 隐藏页面
-	Rules         bool // 自动归类规则
-	Import        bool // 从浏览器书签 / Pocket 等导入
-	ParsePriority bool // 解析优先队列
+	HiddenPages   bool `json:"hidden_pages"`   // 隐藏页面
+	Rules         bool `json:"rules"`          // 自动归类规则
+	Import        bool `json:"import"`         // 从浏览器书签 / Pocket 等导入
+	ParsePriority bool `json:"parse_priority"` // 解析优先队列
 }
 
 // 档位键。这五个字符串同时是三家支付渠道的商品 ID 约定的一部分

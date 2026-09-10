@@ -14,6 +14,8 @@ import (
 	"github.com/squyrrl/api/internal/features/file"
 	"github.com/squyrrl/api/internal/features/page"
 	"github.com/squyrrl/api/internal/features/parser"
+	"github.com/squyrrl/api/internal/features/pricing"
+	"github.com/squyrrl/api/internal/features/quota"
 	"github.com/squyrrl/api/internal/features/snippet"
 	"github.com/squyrrl/api/internal/features/subscriptions"
 	"github.com/squyrrl/api/internal/features/tag"
@@ -39,6 +41,7 @@ type Server struct {
 	subSvc     *subscriptions.Service
 	claimSvc   *claim.Service
 	extapiSvc  *extapi.Service
+	quotaSvc   *quota.Service
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
@@ -70,9 +73,14 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 			MaxAttempts: cfg.OTPMaxAttempts,
 		},
 	)
-	pageSvc := page.NewService(page.NewRepo(pool))
+	// wallet 与 quota 要先于业务 service 构造：门槛检查需要读用户档位，
+	// 而档位来自 wallet（subscriptions 表）。
+	walletSvc := wallet.NewService(wallet.NewRepo(pool))
+	quotaSvc := quota.NewService(pool, walletSvc)
+
+	pageSvc := page.NewService(page.NewRepo(pool), quotaSvc)
 	tagRepo := tag.NewRepo(pool)
-	snipSvc := snippet.NewService(snippet.NewRepo(pool))
+	snipSvc := snippet.NewService(snippet.NewRepo(pool), quotaSvc)
 	fileSvc := file.NewService(file.NewRepo(pool), st, cfg.UploadEdgeBase, cfg.UploadTokenSecret)
 
 	// URI 解析：特殊 provider 顺序匹配；通用 OG 兜底放在最末
@@ -81,7 +89,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	registry.Register(parser.NewGistProvider())
 	registry.Register(parser.NewRedditProvider())
 	registry.Register(parser.NewGenericOGProvider())
-	walletSvc := wallet.NewService(wallet.NewRepo(pool))
 	extapiSvc := extapi.NewService(extapi.NewRepo(pool))
 	parsSvc := parser.NewService(registry, parser.NewCache(pool), walletSvc, extapiSvc, cfg.ParseCost)
 
@@ -99,6 +106,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		subSvc:     subSvc,
 		claimSvc:   claimSvc,
 		extapiSvc:  extapiSvc,
+		quotaSvc:   quotaSvc,
 	}
 	s.routes()
 	return s
@@ -146,7 +154,7 @@ func (s *Server) routes() {
 	api.Use(s.authSvc.Middleware())
 
 	page.NewHandler(s.pageSvc).Register(api.Group("/pages"))
-	tag.NewHandler(s.tagRepo).Register(api.Group("/tags"))
+	tag.NewHandler(s.tagRepo, s.quotaSvc).Register(api.Group("/tags"))
 	snippet.NewHandler(s.snipSvc).Register(api.Group("/snippets"))
 	file.NewHandler(s.fileSvc).Register(api.Group("/files"))
 	parserHandler := parser.NewHandler(s.parsSvc)
@@ -154,9 +162,13 @@ func (s *Server) routes() {
 	// GET /uris/manifest 走公开 group（无 Bearer 中间件）：匿名客户端也需要清单做本地判断
 	parserHandler.RegisterPublic(s.engine.Group("/uris"))
 
+	// GET /pricing 同样公开：购买页与「帮我选择」向导在登录前就要能算价（ADR-075）。
+	// 它也是唯一能不发版调价的机制，客户端冷启动拉一次。
+	pricing.NewHandler().RegisterPublic(s.engine.Group("/"))
+
 	// 钱包 — 用户端在 /me/wallet；匿名数据归属在 /me/anonymous/claim
 	meGroup := api.Group("/me")
-	walletHandler := wallet.NewHandler(s.walletSvc)
+	walletHandler := wallet.NewHandler(s.walletSvc, s.quotaSvc)
 	walletHandler.RegisterUser(meGroup)
 	claim.NewHandler(s.claimSvc).Register(meGroup)
 

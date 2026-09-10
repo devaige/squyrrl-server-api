@@ -117,3 +117,102 @@ func TestRateConstantsAreConsistent(t *testing.T) {
 		t.Errorf("ADR-075 定 $1 = 10 000 credits，实际 %d", got)
 	}
 }
+
+// 存储定价的核心不变量：**单位价格随档位增大不上升**。
+//
+// 这才是「叠加安全」的准确表述。设计时说的是线性（$0.03/GB·月），但 1 TB / 2 TB
+// 两档取整后单价略低（$0.293 vs $0.30）—— 方向是「买大档不吃亏」，无害。
+// 真正要防的是反过来：某个大档单价更高，导致拆成小档叠加更便宜，
+// 那种价目表会被用户当成陷阱，而且是完全正当的指责。
+func TestStorageUnitPriceNeverIncreases(t *testing.T) {
+	for i := 1; i < len(storageTiers); i++ {
+		lo, hi := storageTiers[i-1], storageTiers[i]
+		if hi.GB <= lo.GB {
+			t.Fatalf("档位未按容量升序：%d GB 出现在 %d GB 之后", hi.GB, lo.GB)
+		}
+		// 比较 lo.Price/lo.GB >= hi.Price/hi.GB，用交叉相乘避免浮点
+		if lo.PriceUSDYear*hi.GB < hi.PriceUSDYear*lo.GB {
+			t.Errorf("%d GB 的单价高于 %d GB —— 拆成小档叠加会更便宜",
+				hi.GB, lo.GB)
+		}
+	}
+}
+
+// 叠加买到的容量，价格不应低于直接买同等的单档（否则单档就没有存在意义）。
+func TestStackingIsNeverCheaperThanASingleTier(t *testing.T) {
+	for _, target := range storageTiers {
+		// 用最便宜的单位价档位去凑 target.GB
+		best := storageTiers[0]
+		n := (target.GB + best.GB - 1) / best.GB
+		stacked := n * best.PriceUSDYear
+		if stacked < target.PriceUSDYear {
+			t.Errorf("%d GB 单档 $%d，用 %d 份 %d GB 叠加只要 $%d",
+				target.GB, target.PriceUSDYear, n, best.GB, stacked)
+		}
+	}
+}
+
+func TestMaxFileBytesFor(t *testing.T) {
+	const gb = int64(1) << 30
+	cases := []struct {
+		quotaGB int
+		want    int64
+	}{
+		{0, 0},  // 未购买存储：不允许上传
+		{19, 0}, // 不足最低档
+		{20, 2 * gb},
+		{100, 2 * gb},
+		{200, 10 * gb},
+		{1023, 10 * gb},
+		{1024, 50 * gb},
+		{5000, 50 * gb}, // 超出最高档仍取最高档
+	}
+	for _, c := range cases {
+		if got := MaxFileBytesFor(c.quotaGB); got != c.want {
+			t.Errorf("配额 %d GB 的单文件上限 = %d，期望 %d", c.quotaGB, got, c.want)
+		}
+	}
+}
+
+// 单文件上限的硬顶来自 multipart：8 MiB × 10000 片 = 78.125 GB。
+// 任何一档越过它，上传会在最后一片失败 —— 而那时用户已经传了几十 GB。
+func TestFileSizeTiersStayUnderMultipartCeiling(t *testing.T) {
+	const ceiling = int64(8) << 20 * 10000 // 8 MiB × 10000 parts
+	for _, ft := range fileSizeTiers {
+		if ft.MaxFileBytes >= ceiling {
+			t.Errorf("%d GB 档的单文件上限 %d 越过 multipart 硬顶 %d",
+				ft.MinQuotaGB, ft.MaxFileBytes, ceiling)
+		}
+	}
+}
+
+// 加购档位必须「买得多不吃亏」：每美元换到的代币数不递减。
+func TestCreditPacksNeverGetWorse(t *testing.T) {
+	for i := 1; i < len(creditPacks); i++ {
+		lo, hi := creditPacks[i-1], creditPacks[i]
+		if hi.PriceUSD <= lo.PriceUSD {
+			t.Fatalf("加购档位未按价格升序")
+		}
+		// lo.Credits/lo.Price <= hi.Credits/hi.Price
+		if lo.Credits*int64(hi.PriceUSD) > hi.Credits*int64(lo.PriceUSD) {
+			t.Errorf("$%d 档每美元换到的代币少于 $%d 档", hi.PriceUSD, lo.PriceUSD)
+		}
+	}
+	// 最小档必须严格等于面值，否则汇率就不是 $1 = 10000 了
+	if creditPacks[0].Credits != int64(creditPacks[0].PriceUSD)*CreditsPerUSD {
+		t.Errorf("$%d 档应换 %d 代币（面值），实际 %d",
+			creditPacks[0].PriceUSD, int64(creditPacks[0].PriceUSD)*CreditsPerUSD, creditPacks[0].Credits)
+	}
+}
+
+// 注册赠送必须够 3 条最贵的解析 —— 承诺是「3 条」，就要在最坏 provider 下也成立。
+func TestSignupGrantCoversThreeExpensiveParses(t *testing.T) {
+	const priciestUpstreamMicros = 10_000 // $0.01
+	cost, err := CreditCost(priciestUpstreamMicros, DefaultMarginBP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if SignupGrantCredits < cost*3 {
+		t.Errorf("赠送 %d 代币，但 3 条最贵解析需要 %d", SignupGrantCredits, cost*3)
+	}
+}

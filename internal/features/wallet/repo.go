@@ -184,7 +184,7 @@ func (r *Repo) Consume(ctx context.Context, userID uuid.UUID, cost int64, reason
 		return nil, err
 	}
 	if curBal < cost {
-		return nil, ErrInsufficientCredits
+		return nil, &InsufficientCreditsError{Balance: curBal, Required: cost}
 	}
 
 	newBal := curBal - cost

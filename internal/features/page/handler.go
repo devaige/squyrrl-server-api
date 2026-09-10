@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/auth"
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
 type Handler struct {
@@ -102,6 +103,10 @@ func (h *Handler) delete(c *gin.Context) {
 }
 
 func writeErr(c *gin.Context, err error) {
+	// 配额与档位门槛统一走 402，响应体形状由 quota 包持有 —— 散落成多份必然漂移。
+	if quota.WriteIfQuota(c, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})

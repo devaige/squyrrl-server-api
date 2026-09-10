@@ -8,13 +8,19 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/auth"
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
+// tag 包没有 service 层（repo 足够薄），门槛因此挂在 handler 上。
+// 其它 feature 一律在 service 层设卡 —— 那里能覆盖所有调用方。
 type Handler struct {
-	repo *Repo
+	repo  *Repo
+	quota *quota.Service
 }
 
-func NewHandler(repo *Repo) *Handler { return &Handler{repo: repo} }
+func NewHandler(repo *Repo, q *quota.Service) *Handler {
+	return &Handler{repo: repo, quota: q}
+}
 
 func (h *Handler) Register(g *gin.RouterGroup) {
 	g.POST("", h.create)
@@ -28,6 +34,10 @@ func (h *Handler) create(c *gin.Context) {
 	var in CreateInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.quota.CheckTagCreate(c.Request.Context(), id.UserID); err != nil {
+		writeErr(c, err)
 		return
 	}
 	t, err := h.repo.Create(c.Request.Context(), id.UserID, &in)
@@ -86,6 +96,10 @@ func (h *Handler) delete(c *gin.Context) {
 }
 
 func writeErr(c *gin.Context, err error) {
+	// 配额与档位门槛统一走 402，响应体形状由 quota 包持有 —— 散落成多份必然漂移。
+	if quota.WriteIfQuota(c, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, ErrNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})

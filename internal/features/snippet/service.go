@@ -6,15 +6,25 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
 type Service struct {
-	repo *Repo
+	repo  *Repo
+	quota *quota.Service
 }
 
-func NewService(repo *Repo) *Service { return &Service{repo: repo} }
+func NewService(repo *Repo, q *quota.Service) *Service {
+	return &Service{repo: repo, quota: q}
+}
 
 func (s *Service) Create(ctx context.Context, userID uuid.UUID, in *CreateInput) (*Snippet, error) {
+	// 门槛检查放在所有权校验之前：配额满了就没必要再查页面/标签/文件归属，
+	// 而且「配额已满」比「页面不属于你」是更根本的拒绝理由，先报它更不容易误导。
+	if err := s.quota.CheckSnippetCreate(ctx, userID); err != nil {
+		return nil, err
+	}
 	if err := s.repo.EnsurePageOwned(ctx, userID, in.PageID); err != nil {
 		return nil, err
 	}
