@@ -40,11 +40,9 @@ type SubscriptionEvent struct {
 	BonusStorageGB        *int      // storage 类型时填入
 }
 
-// CreditsByTier 每月赠送的 credits（按 ADR-007 简化版）
-// 触发：webhook 收到「新订阅 active」或「续期成功」时调用 wallet.Grant
-var CreditsByTier = map[string]int64{
-	"basic":    1000,
-	"standard": 3000,
-	"premium":  8000,
-	"maximum":  20000,
-}
+// 这里原本有一张 CreditsByTier 表，webhook 收到 active / 续期时按档位赠送 credits。
+// ADR-075 拆商品后整段删除：**基础订阅不含任何 credits**，credits 是独立购买的消耗品。
+//
+// 顺带消灭了一个真实缺陷：Stripe 的 customer.subscription.updated 在换卡、
+// 改 metadata 这类无关变更时同样触发，而 credits_ledger 没有幂等键，
+// 于是每触发一次就重发一整月额度。拆分后承载它的代码路径不存在了，无需修复。
