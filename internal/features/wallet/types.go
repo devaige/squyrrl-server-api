@@ -10,6 +10,15 @@ import (
 // 上层 handler 应映射到 HTTP 402 Payment Required。
 var ErrInsufficientCredits = errors.New("insufficient credits")
 
+// ErrNegativeBalance 由 Grant 在扣减会使余额变负时返回。
+// 上层 handler 应映射到 HTTP 400 —— 这是请求参数的问题（扣得太多），不是服务端故障。
+var ErrNegativeBalance = errors.New("grant would drive balance negative")
+
+// ErrGrantOverflow 由 Grant 在 delta 会让 int64 余额回绕时返回。
+// 正常业务量永远碰不到（int64 上限约 9.2e18 credits ≈ $9.2e14），
+// 它防的是手滑或恶意填入的极端值 —— 而回绕恰好能穿过负余额检查，所以必须单独挡。
+var ErrGrantOverflow = errors.New("grant would overflow balance")
+
 // Wallet 是 /me/wallet 端点的响应：当前活跃 plan + 代币余额
 type Wallet struct {
 	Plan           string `json:"plan"`            // 'free' / 'basic' / 'standard' / 'premium' / 'maximum'

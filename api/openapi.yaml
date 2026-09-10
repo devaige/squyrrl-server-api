@@ -1225,9 +1225,17 @@ paths:
       tags: [Wallet]
       summary: 内部：给指定用户调整 credits 余额
       description: |
-        受 X-Internal-Token 头保护。供管理后台 / 支付回调 / 运营批处理调用。
+        受 X-Internal-Token 头保护。供管理后台 / 运营批处理调用。
         `delta` 可正可负；服务端用 advisory lock 串行化同一用户的并发写入，
         保证 `credits_ledger.balance_after` 列单调连续。
+
+        **扣减不得使余额变负**：会导致负余额的请求返回 400 且不落流水（错误消息里带当前余额）。
+        允许负余额会让此后每次 `Consume` 都因 `curBal < cost` 而 402，用户被永久锁死。
+        需要清零时请按当前余额填精确值；服务端不做「夹到 0」处理，
+        那会让流水里的 `delta` 与请求不一致，事后对账无从下手。
+
+        注意：基础订阅**不再赠送 credits**（ADR-075，三块商品互相独立），
+        因此本端点不再有来自订阅 webhook 的调用方。
       security:
         - internalToken: []
       requestBody:
@@ -1252,6 +1260,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CreditsGrantResponse' }
+        '400':
+          description: |
+            扣减会使余额变负，或 `delta` 极端到令 int64 余额回绕。两种情况都不落流水。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: 内部 token 缺失
           content:

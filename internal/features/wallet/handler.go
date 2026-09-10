@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -42,6 +43,12 @@ func (h *Handler) grantCredits(c *gin.Context) {
 	}
 	res, err := h.svc.Grant(c.Request.Context(), in.UserID, in.Delta, in.Reason)
 	if err != nil {
+		// 扣得太多或数值越界都是请求本身的问题，回 400 并把当前余额带在消息里，
+		// 后台才知道该改填多少；回 500 会让运营以为是服务挂了而反复重试。
+		if errors.Is(err, ErrNegativeBalance) || errors.Is(err, ErrGrantOverflow) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
