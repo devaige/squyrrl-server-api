@@ -105,13 +105,23 @@ type CreateInput struct {
 }
 
 // UpdateInput 采用「字段存在即更新」语义。version 字段做乐观锁。
-// 限制：本接口暂不支持把 page_id / title / description / text_lang 显式置空（pointer 无法区分 omit 与 null）。
-//
-//	若需清空，使用专用端点（待后续实现）或重建碎片。
+// 限制：title / description / text_lang 仍不支持显式置空（pointer 无法区分 omit 与 null）。
+// page_id 是例外，见下面的 ClearPage。
 type UpdateInput struct {
 	Version int64 `json:"version" binding:"required"`
 
-	PageID      *uuid.UUID      `json:"page_id,omitempty"`
+	PageID *uuid.UUID `json:"page_id,omitempty"`
+	// ClearPage 把碎片移出页面，回到「全部碎片」虚拟视图。
+	//
+	// 需要一个独立布尔而不是传 `page_id: null`：ADR-023 定下 PATCH 不支持显式
+	// null 清空 —— 标准库 JSON 分不清「字段缺席」与「显式 null」，两者解码后
+	// 都是 nil 指针。tag_ids 能用 `*[]T` 绕过（nil 与空切片可区分），
+	// 但 page_id 是标量，没有这个余地。
+	//
+	// 没有它，「把碎片移出页面」在 API 上根本不可表达：唯一的途径是删掉整个页面
+	// （page.Delete 会把旗下碎片的 page_id 置空），而那显然不是用户想要的。
+	ClearPage bool `json:"clear_page,omitempty"`
+
 	Title       *string         `json:"title,omitempty"`
 	Description *string         `json:"description,omitempty"`
 	TextContent []byte          `json:"text_content,omitempty"`

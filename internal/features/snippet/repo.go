@@ -369,7 +369,11 @@ func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput
 	}
 
 	// 应用字段差异
-	if in.PageID != nil {
+	// ClearPage 先判：同时传了 page_id 和 clear_page 时，「移出」是更明确的意图 ——
+	// 一个想把碎片放进某页的调用方不会顺手带上 clear_page。
+	if in.ClearPage {
+		cur.PageID = nil
+	} else if in.PageID != nil {
 		cur.PageID = in.PageID
 	}
 	if in.Title != nil {

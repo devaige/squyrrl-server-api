@@ -1269,13 +1269,14 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [format, version, exported_at, pages, snippets]
+                required: [format, version, exported_at, pages, tags, snippets]
                 properties:
                   format: { type: string, enum: ['squyrrl.local-backup'] }
                   version: { type: integer, enum: [2] }
                   exported_at: { type: string, format: date-time }
                   content_obfuscated: { type: boolean, enum: [true] }
                   pages: { type: array, items: { type: object } }
+                  tags: { type: array, items: { type: object } }
                   snippets: { type: array, items: { type: object } }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
@@ -1874,6 +1875,15 @@ components:
         page_id:
           type: string
           format: uuid
+          description: 移动到该页面。**不支持传 null 表示移出** —— 见 clear_page。
+        clear_page:
+          type: boolean
+          description: |
+            把碎片移出页面，回到「全部碎片」。
+            需要独立布尔而不是 `page_id: null`：ADR-023 定下 PATCH 不支持显式
+            null 清空（标准库 JSON 分不清缺席与 null，解码后都是 nil 指针）。
+            `tag_ids` 用 `*[]T` 绕过了这个限制，而 page_id 是标量，没有这个余地。
+            两者同传时以 clear_page 为准。
         title: { type: string }
         description: { type: string }
         text_content: { type: string, format: byte }

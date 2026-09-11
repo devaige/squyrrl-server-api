@@ -50,6 +50,12 @@ func (e *Exporter) Export(ctx context.Context, userID uuid.UUID, w io.Writer) er
 	if err := e.writePages(ctx, userID, w); err != nil {
 		return err
 	}
+	if _, err := io.WriteString(w, `],"tags":[`); err != nil {
+		return err
+	}
+	if err := e.writeTags(ctx, userID, w); err != nil {
+		return err
+	}
 	if _, err := io.WriteString(w, `],"snippets":[`); err != nil {
 		return err
 	}
@@ -86,6 +92,39 @@ func (e *Exporter) writePages(ctx context.Context, userID uuid.UUID, w io.Writer
 			return err
 		}
 		if err := enc.Encode(p); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// writeTags 导出标签本身；碎片与标签的关联在 snippets 的 tag_ids 里。
+//
+// 不导出关联表而是让每条碎片自带 tag_ids：导入方是按碎片逐条合并的，
+// 一张独立的关联表会要求它先把所有碎片落完再回头补关联，
+// 而中途失败就会留下一批没有标签的碎片。
+func (e *Exporter) writeTags(ctx context.Context, userID uuid.UUID, w io.Writer) error {
+	rows, err := e.pool.Query(ctx,
+		`SELECT id, name FROM tags WHERE user_id = $1 ORDER BY name, id`, userID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	enc := json.NewEncoder(w)
+	first := true
+	for rows.Next() {
+		var t struct {
+			ID   uuid.UUID `json:"id"`
+			Name string    `json:"name"`
+		}
+		if err := rows.Scan(&t.ID, &t.Name); err != nil {
+			return err
+		}
+		if err := writeSep(w, &first); err != nil {
+			return err
+		}
+		if err := enc.Encode(t); err != nil {
 			return err
 		}
 	}
