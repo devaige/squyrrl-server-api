@@ -79,6 +79,12 @@ func main() {
 	// 那段带宽限期的逻辑只该有一个定义。
 	go snippet.NewTrashSweeper(pool, srv.WalletService(), cfg.TrashSweepInterval).Run(rootCtx)
 
+	// 后台任务：维护降级后超额数据的生命周期（ADR-075，2026-09-11 用户决策）。
+	// 与回收站清理是两条链路：那边处理用户自己删过的，这边处理用户没删、
+	// 但已经不在档位额度内的。跑得比回收站勤，因为用户在宽限期内删数据之后
+	// 应当尽快恢复正常，而不是等到几小时后的下一轮。
+	go snippet.NewRestrictionSweeper(pool, srv.WalletService(), cfg.RestrictionSweepInterval).Run(rootCtx)
+
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler(),

@@ -11,8 +11,11 @@ import (
 	"github.com/squyrrl/api/internal/features/pricing"
 )
 
-// GracePeriod 的定义在 pricing 包；这里保留一个别名，让 wallet 的调用点读起来自然。
-const GracePeriod = pricing.GracePeriod
+// 档位宽限期按计费周期取值，定义在 pricing 包（quota 也要用它）。
+const (
+	GraceMonthly = pricing.GraceMonthly
+	GraceYearly  = pricing.GraceYearly
+)
 
 // plan 订阅的三种对外状态。
 const (

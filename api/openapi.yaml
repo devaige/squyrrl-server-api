@@ -474,6 +474,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Snippet' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            该碎片处于**冻结期**（降级后超额数据，ADR-075）。它仍会出现在列表里，
+            但详情不可读。响应体带 `restrict_until` —— 那是永久删除的倒计时。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       operationId: updateSnippet
@@ -508,6 +515,14 @@ paths:
               schema: { $ref: '#/components/schemas/Snippet' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            该碎片超出当前方案，处在降级后的受限生命周期里（ADR-075）：
+            宽限期与冻结期**都不可修改**。删除始终可用 —— 那是用户把自己
+            拉回额度内的唯一手段，堵死它等于把人锁在一个无法自救的状态里。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
@@ -1505,11 +1520,13 @@ components:
       properties:
         reason:
           type: string
-          enum: [insufficient_credits, plan_limit, sync_required]
+          enum: [insufficient_credits, plan_limit, sync_required, data_restricted]
           description: |
             机器可读的拒绝原因。`sync_required` 从 `plan_limit` 里单独拆出，
             因为它对应的引导完全不同（「升级以启用云同步」而非「数量已达上限」），
-            且它是免费档用户最常撞到的一条。
+            且它是免费档用户最常撞到的一条。`data_restricted` 则是降级之后
+            超额数据的生命周期：不是「你不能再加了」，而是「这件已经存在的东西
+            你暂时动不了，且带截止日期」。
         error: { type: string, description: 人可读的中文描述，仅作兜底展示 }
         limit:
           type: string
@@ -1526,6 +1543,18 @@ components:
             显示成一个点了没有任何变化的「请升级」按钮。
         balance: { type: integer, format: int64, description: 当前代币余额（insufficient_credits） }
         required: { type: integer, format: int64, description: 本次操作所需代币（insufficient_credits） }
+        restrict_stage:
+          type: string
+          enum: [grace, frozen]
+          description: |
+            data_restricted 专用。`grace` = 可读可删、不可改；
+            `frozen` = 列表仍可见但详情不可读。
+        restrict_until:
+          type: string
+          format: date-time
+          description: |
+            当前阶段的结束时刻。冻结期结束即**永久删除** ——
+            这是一个真实的倒计时，客户端应当照实显示。
 
     # ---------- 认证 ----------
     User:
@@ -1659,6 +1688,16 @@ components:
         - updated_at
       properties:
         id: { type: string, format: uuid }
+        restriction:
+          type: string
+          enum: [grace, frozen]
+          description: |
+            降级后超额数据的阶段（ADR-075）。**字段缺席表示正常** ——
+            正常碎片占绝大多数，为它们各带一个空串是纯粹的带宽浪费。
+            `grace`：可读、可删，不可修改；`frozen`：**仍会出现在列表里**，
+            但 `GET /snippets/{id}` 返回 402。列出而不隐藏是有意的：
+            藏起来用户会以为数据已经没了并停止行动，列出来则那串条目
+            本身就是最有效的续费提醒。
         page_id:
           type: [string, 'null']
           format: uuid

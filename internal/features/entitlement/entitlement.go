@@ -126,6 +126,21 @@ func Known(tier string) bool {
 	return ok
 }
 
+// ServerSnippets 是该档位允许**留在服务端**的碎片数。
+//
+// 与 Snippets 的区别是这个包里最容易读错的一处：Snippets 是**客户端本地**可创建的
+// 数量（2026-09-10 用户决策，游客与免费档同一份门槛）；而免费档根本不同步，
+// 它在服务端的允许量是 **0**，不是 1000。
+//
+// 拿 Snippets 去当服务端上限，降级到免费档的用户会被判定为「还能在云上留 1000 条」——
+// 而那 1000 行是真实的服务端成本，恰恰是「免费档零成本」这个前提要排除的东西。
+func (t Tier) ServerSnippets() int {
+	if !t.Sync {
+		return 0
+	}
+	return t.Snippets
+}
+
 // MustOf 取能力表，未知档位回落到 Free。
 // 仅用于「已经确定用户没有 active plan」的读路径 —— wallet.ActivePlan 查不到订阅时就返回 "free"，
 // 那是正常状态而非错误。写路径和校验路径一律用 Of 并处理 false。

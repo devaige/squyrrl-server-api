@@ -63,6 +63,28 @@ type Snippet struct {
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
+
+	// RestrictedAt 是这条碎片进入「降级后超额」生命周期的时刻。内部字段，不下发 ——
+	// 客户端需要的是阶段名而不是一个要自己做日期算术的时间戳，
+	// 那种算术分散在三个客户端里就会出现三种边界行为。
+	RestrictedAt *time.Time `json:"-"`
+}
+
+// Restriction 是下发给客户端的受限阶段：""（正常）/ "grace" / "frozen"。
+// 由 RestrictedAt 推导，见 RestrictionOf。
+func (s *Snippet) Restriction() Restriction { return RestrictionOf(s.RestrictedAt, time.Now()) }
+
+// MarshalJSON 在序列化时补上 restriction 字段。
+//
+// 用别名类型避免递归：直接在方法里 json.Marshal(s) 会再次调用本方法。
+// 写成自定义 Marshal 而不是多一个结构体字段，是为了让「阶段」始终与
+// RestrictedAt 同步 —— 字段会被某处忘记填，方法不会。
+func (s Snippet) MarshalJSON() ([]byte, error) {
+	type alias Snippet
+	return json.Marshal(struct {
+		alias
+		Restriction Restriction `json:"restriction,omitempty"`
+	}{alias(s), RestrictionOf(s.RestrictedAt, time.Now())})
 }
 
 type CreateInput struct {

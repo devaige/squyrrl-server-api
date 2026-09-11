@@ -9,6 +9,7 @@ package quota
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/squyrrl/api/internal/features/entitlement"
 )
@@ -30,6 +31,13 @@ const (
 	// （「升级以启用云同步」而非「你的页面数量已达上限」），
 	// 而且它是免费用户最常撞到的一条，值得让客户端单独处理。
 	ReasonSyncRequired Reason = "sync_required"
+	// ReasonDataRestricted 这条数据超出了当前档位，正处在降级后的生命周期里
+	// （宽限期不可修改 / 冻结期不可读取）。
+	//
+	// 与 ReasonPlanLimit 分开：那一条说的是「你不能再加了」，动作是少建几条或升级；
+	// 这一条说的是「这件已经存在的东西你暂时动不了」，而且**带截止日期**。
+	// 客户端要显示的东西完全不同，合并成一个 reason 就只能靠猜。
+	ReasonDataRestricted Reason = "data_restricted"
 )
 
 // Limit 标识撞到的是哪一项门槛。取值与 entitlement.Tier 的字段一一对应。
@@ -65,6 +73,13 @@ type Error struct {
 	// —— ReasonInsufficientCredits ——
 	Balance  *int64 `json:"balance,omitempty"`
 	Required *int64 `json:"required,omitempty"`
+
+	// —— ReasonDataRestricted ——
+	// RestrictStage 是 "grace"（可读可删不可改）或 "frozen"（列表可见、详情不可读）。
+	RestrictStage string `json:"restrict_stage,omitempty"`
+	// RestrictUntil 是当前阶段的结束时刻。冻结期结束即永久删除，所以这个字段
+	// 承载的是一个真实的倒计时，而不是一句软性提示。
+	RestrictUntil *time.Time `json:"restrict_until,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Msg }
@@ -73,6 +88,21 @@ func (e *Error) Error() string { return e.Msg }
 func IsQuotaError(err error) (*Error, bool) {
 	qe, ok := err.(*Error)
 	return qe, ok
+}
+
+// ErrDataRestricted 组装降级后受限数据的 402。
+//
+// stage 是 "grace" / "frozen"，until 是该阶段的结束时刻 —— 客户端要靠它显示
+// 「还有 N 天」。不给截止时间的话，这条提示就只是一句无从行动的坏消息。
+func ErrDataRestricted(msg, stage string, until time.Time, plan string) *Error {
+	return &Error{
+		Reason:        ReasonDataRestricted,
+		Msg:           msg,
+		Plan:          plan,
+		RestrictStage: stage,
+		RestrictUntil: &until,
+		RequiredPlan:  "",
+	}
 }
 
 // newLimitError 组装一个「档位容量不足」的错误，并算出需要升到哪一档。

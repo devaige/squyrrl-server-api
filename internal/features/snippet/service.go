@@ -46,7 +46,19 @@ func collectFileIDs(els []ElementInput) []uuid.UUID {
 }
 
 func (s *Service) Get(ctx context.Context, userID, id uuid.UUID) (*Snippet, error) {
-	return s.repo.Get(ctx, userID, id)
+	res, err := s.repo.Get(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	// 冻结期只挡详情，不挡列表 —— 列表里仍然列出这些条目（用户决策）。
+	// 宽限期照常可读：那一段的限制只是「不可修改」。
+	if st := res.Restriction(); st == RestrictionFrozen {
+		plan, _ := s.quota.PlanOf(ctx, userID)
+		return nil, restrictedError(
+			"该碎片已冻结：恢复订阅后可继续访问，冻结期结束将永久删除",
+			plan, *res.RestrictedAt, st)
+	}
+	return res, nil
 }
 
 func (s *Service) List(ctx context.Context, userID uuid.UUID, in *ListInput) (*ListOutput, error) {
@@ -67,6 +79,22 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, in *ListInput) (*L
 }
 
 func (s *Service) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput) (*Snippet, error) {
+	// 受限碎片一律不可修改，宽限期与冻结期都拒。
+	//
+	// 判断放在最前面而不是交给 repo.Update 的 WHERE：那样会退化成
+	// 「找不到行」→ 404 或版本冲突，而用户真正需要知道的是「这条超出了你的方案」。
+	// 一个能操作却给出错误原因的界面，比一个假装东西不存在的界面好得多。
+	cur, err := s.repo.Get(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	if st := cur.Restriction(); st != RestrictionNone {
+		plan, _ := s.quota.PlanOf(ctx, userID)
+		return nil, restrictedError(
+			"这条碎片超出当前方案，暂时不可修改；删除仍然可用",
+			plan, *cur.RestrictedAt, st)
+	}
+
 	if err := s.repo.EnsurePageOwned(ctx, userID, in.PageID); err != nil {
 		return nil, err
 	}

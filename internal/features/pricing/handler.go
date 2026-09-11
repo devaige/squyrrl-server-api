@@ -54,23 +54,39 @@ type FileSizeTier struct {
 }
 
 const (
-	// GracePeriod 是订阅转入 past_due 之后仍按原档位服务的窗口（ADR-075 ⑭）。
-	//
-	// 取 14 天而不是 7 天：两侧代价不对称。多给一周，成本是一周的服务；少给一周，
-	// 一个在外旅行、没看到催缴邮件的付费用户会发现自己的碎片「不见了」——
-	// ADR-075 ⑧ 之后掉档意味着客户端切回本地模式，云端数据当场离开视野。
-	// 绝大多数订阅中断本就是扣款失败而非主动取消，宁可多送一周。
-	//
-	// 放在 pricing 而不是 wallet：quota 也要用它（存储配额同样吃宽限期），
-	// 而 quota → wallet 会成环（wallet 的 handler 已经依赖 quota）。
-	GracePeriod = 14 * 24 * time.Hour
-
 	// YearlyMonths 年付按 10 个月计价。
 	YearlyMonths = 10
 	// SignupGrantCredits 注册赠送额度，够 3 条最贵的解析（200 × 3）。
 	// 它属于获客成本，不是任何一档订阅的赠品 —— 三块商品互相独立。
 	SignupGrantCredits = 600
 )
+
+// 档位宽限期：扣款失败后仍按**原档位**服务的窗口（ADR-075 ⑭）。
+//
+// 这一层管的是「支付还在重试」，与降级之后的数据生命周期（30 天宽限 + 30 天冻结）
+// 是两件先后发生的事：这里的窗口走完仍未续上，才真正降级并启动那条链路。
+// 一张卡两天后补上，不该让用户看到任何可见的状态翻转 —— 那正是这一层存在的理由。
+//
+// 长度随计费周期变（用户决策 2026-09-11）：周期越长，用户越不会天天盯着账单，
+// 察觉扣款失败所需的时间也越长。
+//
+// **这只是默认值。** Apple 与 Google 的 billing grace period 由商店后台按产品配置，
+// 商店通知里带的截止时间才是权威；接 IAP 时 SubscriptionEvent 要带上它并优先采用。
+// 放在 pricing 而不是 wallet：quota 也要用（存储配额同样吃宽限期），
+// 而 quota → wallet 会成环（wallet 的 handler 已依赖 quota）。
+const (
+	GraceMonthly = 7 * 24 * time.Hour
+	GraceYearly  = 14 * 24 * time.Hour
+)
+
+// GraceFor 返回某计费周期对应的档位宽限期。
+// 未知周期按月付处理 —— 该保守的一侧是给得少，而不是给一个我们没定义过的长度。
+func GraceFor(billingPeriod string) time.Duration {
+	if billingPeriod == "yearly" {
+		return GraceYearly
+	}
+	return GraceMonthly
+}
 
 // storageTiers 按 $0.03/GB·月 × 10 个月定价，线性。
 // 线性是叠加安全的前提：5 份 20 GB 与 1 份 100 GB 严格同价，

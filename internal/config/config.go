@@ -84,6 +84,9 @@ type Config struct {
 	// 回收站清理不需要频繁：最短保留期是 30 天，6 小时的粒度对用户完全无感，
 	// 而更密的轮询只是在反复扫同一批不到期的行。
 	TrashSweepInterval time.Duration `env:"SQUYRRL_TRASH_SWEEP_INTERVAL" envDefault:"6h"`
+	// 超额数据的标记/解除比回收站清理更需要及时：用户在宽限期里删掉足够多的数据
+	// 之后，应当很快看到限制解除，而不是等上几个小时才确认自己的操作有效。
+	RestrictionSweepInterval time.Duration `env:"SQUYRRL_RESTRICTION_SWEEP_INTERVAL" envDefault:"1h"`
 
 	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
 	// 跨环境统一走默认值 2，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。

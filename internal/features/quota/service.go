@@ -38,6 +38,11 @@ func (s *Service) tierOf(ctx context.Context, userID uuid.UUID) (entitlement.Tie
 	return entitlement.MustOf(plan), plan, nil
 }
 
+// PlanOf 暴露用户当前档位字符串，供需要在错误响应里回填 plan 的调用方使用。
+func (s *Service) PlanOf(ctx context.Context, userID uuid.UUID) (string, error) {
+	return s.plans.ActivePlan(ctx, userID)
+}
+
 // RequireSync 断言用户所在档位允许把数据同步到服务端。
 //
 // 这是所有门槛里最重要的一道，因为它直接对应服务端成本：免费档是纯本地应用
@@ -179,13 +184,17 @@ func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus,
 	// 这一侧的后果比 plan 轻 —— 配额掉零只是传不了新文件，已传的字节不会消失 ——
 	// 但两处用不同的判据会制造一种没人能解释的中间态：订阅还在服务，
 	// 而同一次扣款失败已经让存储停摆。
+	// 存储只提供年付（ADR-075），所以这里事实上恒取年付窗口；仍写成 CASE 是为了
+	// 让「万一以后开了月付存储」不会静默套用一个更长的窗口。
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(bonus_storage_gb), 0)::bigint * 1024 * 1024 * 1024
 		FROM subscriptions
 		WHERE user_id = $1 AND kind = 'storage'
 		  AND (status = 'active'
-		       OR (status = 'past_due' AND current_period_end + $2::interval > now()))`,
-		userID, pricing.GracePeriod.String()).Scan(&st.QuotaBytes); err != nil {
+		       OR (status = 'past_due'
+		           AND current_period_end
+		               + (CASE billing_period WHEN 'yearly' THEN $2::interval ELSE $3::interval END) > now()))`,
+		userID, pricing.GraceYearly.String(), pricing.GraceMonthly.String()).Scan(&st.QuotaBytes); err != nil {
 		return st, err
 	}
 

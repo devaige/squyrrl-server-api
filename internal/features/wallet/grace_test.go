@@ -11,16 +11,24 @@ import (
 // 在客户端意味着分流切回本地 —— 用户的云端碎片当场从视野消失，
 // 新写入静默落到本机盘。而绝大多数订阅中断是扣款失败而非主动取消。
 // 把它调短省下的是几天服务成本，赔上的是一次看起来像数据丢失的体验。
-func TestGracePeriodIsTwoWeeks(t *testing.T) {
-	if GracePeriod != 14*24*time.Hour {
-		t.Errorf("宽限期应为 14 天，实际 %v", GracePeriod)
+func TestGracePeriodByBillingPeriod(t *testing.T) {
+	if GraceMonthly != 7*24*time.Hour {
+		t.Errorf("月订阅宽限期应为 7 天，实际 %v", GraceMonthly)
 	}
-	if GracePeriod != pricing.GracePeriod {
-		t.Error("wallet 的别名与 pricing 的定义不一致")
+	if GraceYearly != 14*24*time.Hour {
+		t.Errorf("年订阅宽限期应为 14 天，实际 %v", GraceYearly)
 	}
-	// 短于一个自然计费周期才有意义；等于或长于一个月会让「过期」永远到不了。
-	if GracePeriod >= 28*24*time.Hour {
-		t.Error("宽限期不应接近一个计费周期")
+	if pricing.GraceFor("yearly") != GraceYearly || pricing.GraceFor("monthly") != GraceMonthly {
+		t.Error("GraceFor 与常量不一致")
+	}
+	// 未知周期必须落到**更短**的那一档：给错方向的代价是白送服务，
+	// 而且是一个不会有人来投诉、因此永远不会被发现的漏洞。
+	if pricing.GraceFor("") != GraceMonthly || pricing.GraceFor("weekly") != GraceMonthly {
+		t.Error("未知计费周期应回落到月付窗口")
+	}
+	// 宽限期必须短于它所属的计费周期，否则「过期」永远追不上下一次扣款。
+	if GraceMonthly >= 28*24*time.Hour {
+		t.Error("月付宽限期不应接近一个计费周期")
 	}
 }
 

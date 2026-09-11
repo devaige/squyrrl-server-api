@@ -20,7 +20,7 @@ func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 const snippetCols = `
 	id, page_id, type, subtype, title, description,
 	text_content, text_format, text_lang, payload,
-	source_type, source_data, version, created_at, updated_at, deleted_at,
+	source_type, source_data, version, created_at, updated_at, deleted_at, restricted_at,
 	COALESCE((SELECT array_agg(tag_id) FROM snippet_tags WHERE snippet_id = s.id), '{}') AS tag_ids,
 	COALESCE(
 		(SELECT json_agg(jsonb_build_object(
@@ -41,7 +41,7 @@ func scanSnippet(row pgx.Row) (*Snippet, error) {
 		&s.ID, &s.PageID, &s.Type, &s.Subtype, &s.Title, &s.Description,
 		&s.TextContent, &s.TextFormat, &s.TextLang, &s.Payload,
 		&s.SourceType, &s.SourceData, &s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
-		&s.TagIDs, &elementsJSON,
+		&s.RestrictedAt, &s.TagIDs, &elementsJSON,
 	)
 	if err != nil {
 		return nil, err

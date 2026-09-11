@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/squyrrl/api/internal/features/entitlement"
+	"github.com/squyrrl/api/internal/features/pricing"
 )
 
 type Repo struct {
@@ -33,18 +34,20 @@ func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 func (r *Repo) PlanState(ctx context.Context, userID uuid.UUID) (PlanState, error) {
 	st := PlanState{Tier: entitlement.Free, Status: PlanStatusNone}
 
-	var tier, status string
+	var tier, status, billing string
 	var periodEnd time.Time
 	err := r.pool.QueryRow(ctx, `
-		SELECT tier, status, current_period_end FROM subscriptions
+		SELECT tier, status, billing_period, current_period_end FROM subscriptions
 		WHERE user_id = $1 AND kind = 'plan'
 		  AND (status = 'active'
-		       OR (status = 'past_due' AND current_period_end + $2::interval > now()))
+		       OR (status = 'past_due'
+		           AND current_period_end + `+graceCaseSQL+` > now()))
 		-- active 优先于 past_due：同时存在两行时（换档但旧卡还在催缴），
 		-- 已付费的那条才是用户当下应得的档位。
 		ORDER BY (status = 'active') DESC, current_period_end DESC
 		LIMIT 1`,
-		userID, GracePeriod.String()).Scan(&tier, &status, &periodEnd)
+		userID, GraceYearly.String(), GraceMonthly.String()).
+		Scan(&tier, &status, &billing, &periodEnd)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, nil
 	}
@@ -54,11 +57,19 @@ func (r *Repo) PlanState(ctx context.Context, userID uuid.UUID) (PlanState, erro
 
 	st.Tier, st.Status = tier, status
 	if status == PlanStatusPastDue {
-		until := periodEnd.Add(GracePeriod)
+		until := periodEnd.Add(pricing.GraceFor(billing))
 		st.GraceUntil = &until
 	}
 	return st, nil
 }
+
+// graceCaseSQL 把「宽限期随计费周期变」表达在 SQL 里。
+//
+// 写成 CASE 而不是在 Go 侧先查出 billing_period 再算：那需要两次往返，
+// 而这条查询在每次配额检查上都要跑。$2 = 年付窗口，$3 = 月付窗口，
+// 与 pricing.GraceFor 是同一份规则的两处实现 —— 唯一能这样做的理由是它只有两个分支，
+// 且两处都在同一个文件的视野内；分支再多就该把它收敛回 Go 侧。
+const graceCaseSQL = `(CASE billing_period WHEN 'yearly' THEN $2::interval ELSE $3::interval END)`
 
 // ActivePlan 只取档位字符串，供 quota.PlanReader 使用。
 func (r *Repo) ActivePlan(ctx context.Context, userID uuid.UUID) (string, error) {
