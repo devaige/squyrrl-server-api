@@ -1225,6 +1225,41 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------- Wallet
+  /me/export:
+    get:
+      operationId: exportMyData
+      tags: [Account]
+      summary: 整批导出我的云端数据
+      description: |
+        以 `squyrrl.local-backup` 信封（version 2）流式返回当前用户的页面与碎片，
+        可直接被客户端导入本地库 —— 格式契约见 `docs/spec/backup-envelope.md`。
+
+        存在的理由是 ADR-075 的降级生命周期：超额数据在 60 天后永久删除，
+        在此之前必须有办法整批取走。逐条查看对一个有几万条碎片的人等于没有出口。
+
+        **正文是混淆后的密文**（`content_obfuscated: true`），服务端不持有也不解密它；
+        导入方负责解混淆。**冻结期的碎片不在导出里** —— 那一阶段的定义就是不可访问，
+        而导出是访问的一种。
+
+        不返回 `Content-Length`：内容是流式产出的。写入中途失败时连接会被中断，
+        客户端拿到的是一份**解析失败**的截断 JSON，而不是一份静默残缺的备份。
+      responses:
+        '200':
+          description: 导出文件
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [format, version, exported_at, pages, snippets]
+                properties:
+                  format: { type: string, enum: ['squyrrl.local-backup'] }
+                  version: { type: integer, enum: [2] }
+                  exported_at: { type: string, format: date-time }
+                  content_obfuscated: { type: boolean, enum: [true] }
+                  pages: { type: array, items: { type: object } }
+                  snippets: { type: array, items: { type: object } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /me/wallet:
     get:
       operationId: getWallet
