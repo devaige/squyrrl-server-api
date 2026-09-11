@@ -3,11 +3,37 @@ package wallet
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/entitlement"
+	"github.com/squyrrl/api/internal/features/pricing"
 )
+
+// GracePeriod 的定义在 pricing 包；这里保留一个别名，让 wallet 的调用点读起来自然。
+const GracePeriod = pricing.GracePeriod
+
+// plan 订阅的三种对外状态。
+const (
+	// PlanStatusNone 没有任何 plan 订阅 —— 免费档。
+	PlanStatusNone = "none"
+	// PlanStatusActive 正常付费中。
+	PlanStatusActive = "active"
+	// PlanStatusPastDue 扣款失败但仍在宽限期内，按原档位服务。
+	PlanStatusPastDue = "past_due"
+)
+
+// PlanState 是「用户现在算哪一档，以及为什么」。
+//
+// Status 与 GraceUntil 单独暴露，是为了让客户端能提前提醒续费 ——
+// 只回一个 tier 的话，用户唯一的信号会是宽限期结束那天功能突然消失。
+type PlanState struct {
+	Tier   string `json:"tier"`
+	Status string `json:"status"`
+	// GraceUntil 仅 past_due 时非空：宽限期到此为止，之后按 free 处理。
+	GraceUntil *time.Time `json:"grace_until,omitempty"`
+}
 
 // ErrInsufficientCredits 由 Consume 在余额 < cost 时返回。
 // 上层 handler 应映射到 HTTP 402 Payment Required。
@@ -45,6 +71,12 @@ var ErrGrantOverflow = errors.New("grant would overflow balance")
 type Wallet struct {
 	Plan           string `json:"plan"`            // 'free' / 'basic' / 'standard' / 'premium' / 'maximum'
 	CreditsBalance int64  `json:"credits_balance"` // SUM(delta) over credits_ledger，永不过期
+
+	// PlanStatus 与 GraceUntil 说明「这个档位当前是怎么来的」。
+	// past_due 时 Plan 仍是原档位（宽限期内照常服务），客户端据此提前提醒续费 ——
+	// 不说的话，用户唯一的信号是宽限期结束那天功能突然消失。
+	PlanStatus string     `json:"plan_status"`
+	GraceUntil *time.Time `json:"grace_until,omitempty"`
 
 	// Limits 是当前档位的完整门槛表，客户端据此在本地预判
 	// （比如碎片列表到达上限时提前置灰新建按钮，而不是等服务端回 402）。

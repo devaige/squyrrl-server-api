@@ -117,6 +117,9 @@ func (s *Server) Handler() http.Handler { return s.engine }
 // FileService 供 main 启动后台任务用（上传意图清理）。
 func (s *Server) FileService() *file.Service { return s.fileSvc }
 
+// WalletService 供后台任务读取用户档位（回收站清理要按档位定保留期）。
+func (s *Server) WalletService() *wallet.Service { return s.walletSvc }
+
 func (s *Server) routes() {
 	// GET 与 HEAD 都要注册：**Gin 不会为 GET 路由自动响应 HEAD**（httprouter 的行为，
 	// 与 net/http 的 ServeMux 不同），漏了这条 HEAD /health 会返回 404。

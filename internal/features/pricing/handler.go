@@ -2,6 +2,7 @@ package pricing
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -53,6 +54,17 @@ type FileSizeTier struct {
 }
 
 const (
+	// GracePeriod 是订阅转入 past_due 之后仍按原档位服务的窗口（ADR-075 ⑭）。
+	//
+	// 取 14 天而不是 7 天：两侧代价不对称。多给一周，成本是一周的服务；少给一周，
+	// 一个在外旅行、没看到催缴邮件的付费用户会发现自己的碎片「不见了」——
+	// ADR-075 ⑧ 之后掉档意味着客户端切回本地模式，云端数据当场离开视野。
+	// 绝大多数订阅中断本就是扣款失败而非主动取消，宁可多送一周。
+	//
+	// 放在 pricing 而不是 wallet：quota 也要用它（存储配额同样吃宽限期），
+	// 而 quota → wallet 会成环（wallet 的 handler 已经依赖 quota）。
+	GracePeriod = 14 * 24 * time.Hour
+
 	// YearlyMonths 年付按 10 个月计价。
 	YearlyMonths = 10
 	// SignupGrantCredits 注册赠送额度，够 3 条最贵的解析（200 × 3）。

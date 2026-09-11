@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/squyrrl/api/internal/features/entitlement"
 )
 
 type Repo struct {
@@ -16,19 +19,51 @@ type Repo struct {
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-// ActivePlan 取用户当前活跃的 plan 订阅 tier；没有则视为 free
-func (r *Repo) ActivePlan(ctx context.Context, userID uuid.UUID) (string, error) {
-	var tier string
+// PlanState 取用户当前生效的 plan 档位，**把宽限期算在内**；无订阅时是 free。
+//
+// past_due 必须照常服务，这是 ADR-075 ⑭ 的全部内容，理由不是宽容而是风险不对称：
+// 绝大多数订阅中断是扣款失败（卡过期、额度不足、风控误伤）而非主动取消，
+// 而 ADR-075 ⑧ 之后「掉回 free」在客户端意味着**分流切到本地** ——
+// 用户的云端碎片当场从视野里消失，新写入静默落到本机盘。
+// 一次银行侧的临时失败不该产生这种后果。
+//
+// 宽限期锚在 current_period_end 而不是「转入 past_due 的时刻」：后者需要额外一列，
+// 而前者已经在表里，且语义正确 —— 用户付过钱的那段时间结束之后，再多给 N 天。
+// 期末之前就转 past_due（催缴通常早于期末）时该条件天然满足，也是对的。
+func (r *Repo) PlanState(ctx context.Context, userID uuid.UUID) (PlanState, error) {
+	st := PlanState{Tier: entitlement.Free, Status: PlanStatusNone}
+
+	var tier, status string
+	var periodEnd time.Time
 	err := r.pool.QueryRow(ctx, `
-		SELECT tier FROM subscriptions
-		WHERE user_id = $1 AND kind = 'plan' AND status = 'active'
-		ORDER BY current_period_end DESC
+		SELECT tier, status, current_period_end FROM subscriptions
+		WHERE user_id = $1 AND kind = 'plan'
+		  AND (status = 'active'
+		       OR (status = 'past_due' AND current_period_end + $2::interval > now()))
+		-- active 优先于 past_due：同时存在两行时（换档但旧卡还在催缴），
+		-- 已付费的那条才是用户当下应得的档位。
+		ORDER BY (status = 'active') DESC, current_period_end DESC
 		LIMIT 1`,
-		userID).Scan(&tier)
+		userID, GracePeriod.String()).Scan(&tier, &status, &periodEnd)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "free", nil
+		return st, nil
 	}
-	return tier, err
+	if err != nil {
+		return st, err
+	}
+
+	st.Tier, st.Status = tier, status
+	if status == PlanStatusPastDue {
+		until := periodEnd.Add(GracePeriod)
+		st.GraceUntil = &until
+	}
+	return st, nil
+}
+
+// ActivePlan 只取档位字符串，供 quota.PlanReader 使用。
+func (r *Repo) ActivePlan(ctx context.Context, userID uuid.UUID) (string, error) {
+	st, err := r.PlanState(ctx, userID)
+	return st.Tier, err
 }
 
 // CreditsBalance 用 SUM(delta) 直接算总余额；避免维护 balance_after 的并发难度

@@ -20,7 +20,7 @@ func (s *Service) ActivePlan(ctx context.Context, userID uuid.UUID) (string, err
 }
 
 func (s *Service) GetWallet(ctx context.Context, userID uuid.UUID) (*Wallet, error) {
-	plan, err := s.repo.ActivePlan(ctx, userID)
+	st, err := s.repo.PlanState(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +28,17 @@ func (s *Service) GetWallet(ctx context.Context, userID uuid.UUID) (*Wallet, err
 	if err != nil {
 		return nil, err
 	}
-	return &Wallet{Plan: plan, CreditsBalance: bal}, nil
+	return &Wallet{
+		Plan:           st.Tier,
+		PlanStatus:     st.Status,
+		GraceUntil:     st.GraceUntil,
+		CreditsBalance: bal,
+	}, nil
+}
+
+// PlanState 暴露完整的档位状态，供需要区分 active / past_due 的调用方使用。
+func (s *Service) PlanState(ctx context.Context, userID uuid.UUID) (PlanState, error) {
+	return s.repo.PlanState(ctx, userID)
 }
 
 // Grant 落一笔 credits 流水。idemKey 为空表示不参与幂等；

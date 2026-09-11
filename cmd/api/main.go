@@ -13,6 +13,7 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/squyrrl/api/internal/config"
+	"github.com/squyrrl/api/internal/features/snippet"
 	"github.com/squyrrl/api/internal/infra/db"
 	"github.com/squyrrl/api/internal/infra/storage"
 	"github.com/squyrrl/api/internal/server"
@@ -72,6 +73,11 @@ func main() {
 	// 这里收的是「客户端拿了令牌却没 commit」——那些字节在 R2 里，files 表却没有行，
 	// 唯一的线索就是意图表。
 	go srv.FileService().RunIntentSweeper(rootCtx, cfg.FileGCInterval)
+
+	// 后台任务：按档位清理过期的回收站条目（ADR-075 ⑯）。
+	// 放在 server.New 之后是因为它要用 walletSvc 解析「用户现在算哪一档」——
+	// 那段带宽限期的逻辑只该有一个定义。
+	go snippet.NewTrashSweeper(pool, srv.WalletService(), cfg.TrashSweepInterval).Run(rootCtx)
 
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,

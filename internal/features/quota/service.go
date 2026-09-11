@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/squyrrl/api/internal/features/entitlement"
+	"github.com/squyrrl/api/internal/features/pricing"
 )
 
 // PlanReader 提供用户当前档位。由 wallet.Service 实现 —— 用接口而不是直接依赖，
@@ -72,10 +73,25 @@ func (s *Service) CheckTagCreate(ctx context.Context, userID uuid.UUID) error {
 		`SELECT count(*) FROM tags WHERE user_id = $1`)
 }
 
+// deviceCountSQL 数「真正的设备」。
+//
+// 排除三方绑定占位的那些：Telegram 绑定会建一台 platform=telegram 的设备
+// （tg.CreateBindingDevice），但它已经被 BindingsPerPlatform 这条门槛管着了。
+// 两条门槛同时计一样东西，用户会看到「我只登了一台电脑，怎么说我有两台设备」——
+// 而且绑一个 TG 号会白白吃掉一个登录名额，那不是档位表的意思：
+// 设备数与每平台绑定数在 ADR-075 里是两个独立的允许量。
+const deviceCountSQL = `
+	SELECT count(*) FROM devices d
+	WHERE d.user_id = $1 AND d.revoked_at IS NULL
+	  AND NOT EXISTS (SELECT 1 FROM platform_bindings pb WHERE pb.device_id = d.id)`
+
 // CheckDeviceCreate 在注册新设备前校验数量。
+//
+// **尚未接入任何调用点**：既有设计是「超限时踢掉最久未活跃的那台」而不是拒绝新登录
+// （见 docs/context.md 的 Device limit 一条），那是一条独立的逐出链路，
+// 而它落在登录路径上 —— 做错的后果是把人挡在门外。留待单独一批。
 func (s *Service) CheckDeviceCreate(ctx context.Context, userID uuid.UUID) error {
-	return s.checkCount(ctx, userID, LimitDevices,
-		`SELECT count(*) FROM devices WHERE user_id = $1 AND revoked_at IS NULL`)
+	return s.checkCount(ctx, userID, LimitDevices, deviceCountSQL)
 }
 
 // CheckBindingCreate 在绑定新的三方账号前校验数量。
@@ -159,11 +175,17 @@ type StorageStatus struct {
 func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus, error) {
 	var st StorageStatus
 
+	// past_due 同样吃宽限期，判据与 plan 一致（ADR-075 ⑭）。
+	// 这一侧的后果比 plan 轻 —— 配额掉零只是传不了新文件，已传的字节不会消失 ——
+	// 但两处用不同的判据会制造一种没人能解释的中间态：订阅还在服务，
+	// 而同一次扣款失败已经让存储停摆。
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(bonus_storage_gb), 0)::bigint * 1024 * 1024 * 1024
 		FROM subscriptions
-		WHERE user_id = $1 AND kind = 'storage' AND status = 'active'`,
-		userID).Scan(&st.QuotaBytes); err != nil {
+		WHERE user_id = $1 AND kind = 'storage'
+		  AND (status = 'active'
+		       OR (status = 'past_due' AND current_period_end + $2::interval > now()))`,
+		userID, pricing.GracePeriod.String()).Scan(&st.QuotaBytes); err != nil {
 		return st, err
 	}
 
@@ -203,7 +225,8 @@ func (s *Service) CurrentUsage(ctx context.Context, userID uuid.UUID) (Usage, er
 			(SELECT count(*) FROM snippets WHERE user_id = $1 AND deleted_at IS NULL),
 			(SELECT count(*) FROM pages    WHERE user_id = $1 AND deleted_at IS NULL AND is_system = FALSE),
 			(SELECT count(*) FROM tags     WHERE user_id = $1),
-			(SELECT count(*) FROM devices  WHERE user_id = $1 AND revoked_at IS NULL)`,
+			(SELECT count(*) FROM devices d WHERE d.user_id = $1 AND d.revoked_at IS NULL
+			   AND NOT EXISTS (SELECT 1 FROM platform_bindings pb WHERE pb.device_id = d.id))`,
 		userID).Scan(&u.Snippets, &u.Pages, &u.Tags, &u.Devices)
 	return u, err
 }

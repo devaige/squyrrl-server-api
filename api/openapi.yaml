@@ -1981,7 +1981,7 @@ components:
     # ---------- 钱包 ----------
     Wallet:
       type: object
-      required: [plan, credits_balance, limits, usage, storage]
+      required: [plan, plan_status, credits_balance, limits, usage, storage]
       description: |
         三块增值服务各自的状态（ADR-075）。必须一起下发：客户端要在同一处解释
         「为什么这个操作被拒了」，只拿到其中两块就无法区分 402 是余额不足还是配额已满。
@@ -1989,7 +1989,22 @@ components:
         plan:
           type: string
           enum: [free, basic, standard, premium, maximum]
-          description: 当前活跃订阅 tier；无活跃订阅时返 'free'
+          description: |
+            当前**生效**的档位。扣款失败但仍在宽限期内（ADR-075 ⑭）时，这里仍是
+            原档位而非 free —— 宽限期内服务不降级。
+        plan_status:
+          type: string
+          enum: [none, active, past_due]
+          description: |
+            这个档位是怎么来的。`past_due` = 扣款失败但仍在宽限期内。
+            客户端应据此提前提醒续费：不提醒的话，用户唯一的信号就是宽限期结束
+            那天功能突然消失，而那时已经来不及了。
+        grace_until:
+          type: string
+          format: date-time
+          description: |
+            仅 `plan_status = past_due` 时出现。宽限期到此为止，之后按 free 处理 ——
+            而 free 在客户端意味着数据分流切回本地（ADR-075 ⑧）。
         credits_balance:
           type: integer
           format: int64
