@@ -92,7 +92,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	extapiSvc := extapi.NewService(extapi.NewRepo(pool))
 	parsSvc := parser.NewService(registry, parser.NewCache(pool), walletSvc, extapiSvc, cfg.ParseCost)
 
-	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, cfg.TGBotUsername)
+	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, quotaSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
 	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool))
 	claimSvc := claim.NewService(pool, quotaSvc)

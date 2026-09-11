@@ -3,6 +3,7 @@ package tg
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,10 @@ var (
 	ErrBotUnconfigured = errors.New("服务端未配置 Telegram Bot 用户名")
 )
 
+// PlatformTelegram 是本包唯一签发/核销的平台标识。写成常量而不是散落的字符串
+// 字面量，是因为接入第二个平台时，编译器能替你找出所有该分叉的地方。
+const PlatformTelegram = "telegram"
+
 // BindingTokenBytes 是令牌的随机字节数。base64url 编码后 43 字符，
 // 落在 Telegram deep link payload 的 64 字符上限与 [A-Za-z0-9_-] 字符集内。
 const BindingTokenBytes = 32
@@ -28,15 +33,25 @@ type BindingLink struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// Binding 是面向用户的绑定记录，字段一律用平台无关的名字。
+//
+// 与 /internal/tg 上那套 `tg_user_id` 形状的分界是有意的：内部端点是 Bot 与 API
+// 之间的私有协议，说 Telegram 的母语（int64 的 tg_user_id）才自然；而这个结构
+// 出现在「我绑了哪些账号」这张用户可见的列表里，将来微信等平台的记录要与它并排，
+// 所以它必须先是平台无关的。
+//
+// PlatformUserID 是字符串而不是 int64：Telegram 的 ID 恰好是数字，微信 openid
+// 不是。让它在最外层就是字符串，比日后再改一次已发布的契约便宜。
 type Binding struct {
-	ID         uuid.UUID `json:"id"`
-	TGUserID   int64     `json:"tg_user_id"`
-	TGUsername *string   `json:"tg_username,omitempty"`
-	TGName     *string   `json:"tg_name,omitempty"`
-	UserID     uuid.UUID `json:"user_id"`
-	DeviceID   uuid.UUID `json:"device_id"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastUsedAt time.Time `json:"last_used_at"`
+	ID             uuid.UUID `json:"id"`
+	Platform       string    `json:"platform"`
+	PlatformUserID string    `json:"platform_user_id"`
+	Username       *string   `json:"platform_username,omitempty"`
+	Name           *string   `json:"platform_name,omitempty"`
+	UserID         uuid.UUID `json:"user_id"`
+	DeviceID       uuid.UUID `json:"device_id"`
+	CreatedAt      time.Time `json:"created_at"`
+	LastUsedAt     time.Time `json:"last_used_at"`
 }
 
 // TGIdentity 是 Bot 观察到的 TG 用户身份，核销令牌建立绑定时一并带上，
@@ -45,6 +60,17 @@ type TGIdentity struct {
 	TGUserID int64  `json:"tg_user_id" binding:"required"`
 	Username string `json:"tg_username,omitempty"`
 	Name     string `json:"tg_name,omitempty"`
+}
+
+// identity 把 Bot 报上来的 Telegram 原生身份翻译成存储层的平台无关形状。
+// 这是整个包里唯一一处 int64 → string 的转换点。
+func (id TGIdentity) identity() Identity {
+	return Identity{
+		Platform: PlatformTelegram,
+		UserID:   strconv.FormatInt(id.TGUserID, 10),
+		Username: id.Username,
+		Name:     id.Name,
+	}
 }
 
 // =============================================================================

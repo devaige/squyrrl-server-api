@@ -906,7 +906,7 @@ paths:
                 properties:
                   bindings:
                     type: array
-                    items: { $ref: '#/components/schemas/TelegramBinding' }
+                    items: { $ref: '#/components/schemas/PlatformBinding' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /me/tg/binding/link:
@@ -980,7 +980,7 @@ paths:
           description: 已绑定
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TelegramBinding' }
+              schema: { $ref: '#/components/schemas/PlatformBinding' }
         '400':
           description: 令牌无效或已过期
           content:
@@ -991,6 +991,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '402':
+          description: |
+            档位门槛拒绝。`reason=sync_required` 表示当前档位（免费档）不含三方绑定；
+            `reason=plan_limit` 表示该平台可绑定的账号数已达上限。Bot 据此给出不同建议 ——
+            前者要升级，后者可以先解绑一个。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
         '409':
           description: 该 tg_user_id 已绑定其它 Squyrrl 用户
           content:
@@ -1486,6 +1494,38 @@ components:
       required: [error]
       properties:
         error: { type: string, description: 人可读的错误描述（中文） }
+
+    QuotaError:
+      type: object
+      description: |
+        所有 402 的统一载体（ADR-075）。字段**按 `reason` 分组填写**，
+        用不到的一律省略 —— 同一个响应体里既有 `balance` 又有 `cap`，
+        客户端就无从判断该读哪个、该把用户引导去充值还是去升级。
+      required: [reason, error]
+      properties:
+        reason:
+          type: string
+          enum: [insufficient_credits, plan_limit, sync_required]
+          description: |
+            机器可读的拒绝原因。`sync_required` 从 `plan_limit` 里单独拆出，
+            因为它对应的引导完全不同（「升级以启用云同步」而非「数量已达上限」），
+            且它是免费档用户最常撞到的一条。
+        error: { type: string, description: 人可读的中文描述，仅作兜底展示 }
+        limit:
+          type: string
+          enum: [snippets, pages, tags, devices, bindings, hidden_pages]
+          description: 撞到的是哪一项门槛（plan_limit / sync_required）
+        cap: { type: integer, description: 当前档位该项的上限 }
+        current: { type: integer, description: 当前用量；批量写入时是「加完之后」的值 }
+        plan: { type: string, description: 用户当前档位 }
+        required_plan:
+          type: string
+          description: |
+            能满足本次操作的最低档位。**为空表示最高档也不够** ——
+            客户端必须区分这两种情况，否则会把「你已经是至尊版了，这条确实放不下」
+            显示成一个点了没有任何变化的「请升级」按钮。
+        balance: { type: integer, format: int64, description: 当前代币余额（insufficient_credits） }
+        required: { type: integer, format: int64, description: 本次操作所需代币（insufficient_credits） }
 
     # ---------- 认证 ----------
     User:
@@ -2053,20 +2093,32 @@ components:
           example: https://t.me/SquyrrlBot?start=fT3n9-xQ...
         expires_at: { type: string, format: date-time }
 
-    TelegramBinding:
+    PlatformBinding:
       type: object
-      required: [id, tg_user_id, user_id, device_id, created_at, last_used_at]
+      description: |
+        用户绑定的一个三方账号。字段一律平台无关 —— 这张列表将来会同时容纳
+        Telegram / 微信等多个平台的记录。注意与 /internal/tg 上那套 `tg_user_id`
+        形状的区别：后者是 Bot 与 API 之间的私有协议，说 Telegram 的母语。
+      required: [id, platform, platform_user_id, user_id, device_id, created_at, last_used_at]
       properties:
         id: { type: string, format: uuid }
-        tg_user_id: { type: integer, format: int64 }
-        tg_username:
+        platform:
           type: string
-          description: 绑定时由 Bot 带上，供 App 区分多个已绑账号；TG 侧改名不回流
-        tg_name: { type: string }
+          enum: [telegram]
+          description: 目前只有 telegram；接入新平台时在此扩充
+        platform_user_id:
+          type: string
+          description: |
+            该平台上的账号 ID，**字符串**。Telegram 的恰好是数字，
+            微信 openid 不是 —— 用字符串承载才不必在接第二个平台时改契约。
+        platform_username:
+          type: string
+          description: 绑定时由平台侧带上，供 App 区分多个已绑账号；对方改名不回流
+        platform_name: { type: string }
         user_id: { type: string, format: uuid }
         device_id:
           type: string
           format: uuid
-          description: 每个 TG 号对应一台 platform=telegram 的设备占位
+          description: 每个三方号对应一台同名 platform 的设备占位
         created_at: { type: string, format: date-time }
         last_used_at: { type: string, format: date-time }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/squyrrl/api/internal/features/auth"
 	"github.com/squyrrl/api/internal/features/file"
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
 type Handler struct {
@@ -100,6 +101,11 @@ func (h *Handler) consumeToken(c *gin.Context) {
 	}
 	b, err := h.svc.Bind(c.Request.Context(), in.Token, in.TGIdentity)
 	if err != nil {
+		// 档位门槛要先于 default 分支判断，否则「绑定数已达上限」会以 500 出去，
+		// Bot 那侧看到的是「服务端炸了」而不是一句能转述给用户的话。
+		if quota.WriteIfQuota(c, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, ErrTokenInvalid):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

@@ -78,6 +78,17 @@ func (s *Service) CheckDeviceCreate(ctx context.Context, userID uuid.UUID) error
 		`SELECT count(*) FROM devices WHERE user_id = $1 AND revoked_at IS NULL`)
 }
 
+// CheckBindingCreate 在绑定新的三方账号前校验数量。
+//
+// 计数带 platform 条件：BindingsPerPlatform 的字面含义是「每个平台各多少个」，
+// 不是所有平台合计。合计口径会让接入微信之后，已经绑满 Telegram 的用户
+// 一个微信号都绑不了 —— 而他并没有多占任何成本。
+func (s *Service) CheckBindingCreate(ctx context.Context, userID uuid.UUID, platform string) error {
+	return s.checkCount(ctx, userID, LimitBindings,
+		`SELECT count(*) FROM platform_bindings WHERE user_id = $1 AND platform = $2`,
+		platform)
+}
+
 // CheckHiddenPage 校验「隐藏页面」这项能力。它是布尔门槛，没有数量概念。
 func (s *Service) CheckHiddenPage(ctx context.Context, userID uuid.UUID) error {
 	t, plan, err := s.tierOf(ctx, userID)
@@ -97,7 +108,8 @@ func (s *Service) CheckHiddenPage(ctx context.Context, userID uuid.UUID) error {
 // 每次 create 都多一次 count 查询是有代价的，但这些表都有 user_id 的部分索引，
 // 而 create 本身也不是高频路径。真到了需要优化的那天，正确做法是维护计数器列
 // 并定期对账，而不是取消检查 —— 但那属于过早优化，现在不做。
-func (s *Service) checkCount(ctx context.Context, userID uuid.UUID, limit Limit, countSQL string) error {
+// countSQL 恒以 $1 = userID 开头，extra 依次填 $2 起 —— 目前只有按平台计数用到。
+func (s *Service) checkCount(ctx context.Context, userID uuid.UUID, limit Limit, countSQL string, extra ...any) error {
 	t, plan, err := s.tierOf(ctx, userID)
 	if err != nil {
 		return err
@@ -107,8 +119,9 @@ func (s *Service) checkCount(ctx context.Context, userID uuid.UUID, limit Limit,
 	}
 
 	max := capOf(t, limit)
+	args := append([]any{userID}, extra...)
 	var current int
-	if err := s.pool.QueryRow(ctx, countSQL, userID).Scan(&current); err != nil {
+	if err := s.pool.QueryRow(ctx, countSQL, args...).Scan(&current); err != nil {
 		return err
 	}
 	if current >= max {
