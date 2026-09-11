@@ -216,6 +216,22 @@ func (h *Handler) uploadFile(c *gin.Context) {
 		mime = "application/octet-stream"
 	}
 
+	// 配额卡在读取请求体**之前**：读完再拒等于白白吃下一次入网传输，
+	// 而这条路径正是唯一还在消耗服务器带宽的那条。
+	if tgUserID, err := strconv.ParseInt(c.GetHeader("X-TG-User-ID"), 10, 64); err == nil && tgUserID != 0 {
+		if err := h.svc.CheckUploadFor(c.Request.Context(), tgUserID, size); err != nil {
+			if quota.WriteIfQuota(c, err) {
+				return
+			}
+			if errors.Is(err, ErrNotBound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	f, err := h.fileSvc.Upload(c.Request.Context(), plain, cipher, size, mime, c.Request.Body)
 	if err != nil {
 		switch {

@@ -31,6 +31,11 @@ const (
 	// （「升级以启用云同步」而非「你的页面数量已达上限」），
 	// 而且它是免费用户最常撞到的一条，值得让客户端单独处理。
 	ReasonSyncRequired Reason = "sync_required"
+	// ReasonStorageFull 云存储空间不足、单文件超限，或压根没买存储。
+	//
+	// 不并进 plan_limit：存储是**独立商品**（ADR-075），任何订阅档位单独都给不了它。
+	// 混进去的话客户端会引导用户去升级订阅，而升级订阅一个字节都不会多出来。
+	ReasonStorageFull Reason = "storage_full"
 	// ReasonDataRestricted 这条数据超出了当前档位，正处在降级后的生命周期里
 	// （宽限期不可修改 / 冻结期不可读取）。
 	//
@@ -50,6 +55,7 @@ const (
 	LimitDevices     Limit = "devices"
 	LimitBindings    Limit = "bindings"
 	LimitHiddenPages Limit = "hidden_pages"
+	LimitStorage     Limit = "storage"
 )
 
 // Error 是所有 402 的统一载体。handler 把它序列化成响应体。
@@ -77,6 +83,11 @@ type Error struct {
 	// —— ReasonDataRestricted ——
 	// RestrictStage 是 "grace"（可读可删不可改）或 "frozen"（列表可见、详情不可读）。
 	RestrictStage string `json:"restrict_stage,omitempty"`
+	// —— ReasonStorageFull ——
+	QuotaBytes  *int64 `json:"quota_bytes,omitempty"`
+	UsedBytes   *int64 `json:"used_bytes,omitempty"`
+	NeededBytes *int64 `json:"needed_bytes,omitempty"`
+
 	// RestrictUntil 是当前阶段的结束时刻。冻结期结束即永久删除，所以这个字段
 	// 承载的是一个真实的倒计时，而不是一句软性提示。
 	RestrictUntil *time.Time `json:"restrict_until,omitempty"`
@@ -102,6 +113,23 @@ func ErrDataRestricted(msg, stage string, until time.Time, plan string) *Error {
 		RestrictStage: stage,
 		RestrictUntil: &until,
 		RequiredPlan:  "",
+	}
+}
+
+// newStorageError 组装存储相关的 402。
+//
+// required_plan 恒为空：存储不是靠升档位拿到的。留一个指向订阅页的按钮，
+// 用户点了、付了钱、空间还是 0 —— 那是最糟的一种错误引导。
+func newStorageError(msg, plan string, st StorageStatus, need int64) *Error {
+	return &Error{
+		Reason:       ReasonStorageFull,
+		Msg:          msg,
+		Limit:        LimitStorage,
+		Plan:         plan,
+		QuotaBytes:   &st.QuotaBytes,
+		UsedBytes:    &st.UsedBytes,
+		NeededBytes:  &need,
+		RequiredPlan: "",
 	}
 }
 

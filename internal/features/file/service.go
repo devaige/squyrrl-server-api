@@ -19,9 +19,19 @@ import (
 	"github.com/squyrrl/api/internal/infra/storage"
 )
 
+// UploadQuota 是 quota.Service 的窄接口：上传前判定这个文件放不放得下。
+//
+// 用接口而非直接依赖 quota.Service，理由和其它几处一样 —— 让 file 的单测
+// 不必拖进一个数据库连接池，也让「没配额检查器」在构造期就是一个显式的选择
+// 而不是一次忘记注入。
+type UploadQuota interface {
+	CheckUpload(ctx context.Context, userID uuid.UUID, size int64) error
+}
+
 type Service struct {
 	repo    *Repo
 	storage *storage.Client
+	quota   UploadQuota
 
 	// 边缘配置（ADR-069 上传 / ADR-070 下载），两项都必填。任一为空 ⇒ 上传与下载
 	// 一起不可用（fail-closed）：签发端点返回 503 —— 而**不是**退回让字节穿过 api。
@@ -30,8 +40,8 @@ type Service struct {
 	tokenSecret string
 }
 
-func NewService(repo *Repo, st *storage.Client, edgeBase, tokenSecret string) *Service {
-	return &Service{repo: repo, storage: st, edgeBase: edgeBase, tokenSecret: tokenSecret}
+func NewService(repo *Repo, st *storage.Client, q UploadQuota, edgeBase, tokenSecret string) *Service {
+	return &Service{repo: repo, storage: st, quota: q, edgeBase: edgeBase, tokenSecret: tokenSecret}
 }
 
 // EdgeEnabled 报告边缘是否可用：边缘地址与令牌密钥缺一不可。上传与下载共用这一个
@@ -254,7 +264,23 @@ func (s *Service) IssueIntent(
 	if existing, ok, err := s.Check(ctx, plainHash); err != nil {
 		return nil, err
 	} else if ok {
+		// 去重命中：不传字节，但这个用户的占用照样会涨（ADR-075 的「每个引用者全额计」）。
+		// 仍然过一遍配额 —— 否则「别人传过的文件」就是一条绕开额度的免费通道。
+		if s.quota != nil {
+			if err := s.quota.CheckUpload(ctx, userID, existing.SizeBytes); err != nil {
+				return nil, err
+			}
+		}
 		return &IntentResponse{Exists: true, File: existing}, nil
+	}
+
+	// 配额卡在这里，是因为**这是服务端最后一次能说话的时刻**：签发之后字节直达
+	// R2，api 再也看不到它们（ADR-069）。放到 commit 去查就太晚了 ——
+	// 那时超出去的字节已经躺在 R2 上，按月计费。
+	if s.quota != nil {
+		if err := s.quota.CheckUpload(ctx, userID, size); err != nil {
+			return nil, err
+		}
 	}
 
 	storageKey := StorageKeyFor(cipherHash)

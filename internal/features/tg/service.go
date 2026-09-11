@@ -22,6 +22,7 @@ const tokenTTL = 5 * time.Minute
 // tg 包在构造期反向依赖 quota —— 后者已经依赖 wallet 读档位，绕成环。
 type QuotaChecker interface {
 	CheckBindingCreate(ctx context.Context, userID uuid.UUID, platform string) error
+	CheckUpload(ctx context.Context, userID uuid.UUID, size int64) error
 }
 
 type Service struct {
@@ -85,6 +86,25 @@ func (s *Service) Bind(ctx context.Context, token string, id TGIdentity) (*Bindi
 		return nil, err
 	}
 	return s.repo.FindByAccount(ctx, acc.Platform, acc.UserID)
+}
+
+// CheckUploadFor 在 Bot 代传文件之前，按 tg_user_id 找到账户并校验存储配额。
+//
+// 这条路径此前完全没有配额约束，而且成因是结构性的：`/internal/tg/files` 只带
+// 哈希与大小，**压根不知道是谁的文件** —— 账户要到后面建碎片那一步才由
+// tg_user_id 解析出来。于是字节先落 R2，配额不足在建碎片时才暴露，
+// 留下一批要等 GC 的孤儿对象，而它们已经开始计费了。
+//
+// 修法是把「谁」提前到上传这一步：Bot 本来就知道 tg_user_id，带上即可。
+func (s *Service) CheckUploadFor(ctx context.Context, tgUserID int64, size int64) error {
+	if s.quota == nil {
+		return nil
+	}
+	b, err := s.repo.FindByAccount(ctx, PlatformTelegram, strconv.FormatInt(tgUserID, 10))
+	if err != nil {
+		return err
+	}
+	return s.quota.CheckUpload(ctx, b.UserID, size)
 }
 
 func (s *Service) ListBindings(ctx context.Context, userID uuid.UUID) ([]Binding, error) {

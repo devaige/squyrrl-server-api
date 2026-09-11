@@ -130,7 +130,7 @@ func TestEdgeEnabledRequiresBoth(t *testing.T) {
 		{"https://files.squyrrl.com", "secret", true},
 	}
 	for _, c := range cases {
-		if got := NewService(nil, nil, c.base, c.secret).EdgeEnabled(); got != c.want {
+		if got := NewService(nil, nil, nil, c.base, c.secret).EdgeEnabled(); got != c.want {
 			t.Errorf("base=%q secret=%q ⇒ %v, want %v", c.base, c.secret, got, c.want)
 		}
 	}

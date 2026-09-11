@@ -618,6 +618,16 @@ paths:
               schema: { $ref: '#/components/schemas/UploadIntentResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: |
+            存储配额不足（ADR-075 ⑮）。三种情形共用这一个码，靠 `reason=storage_full`
+            与文案区分：没买存储 / 单文件超上限 / 总量放不下。
+            **判定发生在签发之前** —— 直传之后字节不再经过 api，这是服务端最后
+            一次能说话的时刻；放到 commit 去查，超出的字节已经躺在 R2 上计费了。
+            总量判据含**在途预留**（同用户未过期的 pending 意图），否则并发上传会一起超卖。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
         '413':
           description: 单文件超过 100MiB
         '503':
@@ -1193,6 +1203,15 @@ paths:
         - { name: X-Cipher-Hash, in: header, required: true, schema: { type: string } }
         - { name: X-Size-Bytes,  in: header, required: true, schema: { type: integer } }
         - { name: X-Mime,        in: header, required: false, schema: { type: string } }
+        - name: X-TG-User-ID
+          in: header
+          required: false
+          schema: { type: integer, format: int64 }
+          description: |
+            发起转发的 Telegram 用户。带上它，服务端才能在**读请求体之前**
+            查这个账户的存储配额 —— 这条路径上账户此前要到建碎片那步才解析得出来，
+            于是字节先落 R2、配额不足事后才暴露，留下一批已经开始计费的孤儿对象。
+            缺省时跳过配额校验（兼容尚未升级的 Bot）。
       requestBody:
         required: true
         content:
@@ -1555,7 +1574,7 @@ components:
       properties:
         reason:
           type: string
-          enum: [insufficient_credits, plan_limit, sync_required, data_restricted]
+          enum: [insufficient_credits, plan_limit, sync_required, data_restricted, storage_full]
           description: |
             机器可读的拒绝原因。`sync_required` 从 `plan_limit` 里单独拆出，
             因为它对应的引导完全不同（「升级以启用云同步」而非「数量已达上限」），
@@ -1565,7 +1584,7 @@ components:
         error: { type: string, description: 人可读的中文描述，仅作兜底展示 }
         limit:
           type: string
-          enum: [snippets, pages, tags, devices, bindings, hidden_pages]
+          enum: [snippets, pages, tags, devices, bindings, hidden_pages, storage]
           description: 撞到的是哪一项门槛（plan_limit / sync_required）
         cap: { type: integer, description: 当前档位该项的上限 }
         current: { type: integer, description: 当前用量；批量写入时是「加完之后」的值 }
@@ -1578,6 +1597,18 @@ components:
             显示成一个点了没有任何变化的「请升级」按钮。
         balance: { type: integer, format: int64, description: 当前代币余额（insufficient_credits） }
         required: { type: integer, format: int64, description: 本次操作所需代币（insufficient_credits） }
+        quota_bytes:
+          type: integer
+          format: int64
+          description: storage_full 专用：已购买的云存储总量
+        used_bytes:
+          type: integer
+          format: int64
+          description: storage_full 专用：当前占用（含在途预留之外的已落库部分）
+        needed_bytes:
+          type: integer
+          format: int64
+          description: storage_full 专用：本次上传需要的字节
         restrict_stage:
           type: string
           enum: [grace, frozen]

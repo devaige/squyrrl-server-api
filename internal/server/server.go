@@ -81,7 +81,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	pageSvc := page.NewService(page.NewRepo(pool), quotaSvc)
 	tagRepo := tag.NewRepo(pool)
 	snipSvc := snippet.NewService(snippet.NewRepo(pool), quotaSvc)
-	fileSvc := file.NewService(file.NewRepo(pool), st, cfg.UploadEdgeBase, cfg.UploadTokenSecret)
+	fileSvc := file.NewService(file.NewRepo(pool), st, quotaSvc, cfg.UploadEdgeBase, cfg.UploadTokenSecret)
 
 	// URI 解析：特殊 provider 顺序匹配；通用 OG 兜底放在最末
 	registry := parser.NewRegistry()

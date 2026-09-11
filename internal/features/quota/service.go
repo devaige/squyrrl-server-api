@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -159,6 +160,67 @@ func firstTierWith(pred func(entitlement.Tier) bool) string {
 		}
 	}
 	return ""
+}
+
+// CheckUpload 在**传输开始之前**判定这个文件放不放得下。
+//
+// 三道判据，顺序是有讲究的：
+//  1. 档位是否允许存储 —— 免费档的碎片只在本机，云端字节没有东西可挂（ADR-075）；
+//  2. 单文件上限（由总配额派生，见 pricing.MaxFileBytesFor）；
+//  3. 总量：已占用 + **在途预留** + 本次 ≤ 配额。
+//
+// 第 3 条里的「在途预留」是这个函数存在的真正理由。直传之后字节不经过 api
+// （ADR-069），服务端唯一能施加约束的时刻就是签发意图那一下。只比对已落库的占用，
+// 十个并发上传会各自看到同一个「还剩多少」，然后一起超卖 —— 而超出去的是
+// 已经躺在 R2 里、要按月付费的字节。
+func (s *Service) CheckUpload(ctx context.Context, userID uuid.UUID, size int64) error {
+	t, plan, err := s.tierOf(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !t.Sync {
+		return ErrSyncRequired(plan)
+	}
+
+	st, err := s.Storage(ctx, userID)
+	if err != nil {
+		return err
+	}
+	quotaGB := int(st.QuotaBytes / (1024 * 1024 * 1024))
+
+	maxFile := pricing.MaxFileBytesFor(quotaGB)
+	if maxFile <= 0 {
+		// 没买存储。这不是「档位不够」——任何档位单独都给不了存储，
+		// 要的是另一件商品，所以 required_plan 留空、由文案说清该买什么。
+		return newStorageError("当前账户没有云存储空间，购买后即可上传文件", plan, st, size)
+	}
+	if size > maxFile {
+		return newStorageError(
+			fmt.Sprintf("单个文件最大 %d GB，扩容后上限会随之提升", maxFile/(1024*1024*1024)),
+			plan, st, size)
+	}
+
+	held, err := s.heldBytes(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if st.UsedBytes+held+size > st.QuotaBytes {
+		return newStorageError("云存储空间不足", plan, st, size)
+	}
+	return nil
+}
+
+// heldBytes 是这个用户手上尚未收尾的上传意图占掉的字节。
+//
+// 只算未过期的 pending：过期意图由 sweeper 回收（它同时会 abort R2 的分片），
+// 把它们继续算进预留，等于让一次没传完的上传把额度锁到天荒地老。
+func (s *Service) heldBytes(ctx context.Context, userID uuid.UUID) (int64, error) {
+	var held int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(size_bytes), 0) FROM upload_intents
+		WHERE user_id = $1 AND status = 'pending' AND expires_at > now()`,
+		userID).Scan(&held)
+	return held, err
 }
 
 // StorageStatus 是用户的云存储配额与占用，单位统一为字节。
