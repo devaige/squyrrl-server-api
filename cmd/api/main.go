@@ -85,6 +85,13 @@ func main() {
 	// 应当尽快恢复正常，而不是等到几小时后的下一轮。
 	go snippet.NewRestrictionSweeper(pool, srv.WalletService(), cfg.RestrictionSweepInterval).Run(rootCtx)
 
+	// 后台任务：两张辅助表的保留期（migration 000019）。
+	// 与上面三条的区别是它们回收的不是用户数据，而是「越受欢迎越大、且没有上界」的
+	// 平台自用数据 —— 解析缓存的上界是整个互联网，线上采样的上界是调用次数。
+	// 两者都不影响正确性，所以跑得最稀疏，也因此共用同一个间隔。
+	go srv.ParseCache().RunSweeper(rootCtx, cfg.RetentionSweepInterval)
+	go srv.ExtapiService().RunSampleSweeper(rootCtx, cfg.RetentionSweepInterval)
+
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler(),

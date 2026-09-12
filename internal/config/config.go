@@ -74,8 +74,29 @@ type Config struct {
 	OTPIPWindow    time.Duration `env:"SQUYRRL_OTP_IP_WINDOW"    envDefault:"1h"`
 	OTPDailyBudget int           `env:"SQUYRRL_OTP_DAILY_BUDGET" envDefault:"80"`
 
+	// 验证侧的闸门（与上面三层不同轴：那三层管发信，这个管猜解）。
+	// 单个邮箱在一个码周期内允许猜错的次数，用尽即销毁该邮箱下所有存活的码。
+	// 取 5：6 位码猜中概率 5/10^6，而真实用户连错 5 次已属罕见。
+	OTPMaxAttempts int `env:"SQUYRRL_OTP_MAX_ATTEMPTS" envDefault:"5"`
+
 	// 后台任务节奏
 	FileGCInterval time.Duration `env:"SQUYRRL_FILE_GC_INTERVAL" envDefault:"5m"`
+	// 回收站清理不需要频繁：最短保留期是 30 天，6 小时的粒度对用户完全无感，
+	// 而更密的轮询只是在反复扫同一批不到期的行。
+	TrashSweepInterval time.Duration `env:"SQUYRRL_TRASH_SWEEP_INTERVAL" envDefault:"6h"`
+	// 超额数据的标记/解除比回收站清理更需要及时：用户在宽限期里删掉足够多的数据
+	// 之后，应当很快看到限制解除，而不是等上几个小时才确认自己的操作有效。
+	RestrictionSweepInterval time.Duration `env:"SQUYRRL_RESTRICTION_SWEEP_INTERVAL" envDefault:"1h"`
+	// 辅助表保留期清理（parse_cache 过期行 + api_samples 的线上采样，migration 000019）。
+	// 一天一轮足够：过期的缓存行不影响任何正确性（Get 本来就带 expires_at 条件），
+	// 多留一天只是多占一天磁盘，而更密的轮询只是在反复扫同一批还没到期的行。
+	RetentionSweepInterval time.Duration `env:"SQUYRRL_RETENTION_SWEEP_INTERVAL" envDefault:"24h"`
+
+	// 解析缓存的保留期。30 天是「同一条链接被再次解析的现实窗口」的量级 ——
+	// 更长只是在替整个互联网存档（GenericOG 是兜底 provider，任意 http(s) 链接都会落一行），
+	// 而缓存未命中的代价只是一次上游调用，不是数据丢失。
+	// 设 0 可回到旧的「永不过期」行为，但那正是 000019 要修的东西。
+	ParseCacheTTL time.Duration `env:"SQUYRRL_PARSE_CACHE_TTL" envDefault:"720h"`
 
 	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
 	// 跨环境统一走默认值 2，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。
@@ -83,8 +104,21 @@ type Config struct {
 
 	// 订阅 webhook 签名密钥（任一为空表示该 provider 不启用）
 	StripeWebhookSecret string `env:"SQUYRRL_STRIPE_WEBHOOK_SECRET"`
-	AppleSharedSecret   string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
-	GooglePubsubAud     string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
+	// StripeSecretKey 用于调 Stripe API 创建 Checkout Session。留空 ⇒ 购买入口返回 503
+	// （fail-closed，与边缘直传同一个态度：没有一条「退化成别的方式收款」的暗路）。
+	StripeSecretKey string `env:"SQUYRRL_STRIPE_SECRET_KEY"`
+	// StripePrices 是 SKU → Stripe price id 的 JSON 映射，键为 `kind:tier:period`
+	// （代币加购的 period 固定为 `once`）。例：
+	//   {"plan:basic:monthly":"price_1A...","storage:s50:yearly":"price_1B...","credits:p5:once":"price_1C..."}
+	//
+	// 放环境变量而不是数据库：**Stripe 的测试模式与正式模式是两套完全不同的 price id**，
+	// 它属于环境配置而非业务数据。放进库里意味着每次换环境都要改数据，
+	// 而那正是环境变量存在的理由。
+	StripePrices string `env:"SQUYRRL_STRIPE_PRICES"`
+	// CheckoutReturnBase 是结账完成/取消后跳回的站点前缀，例如 https://squyrrl.com。
+	CheckoutReturnBase string `env:"SQUYRRL_CHECKOUT_RETURN_BASE" envDefault:"https://squyrrl.com"`
+	AppleSharedSecret  string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
+	GooglePubsubAud    string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
 }
 
 func Load() (*Config, error) {

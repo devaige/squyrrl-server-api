@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -130,4 +131,45 @@ func nilIfEmpty(b json.RawMessage) []byte {
 		return nil
 	}
 	return b
+}
+
+// LiveSamplesPerEndpoint 是每个 endpoint 保留的线上采样条数上限。
+//
+// 写成常量而不是环境变量：它不随部署环境变化，取值只由「要看几条才够判断
+// response_map 对不对」决定，而那个答案是 20 左右，不是需要调的旋钮。
+const LiveSamplesPerEndpoint = 20
+
+// RunSampleSweeper 阻塞执行线上采样的限量循环；调用方放在独立 goroutine。
+//
+// 与解析缓存清理共用一个间隔（两者都是「只增不减的辅助表」这一类），
+// 因此没有单独的配置项。
+func (s *Service) RunSampleSweeper(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	slog.Info("解析 API 采样限量启动", "interval", interval, "keep", LiveSamplesPerEndpoint)
+	s.pruneOnce(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("解析 API 采样限量退出")
+			return
+		case <-t.C:
+			s.pruneOnce(ctx)
+		}
+	}
+}
+
+func (s *Service) pruneOnce(ctx context.Context) {
+	n, err := s.repo.PruneLiveSamples(ctx, LiveSamplesPerEndpoint)
+	if err != nil {
+		slog.Warn("解析 API 采样限量失败", "err", err)
+		return
+	}
+	if n > 0 {
+		slog.Info("解析 API 采样限量完成", "removed", n)
+	}
 }

@@ -198,3 +198,31 @@ func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample,
 	}
 	return out, rows.Err()
 }
+
+// PruneLiveSamples 每个 endpoint 只保留最近 keep 条 kind='live' 的采样，其余删除。
+//
+// 按条数而不是按天数限量：live 行只在 config.archive_live=true 时写，用途是
+// 核对 response_map 命中了哪些字段（见 migration 000010），那需要的是「最近几条」。
+// 按天数保留在低频 endpoint 上会一条不剩，在高频 endpoint 上又会留下几十万行 ——
+// 按条数两头都对，且上界与调用量完全无关。
+//
+// 排序带 id 兜底：同毫秒写入的多条若只按 created_at 排，谁进窗口是不确定的，
+// 于是两轮清理之间会反复删掉又留下不同的行（与 snippet 限制扫描同一个教训）。
+//
+// kind='sample' 不在范围内 —— 那是管理员手工录入的契约示例，是业务数据。
+func (r *Repo) PruneLiveSamples(ctx context.Context, keep int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM api_samples s
+		USING (
+			SELECT id, row_number() OVER (
+				PARTITION BY endpoint_id ORDER BY created_at DESC, id DESC
+			) AS rn
+			FROM api_samples
+			WHERE kind = 'live'
+		) ranked
+		WHERE s.id = ranked.id AND ranked.rn > $1`, keep)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

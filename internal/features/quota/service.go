@@ -215,7 +215,10 @@ func (s *Service) CheckUpload(ctx context.Context, userID uuid.UUID, size int64)
 		return err
 	}
 	if st.UsedBytes+held+size > st.QuotaBytes {
-		return newStorageError("云存储空间不足", plan, st, size)
+		// 提一句回收站：占用含未过保留期的已删碎片（见 Storage 的说明），
+		// 而「清空回收站」是用户当场就能做的事，比「再买一份」低一个数量级。
+		// 这句只是兜底，三语文案在客户端的 quotaStorageFull。
+		return newStorageError("云存储空间不足（含回收站中尚未到期的文件）", plan, st, size)
 	}
 	return nil
 }
@@ -249,6 +252,16 @@ type StorageStatus struct {
 // DISTINCT 在用户内部去重（同一用户的多条碎片引用同一文件只算一次），
 // 但跨用户各算各的 —— 全局去重（ADR-026）省下的字节留在成本侧，不回馈给用户。
 // 反过来做的话，别人删掉一个共享文件会让你的占用凭空上涨，那是没人能理解的账单。
+//
+// **回收站里的碎片同样计入**（不再过滤 deleted_at）。软删只把 snippets 标记掉，
+// elements 原封不动，于是 files.ref_count 不降、字节继续躺在 R2 上按月计费 ——
+// 而保留期按档位是 30 到 365 天。过滤掉它们的后果是一条可重复的免费通道：
+// 传满 → 删掉 → 配额立刻归零 → 再传满，实际占用可以数倍于付费额度，
+// 而存储这块商品的毛利根本吃不下第二份。
+//
+// 代价是「删了东西空间没变」需要在界面上说清楚（Dropbox / Google Drive 同样这么算）。
+// 清空回收站是用户自己就能做的动作，所以这不是一条死路。
+// 已过保留期但 TrashSweeper 尚未扫到的最多多算一轮（默认 6 小时），方向是保守的那边。
 func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus, error) {
 	var st StorageStatus
 
@@ -276,7 +289,7 @@ func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus,
 			SELECT DISTINCT e.file_id
 			FROM elements e
 			JOIN snippets s ON s.id = e.snippet_id
-			WHERE s.user_id = $1 AND s.deleted_at IS NULL AND e.file_id IS NOT NULL
+			WHERE s.user_id = $1 AND e.file_id IS NOT NULL
 		) uf
 		JOIN files f ON f.id = uf.file_id`,
 		userID).Scan(&st.UsedBytes); err != nil {

@@ -218,18 +218,27 @@ func (h *Handler) uploadFile(c *gin.Context) {
 
 	// 配额卡在读取请求体**之前**：读完再拒等于白白吃下一次入网传输，
 	// 而这条路径正是唯一还在消耗服务器带宽的那条。
-	if tgUserID, err := strconv.ParseInt(c.GetHeader("X-TG-User-ID"), 10, 64); err == nil && tgUserID != 0 {
-		if err := h.svc.CheckUploadFor(c.Request.Context(), tgUserID, size); err != nil {
-			if quota.WriteIfQuota(c, err) {
-				return
-			}
-			if errors.Is(err, ErrNotBound) {
-				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	//
+	// 头缺失一律拒绝，**不再「缺省即跳过」**。原先那版 fail-open 是为了兼容
+	// 尚未升级的 Bot，但两者的代价完全不对称：fail-closed 坏掉的窗口里 TG 文件传不上来
+	// （用户看得见、一次部署就能修），fail-open 坏掉的窗口里配额**根本不存在**
+	// 而一切正常 —— 字节照落 R2、照按月计费，没有任何信号。
+	// 而且 ADR-063 让 Bot 与 api 各自独立部署，这个窗口可以由一次回滚随时重开。
+	tgUserID, err := strconv.ParseInt(c.GetHeader("X-TG-User-ID"), 10, 64)
+	if err != nil || tgUserID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X-TG-User-ID 缺失或非法"})
+		return
+	}
+	if err := h.svc.CheckUploadFor(c.Request.Context(), tgUserID, size); err != nil {
+		if quota.WriteIfQuota(c, err) {
 			return
 		}
+		if errors.Is(err, ErrNotBound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	f, err := h.fileSvc.Upload(c.Request.Context(), plain, cipher, size, mime, c.Request.Body)
