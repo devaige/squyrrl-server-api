@@ -605,6 +605,12 @@ paths:
         `SQUYRRL_UPLOAD_EDGE_BASE` / `SQUYRRL_UPLOAD_TOKEN_SECRET` 任一为空 ⇒ **503**
         （fail-closed）。**没有服务端中转回退**：漏配的代价是传不了文件，而不是让文件字节
         穿过 api 产生出网带宽费用。
+
+        图片可以在这一步附带一张缩略图声明（`thumb_cipher_hash` + `thumb_size_bytes`），
+        服务端会另签一张 `thumb_token`。缩略图由客户端在混淆之前生成 —— api 手里没有
+        字节，拉回 R2 生成正好抵消掉直传省下的带宽，而列表里每张图都下全尺寸原图
+        是这条链路上最贵的一笔读流量。声明是可选的：不带、非图片、客户端解码失败
+        都只意味着这份文件没有缩略图，下载侧从第一天起就支持那个状态。
       requestBody:
         required: true
         content:
@@ -2011,9 +2017,11 @@ components:
         has_thumbnail:
           type: boolean
           description: |
-            服务端是否存有预生成的 JPEG 缩略图。仅中转上传时代（ADR-069 之前）的图片
-            才会有：直传后 api 手里没有字节，要生成就得把整个对象从 R2 拉回来，
-            恰好抵消掉直传省下的带宽；而客户端混淆后的字节本来也解不出图。
+            是否存有这份文件的缩略图对象（256 px 长边、JPEG q80）。
+            直传路径由**客户端**在混淆之前生成并随本体一起传给边缘；api 全程不碰字节，
+            只在 commit 时核对 R2 里的实际大小再填 `thumbnail_key`。
+            TG 摄取那条服务端还持有 body 的路径仍走 ADR-050 的服务端生成。
+            两者产出同一个 key，区别只在字节是否混淆 —— 见 `thumb_url` 的说明。
         created_at: { type: string, format: date-time }
 
     FileTicket:
@@ -2028,7 +2036,13 @@ components:
         thumb_url:
           type: string
           format: uri
-          description: 缩略图直读 URL；**缺省即没有缩略图**，客户端应回退到 `blob_url`
+          description: |
+            缩略图直读 URL；**缺省即没有缩略图**，客户端应回退到 `blob_url`。
+
+            取回的字节**可能是混淆容器，也可能是裸 JPEG**：客户端生成的那份走与本体
+            相同的混淆格式（ADR-072），服务端生成的（TG 摄取）是明文。两者靠容器头的
+            4 字节 magic `SQOB` 区分即可，不需要额外字段 —— 容器本身是自描述的，
+            再往数据库里存一个标志位就是同一个事实的第二份副本，而两份副本迟早会不一致。
         expires_at:
           type: integer
           format: int64
@@ -2050,6 +2064,21 @@ components:
         cipher_hash: { type: string, pattern: '^[0-9a-f]{64}$', description: 密文 SHA-256，同时是对象 key }
         size_bytes:  { type: integer, minimum: 1, description: 混淆**后**的字节数（= 实际传输量） }
         mime:        { type: string, default: application/octet-stream }
+        thumb_cipher_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            可选。客户端生成的缩略图**混淆后**的 SHA-256。给了就表示「本次还要传一张
+            缩略图」，服务端会在回包里附上 `thumb_token`。
+            仅 `mime` 为 `image/*` 时接受，否则 400。
+        thumb_size_bytes:
+          type: integer
+          format: int64
+          description: |
+            缩略图混淆后的字节数。必须 ≤ 64 KiB **且严格小于 `size_bytes`**。
+            后一条是把「不计配额的字节」框死的不变式：未计费字节因此恒不超过已计费
+            字节，最坏情况下 R2 实际占用是配额的 2 倍，现实中是 1.005 倍。
+            两个 thumb_* 字段同进同退，只给一个视为非法。
 
     UploadIntentResponse:
       type: object
@@ -2071,6 +2100,15 @@ components:
           description: 'HMAC 上传令牌，格式 `base64url(payload).base64url(mac)`；以 `Authorization: Bearer` 送给边缘'
         part_size:  { type: integer, description: 分片大小，固定 8 MiB }
         part_count: { type: integer, description: 1 = 单片模式（不走 multipart） }
+        thumb_token:
+          type: string
+          description: |
+            缩略图专用的第二张上传票，恒为单片模式：`PUT {upload_url}/v1/single`。
+            **缺省即服务端没有接受这次缩略图声明**（没声明 / 非图片 / 去重命中），
+            客户端跳过那一次 PUT 即可，本体上传不受影响。
+
+            单独一张票而不是给 `token` 加字段：一张票只能写一个 key，是这套令牌
+            最要紧的不变式（key 由服务端签死，客户端不能自选）。
 
     UploadCommitInput:
       type: object

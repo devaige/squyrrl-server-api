@@ -9,14 +9,19 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// thumb_size_bytes 走 coalesce 落到 0（同 r2_upload_id 落到 ''）：NULL 表示
+// 「这次没声明缩略图」，而调用方判定的依据是 ThumbCipherHash 是否为空 ——
+// 两个字段各扫各的会让「哈希在、大小是 0」这种不可能状态在 Go 里变得可表示。
+// 数据库那边由 chk_upload_intents_thumb 保证两者同进同退。
 const intentCols = `id, user_id, plain_hash, cipher_hash, size_bytes, mime,
-	storage_key, coalesce(r2_upload_id, ''), part_size, part_count, status, expires_at`
+	storage_key, coalesce(r2_upload_id, ''), part_size, part_count, status, expires_at,
+	thumb_cipher_hash, coalesce(thumb_size_bytes, 0)`
 
 func scanIntent(row pgx.Row) (*UploadIntent, error) {
 	var it UploadIntent
 	if err := row.Scan(&it.ID, &it.UserID, &it.PlainHash, &it.CipherHash, &it.SizeBytes,
 		&it.Mime, &it.StorageKey, &it.R2UploadID, &it.PartSize, &it.PartCount,
-		&it.Status, &it.ExpiresAt); err != nil {
+		&it.Status, &it.ExpiresAt, &it.ThumbCipherHash, &it.ThumbSizeBytes); err != nil {
 		return nil, err
 	}
 	return &it, nil
@@ -27,14 +32,24 @@ func (r *Repo) InsertIntent(ctx context.Context, it *UploadIntent) (*UploadInten
 	if it.R2UploadID != "" {
 		r2 = &it.R2UploadID
 	}
+	// 两项一起给或一起为 NULL。只写其中一个会被 CHECK 拒掉，那正是想要的 ——
+	// 「有哈希没大小」的意图收尾时无从校验 R2 里实际躺了多少字节。
+	var thumbHash []byte
+	var thumbSize *int64
+	if len(it.ThumbCipherHash) > 0 {
+		thumbHash = it.ThumbCipherHash
+		size := it.ThumbSizeBytes
+		thumbSize = &size
+	}
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO upload_intents
 			(user_id, plain_hash, cipher_hash, size_bytes, mime, storage_key,
-			 r2_upload_id, part_size, part_count, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			 r2_upload_id, part_size, part_count, expires_at,
+			 thumb_cipher_hash, thumb_size_bytes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		RETURNING `+intentCols,
 		it.UserID, it.PlainHash, it.CipherHash, it.SizeBytes, it.Mime, it.StorageKey,
-		r2, it.PartSize, it.PartCount, it.ExpiresAt)
+		r2, it.PartSize, it.PartCount, it.ExpiresAt, thumbHash, thumbSize)
 	return scanIntent(row)
 }
 

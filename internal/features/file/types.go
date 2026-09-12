@@ -15,6 +15,8 @@ var (
 	ErrIntentState    = errors.New("upload intent is not pending")
 	ErrPartsMismatch  = errors.New("committed parts do not match the intent")
 	ErrEdgeDisabled   = errors.New("edge is not configured")
+	ErrThumbNotImage  = errors.New("thumbnail declared for a non-image upload")
+	ErrThumbTooLarge  = errors.New("thumbnail must be under the ceiling and smaller than the blob")
 )
 
 // 上传体积上限：100 MiB；后续按订阅档位放宽。
@@ -43,6 +45,15 @@ const downloadTTL = 10 * time.Minute
 // 又必须短到让 sweeper 能及时回收 R2 里的半成品分片。
 const intentTTL = 2 * time.Hour
 
+// MaxThumbBytes 是客户端缩略图（**混淆后**）的字节上限。
+//
+// 256 px 长边、q80 的 JPEG 通常 8–25 KB；混淆只加 25 字节头加每块 16 字节 tag，
+// 一块就装得下，所以 64 KiB 留了两倍以上余量。
+//
+// 它必须存在，是因为缩略图字节**不计存储配额**（理由见 validateThumb）：没有天花板
+// 的话，一个 1 字节的本体就能拖着一份任意大的「缩略图」进 R2，而配额只看得见那 1 字节。
+const MaxThumbBytes int64 = 64 * 1024
+
 // PartCountFor 按 PartSize 切分；size <= PartSize 时返回 1（走单片模式，
 // 省掉 multipart 的 create/complete 两次额外 Class A 操作）。
 func PartCountFor(size int64) int {
@@ -66,6 +77,11 @@ type UploadIntent struct {
 	PartCount  int
 	Status     string
 	ExpiresAt  time.Time
+
+	// 缩略图的声明。空 = 本次不带缩略图，这是完全正常的状态（非图片、生成失败、
+	// 老客户端），下载侧从第一天起就支持 thumb_url 缺省。
+	ThumbCipherHash []byte
+	ThumbSizeBytes  int64
 }
 
 // IntentResponse 是 POST /files/intent 的回包。
@@ -78,6 +94,14 @@ type IntentResponse struct {
 	Token     string `json:"token,omitempty"`
 	PartSize  int64  `json:"part_size,omitempty"`
 	PartCount int    `json:"part_count,omitempty"`
+
+	// ThumbToken 是缩略图专用的第二张上传票，恒为单片模式，key 签死在
+	// thumb/<本体 cipher_hash>.jpg。缺省即服务端没有接受这次缩略图声明
+	// （非图片 / 超限 / 压根没声明），客户端据此跳过那一次 PUT。
+	//
+	// 单独一张票而不是给本体那张加字段：边缘凭「票里的 key」决定写哪个对象，
+	// 一张票只能写一个 key 是这套令牌最要紧的不变式（见 token.go）。
+	ThumbToken string `json:"thumb_token,omitempty"`
 }
 
 type IntentInput struct {
@@ -85,6 +109,28 @@ type IntentInput struct {
 	CipherHash string `json:"cipher_hash" binding:"required,hexadecimal,len=64"`
 	SizeBytes  int64  `json:"size_bytes"  binding:"required,gt=0"`
 	Mime       string `json:"mime"`
+
+	// 缩略图可选。omitempty 而非 required：不带缩略图是合法上传，
+	// 而且必须一直合法 —— 非图片、解码失败、老版本客户端都会走到这里。
+	ThumbCipherHash string `json:"thumb_cipher_hash" binding:"omitempty,hexadecimal,len=64"`
+	ThumbSizeBytes  int64  `json:"thumb_size_bytes"`
+}
+
+// IntentRequest 是 IssueIntent 的入参。
+//
+// 收成结构体而不是继续加位置参数：加上缩略图之后有三个 []byte（两个哈希加一个）
+// 和两个 int64（两个大小）互相紧挨着，位置调用里写反一对不会有任何编译错误，
+// 而表现是「对象写到了别人的 key 上」。字段名让这类错误在阅读时就露出来。
+type IntentRequest struct {
+	UserID     uuid.UUID
+	PlainHash  []byte
+	CipherHash []byte
+	SizeBytes  int64
+	Mime       string
+
+	// 两项同进同退：要么都给，要么都不给（与 upload_intents 的 CHECK 一致）。
+	ThumbCipherHash []byte
+	ThumbSizeBytes  int64
 }
 
 // CommitInput 收尾。单片模式 parts 为空；multipart 模式必须交齐每片的 ETag，

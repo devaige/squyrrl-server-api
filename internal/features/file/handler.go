@@ -50,21 +50,44 @@ func (h *Handler) intent(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "单文件超过 100MiB 上限"})
 		return
 	}
+	// 缩略图可选。声明了就必须是一个合法的 32 字节哈希 —— 与另外两个哈希同一套
+	// 校验，不因为它是可选项就放松：长度对不上时签出去的 key 是错的。
+	var thumbHash []byte
+	if in.ThumbCipherHash != "" {
+		thumbHash, err = hex.DecodeString(in.ThumbCipherHash)
+		if err != nil || len(thumbHash) != 32 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "thumb_cipher_hash 必须是 64 位 hex 的 SHA-256"})
+			return
+		}
+	}
 	mime := in.Mime
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
 
-	resp, err := h.svc.IssueIntent(c.Request.Context(), id.UserID, plain, cipher, in.SizeBytes, mime)
+	resp, err := h.svc.IssueIntent(c.Request.Context(), IntentRequest{
+		UserID:          id.UserID,
+		PlainHash:       plain,
+		CipherHash:      cipher,
+		SizeBytes:       in.SizeBytes,
+		Mime:            mime,
+		ThumbCipherHash: thumbHash,
+		ThumbSizeBytes:  in.ThumbSizeBytes,
+	})
 	if err != nil {
-		if errors.Is(err, ErrEdgeDisabled) {
+		switch {
+		case errors.Is(err, ErrEdgeDisabled):
 			// 503 而不是 500：这是配置缺失，不是偶发故障，重试不会好。
 			// 客户端此时**没有**回退路径 —— 中转上传已随 ADR-069 删除，
 			// 这正是想要的：漏配的后果是传不了文件，而不是账单上多一笔出网流量。
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用边缘"})
-			return
+		case errors.Is(err, ErrThumbNotImage):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "只有图片可以附带缩略图"})
+		case errors.Is(err, ErrThumbTooLarge):
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "缩略图超过上限或不小于本体"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, resp)

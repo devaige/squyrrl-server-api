@@ -1,6 +1,7 @@
 package file
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -211,5 +212,82 @@ func TestThumbnailKeyFor_NotNestedUnderBlobPrefix(t *testing.T) {
 func TestThumbnailKeyFor_LegacyUnprefixedKey(t *testing.T) {
 	if got, want := ThumbnailKeyFor("deadbeef"), "thumb/deadbeef.jpg"; got != want {
 		t.Fatalf("ThumbnailKeyFor = %q, want %q", got, want)
+	}
+}
+
+// =============================================================================
+// 客户端缩略图（成本审计 #7）
+// =============================================================================
+
+func TestValidateThumb(t *testing.T) {
+	hash := make([]byte, 32)
+	const blob = 4 * 1024 * 1024
+
+	cases := []struct {
+		name      string
+		mime      string
+		size      int64
+		thumbSize int64
+		thumbHash []byte
+		want      error
+	}{
+		{"没声明就是合法的", "application/pdf", blob, 0, nil, nil},
+		// 没声明时连 mime 都不该看：不带缩略图是所有文件类型的默认状态。
+		{"没声明时不看 mime", "video/mp4", blob, 0, nil, nil},
+		{"正常图片", "image/jpeg", blob, 20 * 1024, hash, nil},
+		{"非图片不许带", "application/pdf", blob, 20 * 1024, hash, ErrThumbNotImage},
+		{"超过 64 KiB 上限", "image/png", blob, MaxThumbBytes + 1, hash, ErrThumbTooLarge},
+		{"恰好 64 KiB 可以", "image/png", blob, MaxThumbBytes, hash, nil},
+		// 这条是把「不计配额的字节」框死的不变式，不是手滑校验：
+		// 允许缩略图 ≥ 本体，一个 1 字节的本体就能拖 64 KiB 未计费字节进 R2。
+		{"不得大于等于本体", "image/jpeg", 1024, 1024, hash, ErrThumbTooLarge},
+		{"比本体小一个字节也行", "image/jpeg", 1024, 1023, hash, nil},
+		{"声明了却给 0 大小", "image/jpeg", blob, 0, hash, ErrThumbTooLarge},
+		{"负数大小", "image/jpeg", blob, -1, hash, ErrThumbTooLarge},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := validateThumb(c.mime, c.size, c.thumbSize, c.thumbHash); !errors.Is(got, c.want) {
+				t.Fatalf("validateThumb = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// 缩略图票必须是「单片、另一个 key」。UploadID 非空会让边缘把它路由到 multipart
+// 分支并跳过整体哈希校验；key 相同则会让缩略图覆盖本体 —— 而 key 是全局去重的，
+// 一次覆盖波及所有引用者。
+func TestThumbTokenIsSinglePartAndTargetsThumbKey(t *testing.T) {
+	const secret = "test-secret"
+	blobKey := StorageKeyFor(make([]byte, 32))
+	exp := time.Now().Add(time.Hour).Unix()
+
+	tok, err := SignUploadToken(secret, UploadClaims{
+		IntentID:   "11111111-1111-1111-1111-111111111111",
+		Key:        ThumbnailKeyFor(blobKey),
+		SizeBytes:  20 * 1024,
+		PartSize:   20 * 1024,
+		PartCount:  1,
+		CipherHash: strings.Repeat("ab", 32),
+		ExpiresAt:  exp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := VerifyUploadToken(secret, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.UploadID != "" {
+		t.Fatalf("缩略图票不该带 uploadId，拿到 %q", claims.UploadID)
+	}
+	if claims.Key == blobKey {
+		t.Fatal("缩略图票指向了本体的 key —— 会覆盖全局去重的那份字节")
+	}
+	if !strings.HasPrefix(claims.Key, thumbPrefix) {
+		t.Fatalf("缩略图 key 前缀不对：%q", claims.Key)
+	}
+	if claims.CipherHash == "" {
+		t.Fatal("缩略图票必须带整体哈希，单片模式靠它做完整性校验")
 	}
 }

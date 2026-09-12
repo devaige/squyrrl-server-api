@@ -250,27 +250,28 @@ func (s *Service) signBlobURL(key, mime string, expiresAt time.Time) (string, er
 // 是内容寻址，两个客户端并发写同一 key 的结果逐字节相同，重复只多花一次带宽；
 // 而阻塞式的 in-flight 检查要引入租约、等待方轮询、上传方猝死后的接管，
 // 复杂度远超它省下的那点流量。
-func (s *Service) IssueIntent(
-	ctx context.Context,
-	userID uuid.UUID,
-	plainHash, cipherHash []byte,
-	size int64,
-	mime string,
-) (*IntentResponse, error) {
+func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentResponse, error) {
 	if !s.EdgeEnabled() {
 		return nil, ErrEdgeDisabled
 	}
+	if err := validateThumb(in.Mime, in.SizeBytes, in.ThumbSizeBytes, in.ThumbCipherHash); err != nil {
+		return nil, err
+	}
 
-	if existing, ok, err := s.Check(ctx, plainHash); err != nil {
+	if existing, ok, err := s.Check(ctx, in.PlainHash); err != nil {
 		return nil, err
 	} else if ok {
 		// 去重命中：不传字节，但这个用户的占用照样会涨（ADR-075 的「每个引用者全额计」）。
 		// 仍然过一遍配额 —— 否则「别人传过的文件」就是一条绕开额度的免费通道。
 		if s.quota != nil {
-			if err := s.quota.CheckUpload(ctx, userID, existing.SizeBytes); err != nil {
+			if err := s.quota.CheckUpload(ctx, in.UserID, existing.SizeBytes); err != nil {
 				return nil, err
 			}
 		}
+		// 命中时**不**签缩略图票，即便这行 files 的 thumbnail_key 还是空的。
+		// 那份对象的 key 由**已存在**的 cipher_hash 推导，而调用方手上的缩略图
+		// 是按自己刚算出的 cipher_hash 加密的 —— 两者对不上。补历史数据的缩略图
+		// 是一条独立的回填链路，不该借一次去重命中顺手做半件。
 		return &IntentResponse{Exists: true, File: existing}, nil
 	}
 
@@ -278,17 +279,17 @@ func (s *Service) IssueIntent(
 	// R2，api 再也看不到它们（ADR-069）。放到 commit 去查就太晚了 ——
 	// 那时超出去的字节已经躺在 R2 上，按月计费。
 	if s.quota != nil {
-		if err := s.quota.CheckUpload(ctx, userID, size); err != nil {
+		if err := s.quota.CheckUpload(ctx, in.UserID, in.SizeBytes); err != nil {
 			return nil, err
 		}
 	}
 
-	storageKey := StorageKeyFor(cipherHash)
-	partCount := PartCountFor(size)
+	storageKey := StorageKeyFor(in.CipherHash)
+	partCount := PartCountFor(in.SizeBytes)
 
 	var r2UploadID string
 	if partCount > 1 {
-		id, err := s.storage.InitMultipart(ctx, storageKey, mime)
+		id, err := s.storage.InitMultipart(ctx, storageKey, in.Mime)
 		if err != nil {
 			return nil, err
 		}
@@ -297,10 +298,11 @@ func (s *Service) IssueIntent(
 
 	expiresAt := time.Now().Add(intentTTL)
 	it, err := s.repo.InsertIntent(ctx, &UploadIntent{
-		UserID: userID, PlainHash: plainHash, CipherHash: cipherHash,
-		SizeBytes: size, Mime: mime, StorageKey: storageKey,
+		UserID: in.UserID, PlainHash: in.PlainHash, CipherHash: in.CipherHash,
+		SizeBytes: in.SizeBytes, Mime: in.Mime, StorageKey: storageKey,
 		R2UploadID: r2UploadID, PartSize: PartSize, PartCount: partCount,
-		ExpiresAt: expiresAt,
+		ExpiresAt:       expiresAt,
+		ThumbCipherHash: in.ThumbCipherHash, ThumbSizeBytes: in.ThumbSizeBytes,
 	})
 	if err != nil {
 		// 意图落库失败而 multipart 已开：立刻 abort，否则那些分片没人认领也没人计费提醒
@@ -317,17 +319,17 @@ func (s *Service) IssueIntent(
 		IntentID:   it.ID.String(),
 		Key:        storageKey,
 		UploadID:   r2UploadID,
-		SizeBytes:  size,
+		SizeBytes:  in.SizeBytes,
 		PartSize:   PartSize,
 		PartCount:  partCount,
-		CipherHash: hex.EncodeToString(cipherHash),
+		CipherHash: hex.EncodeToString(in.CipherHash),
 		ExpiresAt:  expiresAt.Unix(),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return &IntentResponse{
+	resp := &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
 		// 恒为非空（EdgeEnabled 已挡住空值）。dev 指向 api 自身的 /edge、
@@ -336,7 +338,52 @@ func (s *Service) IssueIntent(
 		Token:     token,
 		PartSize:  PartSize,
 		PartCount: partCount,
-	}, nil
+	}
+
+	if len(in.ThumbCipherHash) > 0 {
+		// 缩略图恒走单片（MaxThumbBytes 远小于 PartSize），所以 UploadID 留空 ——
+		// 边缘据此把它路由到 /v1/single 那条分支并做整体哈希校验。
+		// 边缘因此一行都不用改：key / sz / ch 本来就是令牌里三个互相独立的字段。
+		thumbToken, err := SignUploadToken(s.tokenSecret, UploadClaims{
+			IntentID:   it.ID.String(),
+			Key:        ThumbnailKeyFor(storageKey),
+			SizeBytes:  in.ThumbSizeBytes,
+			PartSize:   in.ThumbSizeBytes,
+			PartCount:  1,
+			CipherHash: hex.EncodeToString(in.ThumbCipherHash),
+			ExpiresAt:  expiresAt.Unix(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		resp.ThumbToken = thumbToken
+	}
+	return resp, nil
+}
+
+// validateThumb 校验一次缩略图声明。thumbHash 为空 = 本次不带缩略图，合法且常见。
+//
+// 三条规则各挡一件事：
+//   - 只有图片能带缩略图 —— 给一份 PDF 签出 thumb_url，客户端会拿它当图去渲染；
+//   - 上限 MaxThumbBytes —— 缩略图字节不计存储配额，总得有个天花板；
+//   - 必须严格小于本体 —— 这条才是真正把「未计费面积」框死的那一条。
+//
+// 为什么不把缩略图计进配额：那要给 files 加一列 thumb_size_bytes、让 quota.Storage()
+// 多一次 SUM，再让降级生命周期与 file GC 各自重新考虑一遍它 —— 换来的精度是千分之几
+// （4 MB 照片配 20 KB 缩略图）。改用「缩略图必须比本体小」这条不变式之后，未计费字节
+// 恒不超过已计费字节：最坏情况 R2 实际占用是配额的 2 倍，现实中是 1.005 倍。
+// 一条 if 换掉一整条会随时间分叉的核算路径。
+func validateThumb(mime string, size, thumbSize int64, thumbHash []byte) error {
+	if len(thumbHash) == 0 {
+		return nil
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		return ErrThumbNotImage
+	}
+	if thumbSize <= 0 || thumbSize > MaxThumbBytes || thumbSize >= size {
+		return ErrThumbTooLarge
+	}
+	return nil
 }
 
 // Commit 是直传的收尾：合并分片、核对 R2 里的实际字节数、写 files 行。
@@ -384,6 +431,9 @@ func (s *Service) Commit(
 		if derr := s.storage.Delete(ctx, it.StorageKey); derr != nil {
 			slog.Warn("大小不符后删除对象失败（留下 dust）", "key", it.StorageKey, "err", derr)
 		}
+		// 本体作废，缩略图也必须跟着走。它不能靠 abortIntentObject 顺手清掉 ——
+		// 那时 multipart 已经 complete，走 abort 分支必然失败并提前 return。
+		s.deleteThumbObject(ctx, it)
 		_ = s.repo.MarkIntentStatus(ctx, it.ID, "aborted")
 		return nil, ErrSizeMismatch
 	}
@@ -397,15 +447,57 @@ func (s *Service) Commit(
 		return nil, err
 	}
 
-	// 直传路径不生成缩略图：api 手里没有字节，要生成就得把整个对象从 R2 拉回来，
-	// 恰好抵消掉直传省下的带宽。而客户端混淆后的字节本来就解不出图（见 Upload 里的说明），
-	// 缩略图对新数据一直是 NULL —— 也就是说这里没有任何行为损失。
+	// 缩略图由**客户端**在混淆之前生成并随本体一起直传（成本审计 #7）。
+	// api 依然一个字节都不碰 —— 它只在这里确认「R2 里确实躺着一份声明过的大小」，
+	// 然后把 thumbnail_key 填上。服务端自己生成那条路（ADR-050）对直传数据永远
+	// 得不到可解码的字节，留着只服务于 TG 摄取（那条路 api 手里有 body）。
+	if len(it.ThumbCipherHash) > 0 {
+		s.attachThumbnail(ctx, f, it)
+	}
 	return f, nil
+}
+
+// attachThumbnail 收尾缩略图：核对 R2 里的实际字节数，然后写 thumbnail_key。
+//
+// 全程不返回错误，因为**缩略图不是收尾的前提**：任何一步失败的正确结果都是
+// 「这份文件没有缩略图」，而那是下载侧从第一天起就支持的状态（thumb_url 缺省 =
+// 客户端回退原图）。让它失败掉整次 commit，等于拿一份已经躺在 R2 里、已经计过费的
+// 本体，去赌一个 30 KB 的优化。
+func (s *Service) attachThumbnail(ctx context.Context, f *File, it *UploadIntent) {
+	key := ThumbnailKeyFor(it.StorageKey)
+
+	// 与本体同一条规矩：以 R2 记录的大小为准，不信客户端签发时声称的值。
+	actual, err := s.storage.StatObject(ctx, key)
+	if err != nil {
+		slog.Debug("缩略图未传或读取失败，按无缩略图处理", "file_id", f.ID, "err", err)
+		return
+	}
+	if actual != it.ThumbSizeBytes {
+		// 对不上就删掉。留着它既不会被任何东西引用，也不会被 file GC 看见
+		// —— GC 只删 files.thumbnail_key 指到的对象 —— 那就是一份永久计费的垃圾。
+		if derr := s.storage.Delete(ctx, key); derr != nil {
+			slog.Warn("缩略图大小不符且删除失败（留下 dust）", "key", key, "err", derr)
+		}
+		return
+	}
+
+	if err := s.repo.SetThumbnailKey(ctx, f.ID, key); err != nil {
+		slog.Warn("缩略图写库失败", "file_id", f.ID, "err", err)
+		return
+	}
+
+	// 回填内存里的这一份。客户端拿回包里的 has_thumbnail 决定要不要把手上那份
+	// 刚生成的缩略图也落进本地缓存；这里返回 false，它下次预览就会白下一次原图。
+	f.ThumbnailKey = key
+	f.HasThumbnail = true
 }
 
 // abortIntentObject 丢弃意图对应的 R2 半成品：multipart 走 abort，单片走 delete。
 // 两者都是尽力而为，失败只记日志 —— 留下的分片是可计费的 dust，但比中断收尾要好。
 func (s *Service) abortIntentObject(ctx context.Context, it *UploadIntent) {
+	// 缩略图先清，且无论本体走哪条分支 —— 它恒是一次单片直写，与 multipart 无关。
+	s.deleteThumbObject(ctx, it)
+
 	if it.R2UploadID != "" {
 		if err := s.storage.AbortMultipart(ctx, it.StorageKey, it.R2UploadID); err != nil {
 			slog.Warn("abort multipart 失败（留下分片 dust）",
@@ -416,6 +508,22 @@ func (s *Service) abortIntentObject(ctx context.Context, it *UploadIntent) {
 	if err := s.storage.Delete(ctx, it.StorageKey); err != nil {
 		slog.Debug("删除单片对象失败（可能根本没传上来）",
 			"intent", it.ID, "key", it.StorageKey, "err", err)
+	}
+}
+
+// deleteThumbObject 删掉意图声明过的缩略图对象。
+//
+// 单独成函数是因为它有两个触发点，其中一个不能走 abortIntentObject：本体大小不符
+// 那条分支发生在 CompleteMultipart 之后，此时再 abort 必然失败。而这个对象一旦
+// 没进 files.thumbnail_key，就彻底脱离了 file GC 的视野 —— 漏删不是 dust，是永久账单。
+func (s *Service) deleteThumbObject(ctx context.Context, it *UploadIntent) {
+	if len(it.ThumbCipherHash) == 0 {
+		return
+	}
+	key := ThumbnailKeyFor(it.StorageKey)
+	if err := s.storage.Delete(ctx, key); err != nil {
+		slog.Debug("删除缩略图对象失败（可能根本没传上来）",
+			"intent", it.ID, "key", key, "err", err)
 	}
 }
 
