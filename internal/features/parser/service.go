@@ -13,25 +13,33 @@ import (
 )
 
 type Service struct {
-	registry  *Registry
-	cache     *Cache
-	wallet    *wallet.Service
-	extapi    *extapi.Service // 第三方付费 API 供应层；nil 时全部走内置免费实现
-	parseCost int64           // 每次解析请求扣减的 credits（命中/未命中一致）；<=0 时不扣
+	registry *Registry
+	cache    *Cache
+	wallet   *wallet.Service
+	extapi   *extapi.Service // 第三方付费 API 供应层；nil 时全部走内置免费实现
+
+	// baseCost 是**内置免费 provider**（YouTube oEmbed / Gist / Reddit / GenericOG）
+	// 的解析单价。付费 endpoint 的价格不走这里，由 extapi.Quote 从上游单价 × 加价
+	// 倍率算出（pricing.CreditCost）。<=0 表示整体关闭解析计费（dev 用）。
+	baseCost int64
 }
 
-func NewService(registry *Registry, cache *Cache, walletSvc *wallet.Service, extapiSvc *extapi.Service, parseCost int64) *Service {
-	return &Service{registry: registry, cache: cache, wallet: walletSvc, extapi: extapiSvc, parseCost: parseCost}
+func NewService(registry *Registry, cache *Cache, walletSvc *wallet.Service, extapiSvc *extapi.Service, baseCost int64) *Service {
+	return &Service{registry: registry, cache: cache, wallet: walletSvc, extapi: extapiSvc, baseCost: baseCost}
 }
 
 // Manifest 透传 registry 的受支持解析清单，供 handler 的公开 /uris/manifest 端点导出。
 func (s *Service) Manifest() Manifest { return s.registry.Manifest() }
 
-// Parse 是 Service 主入口：先按 URI 选 provider → 扣费 → 命中缓存即返回 → 否则抓取 → 写缓存
+// Parse 是 Service 主入口：先按 URI 选 provider → 询价 → 扣费 → 命中缓存即返回 → 否则抓取 → 写缓存
 //
-// 计费策略（2026-07-05 起）：**每次解析请求都按 parseCost 扣 credits，命中/未命中一致**。
+// 计费策略（2026-07-05 起）：**每次解析请求都扣 credits，命中/未命中一致**。
 // 故扣费点前移到缓存查询之前——改为「按请求计价」，用户侧价格模型更简单、更可预期。
-// （原「命中免费」设计已废止，见 ADR-046 更新。）parseCost<=0 时整体不扣。
+// （原「命中免费」设计已废止，见 ADR-046 更新。）
+//
+// 价格从 2026-09-12 起由 quote 算出，不再是一个全局常量：走付费 endpoint 的
+// provider 按「上游单价 × 加价倍率」收（pricing.CreditCost），走内置免费实现的
+// 按 baseCost 收。baseCost<=0 时整体不扣。
 // 余额不足返 wallet.ErrInsufficientCredits（handler 映射到 402）。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*ParseResponse, error) {
 	p, resourceID, ok := s.registry.Find(uri)
@@ -40,13 +48,18 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*Par
 	}
 
 	// 先扣费再查缓存：命中也计费。放在 registry.Find 之后，保证只有「可解析」的请求才扣。
-	if s.parseCost > 0 {
+	cost := s.quote(ctx, p.Provider())
+	if cost > 0 {
 		reason := "parse_uri:" + p.Provider()
-		if _, err := s.wallet.Consume(ctx, userID, s.parseCost, reason); err != nil {
-			if errors.Is(err, wallet.ErrInsufficientCredits) {
-				return nil, wallet.ErrInsufficientCredits
+		if _, err := s.wallet.Consume(ctx, userID, cost, reason); err != nil {
+			// 原样往上抛，**不要**替换成裸的 wallet.ErrInsufficientCredits。
+			// Consume 返回的是带 Balance/Required 的 *InsufficientCreditsError，
+			// 换成哨兵会让 handler 的 errors.As 永远落空，402 里的「还差多少」恒为 0。
+			// 价格还是常量时这只是不好看，现在价格随 provider 变，客户端再也猜不出来。
+			// errors.Is 不受影响 —— 那个类型 Unwrap 到同一个哨兵。
+			if !errors.Is(err, wallet.ErrInsufficientCredits) {
+				slog.Warn("parse credits 扣费失败", "err", err)
 			}
-			slog.Warn("parse credits 扣费失败", "err", err)
 			return nil, err
 		}
 	}
@@ -55,10 +68,11 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*Par
 		slog.Warn("parse_cache 读取失败", "err", err)
 	} else if hit {
 		return &ParseResponse{
-			Provider:   p.Provider(),
-			ResourceID: resourceID,
-			Snippet:    cached,
-			Cached:     true,
+			Provider:       p.Provider(),
+			ResourceID:     resourceID,
+			Snippet:        cached,
+			Cached:         true,
+			CreditsCharged: cost,
 		}, nil
 	}
 
@@ -90,11 +104,40 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, uri string) (*Par
 	}
 
 	return &ParseResponse{
-		Provider:   p.Provider(),
-		ResourceID: resourceID,
-		Snippet:    snip,
-		Cached:     false,
+		Provider:       p.Provider(),
+		ResourceID:     resourceID,
+		Snippet:        snip,
+		Cached:         false,
+		CreditsCharged: cost,
 	}, nil
+}
+
+// quote 算出这次解析要扣多少 credits。
+//
+// 三条路径都落在「与 fetch 实际会走哪条一致」这一个要求上：
+//   - 有可用的付费 endpoint → 按 extapi 的报价收（已含上游成本 × 加价倍率）；
+//   - ErrNoEndpoint → fetch 也会回退到内置免费实现，按 baseCost 收；
+//   - 询价出错（多半是数据库） → fetch 里的 ListForProvider 同样会失败，
+//     它会 fall through 到内置实现，所以 baseCost 仍然是对的那一边。
+//
+// 换句话说：询价失败不阻断解析，也不会静默免单。
+func (s *Service) quote(ctx context.Context, provider string) int64 {
+	if s.baseCost <= 0 {
+		return 0 // 计费整体关闭
+	}
+	if s.extapi == nil {
+		return s.baseCost
+	}
+	cost, err := s.extapi.Quote(ctx, provider)
+	switch {
+	case err == nil:
+		return cost
+	case errors.Is(err, extapi.ErrNoEndpoint):
+		// 正常路径：这个 provider 还没接付费供应商。
+	default:
+		slog.Warn("extapi 询价失败，按内置实现计价", "provider", provider, "err", err)
+	}
+	return s.baseCost
 }
 
 // fetch 先走已配置的付费 endpoint 兜底链；若该 provider 没有可用 endpoint（ErrNoEndpoint）

@@ -14,17 +14,24 @@ var ErrNoEndpoint = errors.New("no external api endpoint available for provider"
 
 // Endpoint 是一个外部第三方解析 API 的接入点。同一 provider 下多个 endpoint 按 priority 构成兜底链。
 type Endpoint struct {
-	ID              uuid.UUID       `json:"id"`
-	Provider        string          `json:"provider"`
-	Vendor          string          `json:"vendor"`
-	Slug            string          `json:"slug"`
-	Priority        int             `json:"priority"`
-	Enabled         bool            `json:"enabled"`
-	UnitPriceMicros int64           `json:"unit_price_micros"`
-	Currency        string          `json:"currency"`
-	Config          json.RawMessage `json:"config"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	ID              uuid.UUID `json:"id"`
+	Provider        string    `json:"provider"`
+	Vendor          string    `json:"vendor"`
+	Slug            string    `json:"slug"`
+	Priority        int       `json:"priority"`
+	Enabled         bool      `json:"enabled"`
+	UnitPriceMicros int64     `json:"unit_price_micros"`
+
+	// MarginBP 是这个 endpoint 的加价倍率（万分比整数，20000 = 2.0 倍）。
+	// 它与 UnitPriceMicros 一起决定用户侧售价，见 pricing.CreditCost。
+	// migration 000015 加了这一列，但在 2026-09-12 之前**从没被读出来过** ——
+	// 售价一直是个与上游成本无关的全局常量，正是那条迁移注释预言的亏损形态。
+	MarginBP int32 `json:"margin_bp"`
+
+	Currency  string          `json:"currency"`
+	Config    json.RawMessage `json:"config"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
 
 	// 以下为聚合字段，仅列表/详情查询填充（Fetch 路径只用到 BalanceMicros）
 	BalanceMicros int64 `json:"balance_micros"`
@@ -75,14 +82,17 @@ type FetchResult struct {
 // ---- 管理后台入参 ----
 
 type CreateEndpointInput struct {
-	Provider        string          `json:"provider" binding:"required"`
-	Vendor          string          `json:"vendor" binding:"required"`
-	Slug            string          `json:"slug" binding:"required"`
-	Priority        int             `json:"priority"`
-	Enabled         *bool           `json:"enabled"`
-	UnitPriceMicros int64           `json:"unit_price_micros"`
-	Currency        string          `json:"currency"`
-	Config          json.RawMessage `json:"config"`
+	Provider        string `json:"provider" binding:"required"`
+	Vendor          string `json:"vendor" binding:"required"`
+	Slug            string `json:"slug" binding:"required"`
+	Priority        int    `json:"priority"`
+	Enabled         *bool  `json:"enabled"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+	// MarginBP 省略时走库里的 DEFAULT 20000（2.0 倍）。用指针而不是 0 值判定：
+	// 0 是非法值（CHECK margin_bp > 0），把它当「未填」会让一次真正的误填静默变成默认值。
+	MarginBP *int32          `json:"margin_bp"`
+	Currency string          `json:"currency"`
+	Config   json.RawMessage `json:"config"`
 }
 
 type UpdateEndpointInput struct {
@@ -90,6 +100,7 @@ type UpdateEndpointInput struct {
 	Priority        *int             `json:"priority"`
 	Enabled         *bool            `json:"enabled"`
 	UnitPriceMicros *int64           `json:"unit_price_micros"`
+	MarginBP        *int32           `json:"margin_bp"`
 	Currency        *string          `json:"currency"`
 	Config          *json.RawMessage `json:"config"`
 }

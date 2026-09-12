@@ -115,6 +115,13 @@ type ParseResponse struct {
 	ResourceID string         `json:"resource_id"`
 	Snippet    *ParsedSnippet `json:"snippet"`
 	Cached     bool           `json:"cached"`
+
+	// CreditsCharged 是本次实际扣掉的代币数。
+	//
+	// 必须回传，因为价格自 2026-09-12 起随 provider 接的上游而变，客户端无从预知：
+	// 没有这个字段，钱包余额会在用户眼里「自己少了一点」，而唯一的解释路径是
+	// 去翻流水。0 表示未计费（计费关闭，或走的是余额不足以外的免单路径）。
+	CreditsCharged int64 `json:"credits_charged"`
 }
 
 type ParseInput struct {

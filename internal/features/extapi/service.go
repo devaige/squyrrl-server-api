@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/squyrrl/api/internal/features/pricing"
 )
 
 type Service struct {
@@ -24,7 +26,7 @@ func NewService(repo *Repo) *Service {
 
 // Fetch 按 provider 的兜底链依次尝试 endpoint：
 //
-//	跳过：config 缺 url_template（尚未接好）/ 有单价但余额 <= 0
+//	跳过：见 usable —— 与 Quote 共用同一个判据
 //	失败：网络错 / 非 2xx / 响应非 JSON —— 记录并尝试下一个
 //	成功：记一笔平台成本（= 单价）+ 可选采样存档，立即返回
 //
@@ -39,17 +41,13 @@ func (s *Service) Fetch(ctx context.Context, provider, uri, resourceID string) (
 	var lastErr error
 	tried := 0
 	for _, ep := range eps {
-		var cfg EndpointConfig
-		if err := json.Unmarshal(ep.Config, &cfg); err != nil {
-			slog.Warn("extapi endpoint config 解析失败，跳过", "slug", ep.Slug, "err", err)
-			continue
-		}
-		if cfg.URLTemplate == "" {
-			continue // 驱动尚未配置，跳过
-		}
-		if ep.UnitPriceMicros > 0 && ep.BalanceMicros <= 0 {
-			slog.Warn("extapi endpoint 余额不足，跳过", "slug", ep.Slug)
-			lastErr = fmt.Errorf("endpoint %s 余额不足", ep.Slug)
+		cfg, _, skip := usable(ep)
+		if skip != skipNone {
+			// 未配驱动是常态（种子行就是这样落库的），不值得每次解析都刷一条日志；
+			// 其余三种都是「配好了却用不了」，要看得见。
+			if skip != skipNoDriver {
+				slog.Warn("extapi endpoint 跳过", "slug", ep.Slug, "reason", string(skip))
+			}
 			continue
 		}
 
@@ -82,6 +80,90 @@ func (s *Service) Fetch(ctx context.Context, provider, uri, resourceID string) (
 		return nil, ErrNoEndpoint
 	}
 	return nil, fmt.Errorf("provider %s 所有 endpoint 均失败: %w", provider, lastErr)
+}
+
+// skipReason 说明一个 endpoint 为什么不参与本次兜底链。
+type skipReason string
+
+const (
+	skipNone      skipReason = ""
+	skipBadConfig skipReason = "config 解析失败"
+	skipNoDriver  skipReason = "未配置 url_template"
+	skipNoBalance skipReason = "余额不足"
+	skipNoPricing skipReason = "加价倍率非法，无法定价"
+)
+
+// usable 判定一个 endpoint 此刻能不能被调用，并顺带算出它对应的用户侧售价。
+//
+// Fetch 与 Quote 共用这一个判据，而且判据里**包含「能不能定价」** ——
+// 不变式是：一个 endpoint 可调用 ⟺ 它可报价。
+//
+// 把定价塞进可用性判断看着别扭，但两者分开写的失败模式都是静默的：
+// 报了价却没有 endpoint 可调，用户白花一次钱；调得到却报不出价，
+// 一次真实的上游支出对应零收费。后者正是 migration 000015 写下、
+// 而代码直到今天才真正堵上的那个洞，所以它不该再有第二次分叉的机会。
+//
+// margin_bp 库里有 CHECK 兜着，但那拦不住直接改表或者迁移之前的历史行；
+// 拿不出价格时宁可整条链退回内置免费实现，也不要调一个收不上钱的上游。
+func usable(ep Endpoint) (EndpointConfig, int64, skipReason) {
+	var cfg EndpointConfig
+	if err := json.Unmarshal(ep.Config, &cfg); err != nil {
+		return cfg, 0, skipBadConfig
+	}
+	if cfg.URLTemplate == "" {
+		return cfg, 0, skipNoDriver
+	}
+	if ep.UnitPriceMicros > 0 && ep.BalanceMicros <= 0 {
+		return cfg, 0, skipNoBalance
+	}
+	cost, err := pricing.CreditCost(ep.UnitPriceMicros, ep.MarginBP)
+	if err != nil {
+		return cfg, 0, skipNoPricing
+	}
+	return cfg, cost, skipNone
+}
+
+// Quote 报出解析一次该 provider 应向用户收取的 credits。
+//
+// 取候选链上的**最高价**，而不是「会被第一个试到的那个」。两个理由：
+//
+//  1. 兜底链的实际落点由运行时失败决定，报价时无从预知。按第一个报价却回退到
+//     更贵的那个，就是一次真实上游支出对应一笔偏低的收费 —— 亏损随用量线性
+//     放大，且两本账（api_cost_ledger 与 credits_ledger）从不对账，看不出来。
+//  2. 计费发生在查缓存之前（ADR-046 的 2026-07-05 反转），价格因此必须是
+//     provider 的函数而不是某一次调用的函数；否则同一个链接两次解析可能不同价，
+//     而「按请求计价、可预期」正是那次反转要换来的东西。
+//
+// 代价是链路降级到便宜 endpoint 时会多收 —— 与 pricing.CreditCost 的向上取整
+// 同一个取向：宁可多收一个代币，也不要在每次调用上少收。
+//
+// 返回 ErrNoEndpoint 表示没有可用的付费 endpoint，调用方据此按内置免费实现计价。
+func (s *Service) Quote(ctx context.Context, provider string) (int64, error) {
+	eps, err := s.repo.ListForProvider(ctx, provider)
+	if err != nil {
+		return 0, err
+	}
+	return quoteOf(eps)
+}
+
+// quoteOf 是 Quote 的纯函数内核，抽出来是为了能不带数据库地覆盖定价边界。
+func quoteOf(eps []Endpoint) (int64, error) {
+	var top int64
+	found := false
+	for _, ep := range eps {
+		_, cost, skip := usable(ep)
+		if skip != skipNone {
+			continue
+		}
+		if cost > top {
+			top = cost
+		}
+		found = true
+	}
+	if !found {
+		return 0, ErrNoEndpoint
+	}
+	return top, nil
 }
 
 func (s *Service) archiveLive(ctx context.Context, endpointID uuid.UUID, resourceID string, tr *callTrace) {

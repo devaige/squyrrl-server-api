@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/squyrrl/api/internal/features/pricing"
 )
 
 type Repo struct {
@@ -19,7 +21,7 @@ func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 func (r *Repo) ListForProvider(ctx context.Context, provider string) ([]Endpoint, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT e.id, e.provider, e.vendor, e.slug, e.priority, e.enabled,
-		       e.unit_price_micros, e.currency, e.config,
+		       e.unit_price_micros, e.margin_bp, e.currency, e.config,
 		       COALESCE((SELECT SUM(delta) FROM api_cost_ledger l WHERE l.endpoint_id = e.id), 0)
 		FROM api_endpoints e
 		WHERE e.provider = $1 AND e.enabled
@@ -34,7 +36,7 @@ func (r *Repo) ListForProvider(ctx context.Context, provider string) ([]Endpoint
 		var e Endpoint
 		var cfg []byte
 		if err := rows.Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
-			&e.UnitPriceMicros, &e.Currency, &cfg, &e.BalanceMicros); err != nil {
+			&e.UnitPriceMicros, &e.MarginBP, &e.Currency, &cfg, &e.BalanceMicros); err != nil {
 			return nil, err
 		}
 		e.Config = json.RawMessage(cfg)
@@ -47,7 +49,7 @@ func (r *Repo) ListForProvider(ctx context.Context, provider string) ([]Endpoint
 func (r *Repo) List(ctx context.Context) ([]Endpoint, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT e.id, e.provider, e.vendor, e.slug, e.priority, e.enabled,
-		       e.unit_price_micros, e.currency, e.config, e.created_at, e.updated_at,
+		       e.unit_price_micros, e.margin_bp, e.currency, e.config, e.created_at, e.updated_at,
 		       COALESCE(SUM(l.delta), 0),
 		       COALESCE(-SUM(l.delta) FILTER (WHERE l.delta < 0), 0),
 		       COUNT(l.*) FILTER (WHERE l.reason = 'call')
@@ -65,7 +67,7 @@ func (r *Repo) List(ctx context.Context) ([]Endpoint, error) {
 		var e Endpoint
 		var cfg []byte
 		if err := rows.Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
-			&e.UnitPriceMicros, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt,
+			&e.UnitPriceMicros, &e.MarginBP, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt,
 			&e.BalanceMicros, &e.SpentMicros, &e.CallCount); err != nil {
 			return nil, err
 		}
@@ -88,6 +90,12 @@ func (r *Repo) Create(ctx context.Context, in CreateEndpointInput) (*Endpoint, e
 	if currency == "" {
 		currency = "USD"
 	}
+	// 与 priority / currency 同处解析缺省值，而不是靠库里的 DEFAULT：
+	// 落值的那一刻就写进返回给管理后台的对象，省掉一次「建完再查一遍才知道加价多少」。
+	marginBP := int32(pricing.DefaultMarginBP)
+	if in.MarginBP != nil {
+		marginBP = *in.MarginBP
+	}
 	cfg := in.Config
 	if len(cfg) == 0 {
 		cfg = json.RawMessage(`{}`)
@@ -96,13 +104,14 @@ func (r *Repo) Create(ctx context.Context, in CreateEndpointInput) (*Endpoint, e
 	e := &Endpoint{
 		Provider: in.Provider, Vendor: in.Vendor, Slug: in.Slug,
 		Priority: priority, Enabled: enabled,
-		UnitPriceMicros: in.UnitPriceMicros, Currency: currency, Config: cfg,
+		UnitPriceMicros: in.UnitPriceMicros, MarginBP: marginBP,
+		Currency: currency, Config: cfg,
 	}
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO api_endpoints (provider, vendor, slug, priority, enabled, unit_price_micros, currency, config)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO api_endpoints (provider, vendor, slug, priority, enabled, unit_price_micros, margin_bp, currency, config)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at`,
-		in.Provider, in.Vendor, in.Slug, priority, enabled, in.UnitPriceMicros, currency, []byte(cfg),
+		in.Provider, in.Vendor, in.Slug, priority, enabled, in.UnitPriceMicros, marginBP, currency, []byte(cfg),
 	).Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -122,10 +131,11 @@ func (r *Repo) Update(ctx context.Context, id uuid.UUID, in UpdateEndpointInput)
 			priority          = COALESCE($3, priority),
 			enabled           = COALESCE($4, enabled),
 			unit_price_micros = COALESCE($5, unit_price_micros),
-			currency          = COALESCE($6, currency),
-			config            = COALESCE($7, config)
+			margin_bp         = COALESCE($6, margin_bp),
+			currency          = COALESCE($7, currency),
+			config            = COALESCE($8, config)
 		WHERE id = $1`,
-		id, in.Priority, in.Enabled, in.UnitPriceMicros, in.Currency, cfg,
+		id, in.Vendor, in.Priority, in.Enabled, in.UnitPriceMicros, in.MarginBP, in.Currency, cfg,
 	)
 	return err
 }
@@ -134,10 +144,10 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (*Endpoint, error) {
 	var e Endpoint
 	var cfg []byte
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, provider, vendor, slug, priority, enabled, unit_price_micros, currency, config, created_at, updated_at
+		SELECT id, provider, vendor, slug, priority, enabled, unit_price_micros, margin_bp, currency, config, created_at, updated_at
 		FROM api_endpoints WHERE id = $1`, id).
 		Scan(&e.ID, &e.Provider, &e.Vendor, &e.Slug, &e.Priority, &e.Enabled,
-			&e.UnitPriceMicros, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt)
+			&e.UnitPriceMicros, &e.MarginBP, &e.Currency, &cfg, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

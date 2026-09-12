@@ -2160,7 +2160,7 @@ components:
 
     ParseResponse:
       type: object
-      required: [provider, resource_id, snippet, cached]
+      required: [provider, resource_id, snippet, cached, credits_charged]
       properties:
         provider:
           type: string
@@ -2171,6 +2171,14 @@ components:
         cached:
           type: boolean
           description: true 表示命中跨用户解析缓存，未触发上游调用
+        credits_charged:
+          type: integer
+          format: int64
+          description: >-
+            本次实际扣减的代币数。价格按 provider 接入的上游供应商单价 × 加价倍率算出，
+            未接付费供应商的 provider 走内置实现的固定价，因此**同一账户不同链接可能不同价**。
+            缓存命中同样计费（按请求计价，见 ADR-046）。0 表示未计费。
+          examples: [10]
 
     # ---------- Passkey ----------
     PasskeyRegisterBeginResponse:
