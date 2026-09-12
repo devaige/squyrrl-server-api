@@ -108,12 +108,13 @@ func ParseGoogleRTDN(payload []byte) (*SubscriptionEvent, error) {
 		return nil, ErrUnknownUser
 	}
 
-	// subscriptionId 命名约定：'squyrrl_<tier>_<period>'
-	parts := strings.Split(rtdn.SubscriptionNotification.SubscriptionID, "_")
-	if len(parts) < 3 {
-		return nil, ErrUnknownTier
+	// subscriptionId 命名约定见 ParseProductID：'squyrrl_<kind>_<tier>_<period>'，
+	// 三段式（无 kind）向后兼容为 plan。
+	kind, tier, period, storageGB, err := ParseProductID(
+		rtdn.SubscriptionNotification.SubscriptionID, "_")
+	if err != nil {
+		return nil, err
 	}
-	tier, period := parts[1], parts[2]
 
 	status, ok := googleStatus[rtdn.SubscriptionNotification.NotificationType]
 	if !ok {
@@ -134,8 +135,9 @@ func ParseGoogleRTDN(payload []byte) (*SubscriptionEvent, error) {
 		Provider:               ProviderGoogle,
 		ProviderSubscriptionID: rtdn.SubscriptionNotification.PurchaseToken,
 		UserID:                 uid,
-		Kind:                   "plan",
+		Kind:                   kind,
 		Tier:                   tier,
+		BonusStorageGB:         storageGB,
 		BillingPeriod:          period,
 		Status:                 status,
 		PeriodStart:            now,

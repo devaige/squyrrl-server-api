@@ -38,14 +38,61 @@ type OTPGuard struct {
 	MaxAttempts int           // <=0 关闭；单个邮箱在一个码周期内允许猜错的次数
 }
 
-type Service struct {
-	repo   *Repo
-	mailer *Mailer
-	guard  OTPGuard
+// DeviceLimiter 提供用户当前档位允许的设备数。由 quota.Service 实现。
+//
+// 窄接口而非直接依赖，理由与其它几处相同；但这里还多一层：登录路径上任何
+// 额外依赖都要能被关掉。传 nil 即完全不做逐出 —— 一个新引入的门槛不该有能力
+// 把人挡在登录之外。
+type DeviceLimiter interface {
+	DeviceLimit(ctx context.Context, userID uuid.UUID) (int, error)
 }
 
-func NewService(repo *Repo, mailer *Mailer, guard OTPGuard) *Service {
-	return &Service{repo: repo, mailer: mailer, guard: guard}
+type Service struct {
+	repo    *Repo
+	mailer  *Mailer
+	guard   OTPGuard
+	devices DeviceLimiter
+}
+
+func NewService(repo *Repo, mailer *Mailer, guard OTPGuard, devices DeviceLimiter) *Service {
+	return &Service{repo: repo, mailer: mailer, guard: guard, devices: devices}
+}
+
+// registerDevice 注册/复用设备，并在超出档位上限时逐出最久未活跃的那几台。
+//
+// **逐出而不是拒绝新登录**（既有设计，见 docs/context.md）：把人挡在门外是
+// 最糟的一种配额表达 —— 用户此刻手里就拿着这台设备，而「去别的设备上解绑」
+// 往往正是他做不到的事（换了手机、旧机丢了）。
+//
+// **失败不阻断登录**：逐出是成本控制，登录是用户此刻要做的事。
+// 让前者的故障拦住后者，是拿一个可以下次再纠正的问题去换一个不可挽回的体验。
+func (s *Service) registerDevice(
+	ctx context.Context, userID uuid.UUID, name, platform string,
+) (*Device, error) {
+	device, created, err := s.repo.UpsertDevice(ctx, userID, name, platform)
+	if err != nil {
+		return nil, err
+	}
+	if !created || s.devices == nil {
+		return device, nil
+	}
+
+	limit, err := s.devices.DeviceLimit(ctx, userID)
+	if err != nil {
+		slog.Warn("读取设备数上限失败，跳过逐出", "user_id", userID, "err", err)
+		return device, nil
+	}
+	// limit <= 0 是「该档位不适用设备概念」（免费档纯本地），不是「一台都不许有」。
+	// 按后者理解会把刚建好的这台一起撤销，用户当场被登出。
+	if limit <= 0 {
+		return device, nil
+	}
+	if n, err := s.repo.EvictDevicesBeyond(ctx, userID, limit); err != nil {
+		slog.Warn("逐出超额设备失败", "user_id", userID, "err", err)
+	} else if n > 0 {
+		slog.Info("已逐出超额设备", "user_id", userID, "evicted", n, "limit", limit)
+	}
+	return device, nil
 }
 
 // RequestEmailOTP 生成 OTP 落库并发邮件
@@ -114,7 +161,7 @@ func (s *Service) VerifyEmailOTP(ctx context.Context, email, code, deviceName, p
 	if err != nil {
 		return nil, err
 	}
-	device, err := s.repo.UpsertDevice(ctx, user.ID, deviceName, platform)
+	device, err := s.registerDevice(ctx, user.ID, deviceName, platform)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +198,7 @@ func (s *Service) penalizeFailedOTP(ctx context.Context, email, purpose string) 
 // IssueSessionForUser 给已认证用户签发一对新 token + 注册/复用设备
 // 同时被邮箱 OTP 与 Passkey 登录流程使用
 func (s *Service) IssueSessionForUser(ctx context.Context, user *User, deviceName, platform string) (*LoginResult, error) {
-	device, err := s.repo.UpsertDevice(ctx, user.ID, deviceName, platform)
+	device, err := s.registerDevice(ctx, user.ID, deviceName, platform)
 	if err != nil {
 		return nil, err
 	}

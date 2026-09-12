@@ -3,20 +3,46 @@ package subscriptions
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	"github.com/squyrrl/api/internal/features/entitlement"
+	"github.com/squyrrl/api/internal/features/wallet"
 )
+
+// CreditGranter 落一笔 credits 流水。由 wallet.Service 实现。
+type CreditGranter interface {
+	Grant(ctx context.Context, userID uuid.UUID, delta int64, reason, idemKey string) (*wallet.GrantResponse, error)
+}
 
 // Service 处理统一的订阅事件：验签与归一化在 handler / parser 侧完成，
 // 这里只负责落库与档位切换。
 //
-// ADR-075 之后它**不再触碰钱包** —— 基础订阅不赠送 credits，
-// credits 与存储是各自独立购买的商品。这个包因此没有任何跨 feature 依赖。
+// ADR-075 拆商品时这个包与钱包**完全解耦**过一阵：基础订阅不再赠送 credits。
+// 现在钱包又回来了，但原因完全不同 —— 代币本身成了一件可购买的商品，
+// 它的支付回调恰好走同一个 webhook 入口。区别要记牢：
+// 那时是「订阅事件顺带发币」（而 customer.subscription.updated 在换卡、
+// 改 metadata 时同样触发，于是每次都重发一整月额度）；
+// 现在是「一次真实结账发一次币」，且带幂等键。
 type Service struct {
-	repo *Repo
+	repo   *Repo
+	grants CreditGranter
 }
 
-func NewService(repo *Repo) *Service {
-	return &Service{repo: repo}
+func NewService(repo *Repo, grants CreditGranter) *Service {
+	return &Service{repo: repo, grants: grants}
+}
+
+// ApplyPurchase 把一次性支付落成 credits 流水。
+//
+// 幂等键带 provider 前缀，见 OneTimePurchase.IdempotencyKey —— 支付网关重投
+// 是常态，同一笔支付到达两次必须只发一次币。
+func (s *Service) ApplyPurchase(ctx context.Context, p *OneTimePurchase) error {
+	if s.grants == nil {
+		return ErrUnknownEvent
+	}
+	_, err := s.grants.Grant(ctx, p.UserID, p.Credits,
+		"purchase:"+string(p.Provider), p.IdempotencyKey())
+	return err
 }
 
 func (s *Service) Apply(ctx context.Context, e *SubscriptionEvent) error {

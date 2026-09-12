@@ -226,8 +226,10 @@ func (r *Repo) GetUser(ctx context.Context, id uuid.UUID) (*User, error) {
 // devices
 // =============================================================================
 
-// UpsertDevice 同名同平台的未撤销设备复用记录；否则新建
-func (r *Repo) UpsertDevice(ctx context.Context, userID uuid.UUID, name, platform string) (*Device, error) {
+// UpsertDevice 同名同平台的未撤销设备复用记录；否则新建。
+// 第二个返回值标明是否**新建**了一台 —— 只有新建才可能让用户越过档位上限，
+// 复用一台老设备不改变设备总数，没必要每次登录都去跑一遍逐出。
+func (r *Repo) UpsertDevice(ctx context.Context, userID uuid.UUID, name, platform string) (*Device, bool, error) {
 	var d Device
 	err := r.pool.QueryRow(ctx, `
 		UPDATE devices
@@ -236,18 +238,45 @@ func (r *Repo) UpsertDevice(ctx context.Context, userID uuid.UUID, name, platfor
 		RETURNING id, user_id, name, platform, last_seen_at`,
 		userID, name, platform,
 	).Scan(&d.ID, &d.UserID, &d.Name, &d.Platform, &d.LastSeenAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = r.pool.QueryRow(ctx, `
-			INSERT INTO devices (user_id, name, platform)
-			VALUES ($1, $2, $3)
-			RETURNING id, user_id, name, platform, last_seen_at`,
-			userID, name, platform,
-		).Scan(&d.ID, &d.UserID, &d.Name, &d.Platform, &d.LastSeenAt)
+	if err == nil {
+		return &d, false, nil
 	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+	if err := r.pool.QueryRow(ctx, `
+		INSERT INTO devices (user_id, name, platform)
+		VALUES ($1, $2, $3)
+		RETURNING id, user_id, name, platform, last_seen_at`,
+		userID, name, platform,
+	).Scan(&d.ID, &d.UserID, &d.Name, &d.Platform, &d.LastSeenAt); err != nil {
+		return nil, false, err
+	}
+	return &d, true, nil
+}
+
+// EvictDevicesBeyond 保留最近活跃的 keep 台设备，其余撤销，返回被撤销的数量。
+//
+// 按 last_seen_at 逐出最久未活跃的那台，而不是最早注册的：用户想保住的是他
+// 正在用的设备，注册时间早晚与此无关 —— 一台三年前注册、每天都在用的电脑
+// 不该被今天新登录的手机挤掉。
+//
+// 排除三方绑定占位（platform_bindings 指向的那些）：它们由每平台绑定数管着，
+// 两条门槛计同一样东西会让绑一个 TG 号白白吃掉一个登录名额。
+func (r *Repo) EvictDevicesBeyond(ctx context.Context, userID uuid.UUID, keep int) (int, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE devices SET revoked_at = now()
+		WHERE id IN (
+			SELECT d.id FROM devices d
+			WHERE d.user_id = $1 AND d.revoked_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM platform_bindings pb WHERE pb.device_id = d.id)
+			ORDER BY d.last_seen_at DESC
+			OFFSET $2
+		)`, userID, keep)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	return &d, nil
+	return int(tag.RowsAffected()), nil
 }
 
 // =============================================================================
@@ -284,12 +313,21 @@ func (r *Repo) FindSessionByRefreshHash(ctx context.Context, hash []byte) (*Sess
 func (r *Repo) findSession(ctx context.Context, hashCol, expCol string, hash []byte) (*Session, error) {
 	var s Session
 	// 安全：hashCol/expCol 是包内常量字符串，永不来自外部输入
+	// 连 devices 一起判：设备被撤销即视为会话失效。
+	//
+	// 这样「设备被踢」只需要写一处状态（devices.revoked_at），而不必同时去
+	// 撤销它名下的会话 —— 两份状态总有一天会不同步，而不同步的表现是一台
+	// 已经被踢掉的设备仍然能正常读写。代价是每次鉴权多一次主键查找。
+	//
+	// 逐出本身是**惰性生效**的（用户决策 2026-09-11）：不推送、不断连，
+	// 被踢的那台在下一次请求时拿到 401，客户端既有的 onUnauthorized 会清掉登录态。
 	q := `
-		SELECT id, user_id, device_id, access_expires_at, refresh_expires_at
-		FROM sessions
-		WHERE ` + hashCol + ` = $1
-		  AND revoked_at IS NULL
-		  AND ` + expCol + ` > now()`
+		SELECT s.id, s.user_id, s.device_id, s.access_expires_at, s.refresh_expires_at
+		FROM sessions s
+		JOIN devices d ON d.id = s.device_id AND d.revoked_at IS NULL
+		WHERE s.` + hashCol + ` = $1
+		  AND s.revoked_at IS NULL
+		  AND s.` + expCol + ` > now()`
 	err := r.pool.QueryRow(ctx, q, hash).Scan(
 		&s.ID, &s.UserID, &s.DeviceID, &s.AccessExpiresAt, &s.RefreshExpiresAt,
 	)

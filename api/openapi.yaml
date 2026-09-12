@@ -1244,6 +1244,64 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
 
   # ---------------------------------------------------------------- Wallet
+  /me/checkout:
+    post:
+      operationId: createCheckout
+      tags: [Billing]
+      summary: 发起一次购买，返回 Stripe 结账页 URL
+      description: |
+        只接受 SKU（kind / tier / period），**金额与数量一概由服务端从自己的价目表推导**。
+        让客户端提交价格或容量，等于让它自己决定买多少 —— webhook 完全信任
+        Checkout Session 的 metadata，那是唯一能说明「买了什么」的地方。
+
+        `period` 对代币加购固定为 `once`（一次性买断，非订阅）。
+
+        **仅限网页 / 桌面端调用。** iOS 与 Android 上销售数字商品必须走各自的
+        应用内购买，客户端应在那两个平台隐藏入口（见 `/webhooks/apple`、`/webhooks/google`）。
+      responses:
+        '200':
+          description: 已创建结账会话
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                    description: Stripe 托管结账页，客户端在外部浏览器打开
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502':
+          description: 调用 Stripe 失败（原文截断后回传，便于排查）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            未配置收款。密钥与价目表**两项缺一即整体不可用**（fail-closed）——
+            只有其中一项时若判为可用，用户会走到一个「商品不存在」的死胡同。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, tier, period]
+              properties:
+                kind: { type: string, enum: [plan, storage, credits] }
+                tier:
+                  type: string
+                  description: |
+                    档位键：基础订阅为 `basic`…`maximum`；存储为 `s20`/`s50`/…（容量即键）；
+                    代币为 `p1`/`p5`/`p20`（面值即键）。**服务端按自己的目录核对**，
+                    价目表里多一个未上架的键不构成一条能买到未定义商品的通路。
+                period: { type: string, enum: [monthly, yearly, once] }
+
   /me/export:
     get:
       operationId: exportMyData
@@ -1547,7 +1605,13 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Unauthorized:
-      description: 未认证 / token 无效
+      description: |
+        未认证 / token 无效。
+
+        **还有第二种来源：设备已被逐出。** 超出档位设备数时，服务端会撤销最久
+        未活跃的那台（ADR-075），但**不推送、不断连** —— 被逐出的那台在下一次
+        请求时才拿到 401（用户决策 2026-09-11）。客户端对 401 的既有处理
+        （清登录态并回到登录页）正是这里期望的行为，无需区分两种来源。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -26,22 +27,23 @@ import (
 )
 
 type Server struct {
-	cfg        *config.Config
-	pool       *pgxpool.Pool
-	engine     *gin.Engine
-	authSvc    *auth.Service
-	pageSvc    *page.Service
-	tagRepo    *tag.Repo
-	snipSvc    *snippet.Service
-	fileSvc    *file.Service
-	parsSvc    *parser.Service
-	tgSvc      *tg.Service
-	passkeySvc *auth.PasskeyService
-	walletSvc  *wallet.Service
-	subSvc     *subscriptions.Service
-	claimSvc   *claim.Service
-	extapiSvc  *extapi.Service
-	quotaSvc   *quota.Service
+	cfg         *config.Config
+	pool        *pgxpool.Pool
+	engine      *gin.Engine
+	authSvc     *auth.Service
+	pageSvc     *page.Service
+	tagRepo     *tag.Repo
+	checkoutSvc *subscriptions.Checkout
+	snipSvc     *snippet.Service
+	fileSvc     *file.Service
+	parsSvc     *parser.Service
+	tgSvc       *tg.Service
+	passkeySvc  *auth.PasskeyService
+	walletSvc   *wallet.Service
+	subSvc      *subscriptions.Service
+	claimSvc    *claim.Service
+	extapiSvc   *extapi.Service
+	quotaSvc    *quota.Service
 }
 
 func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
@@ -64,6 +66,12 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		panic("webauthn 配置无效：" + err.Error())
 	}
 
+	// wallet 与 quota 要先于所有业务 service 构造：门槛检查需要读用户档位，
+	// 而档位来自 wallet（subscriptions 表）。auth 也在其列 —— 登录时要按档位
+	// 逐出超额设备，所以它同样排在这两者之后。
+	walletSvc := wallet.NewService(wallet.NewRepo(pool))
+	quotaSvc := quota.NewService(pool, walletSvc)
+
 	authSvc := auth.NewService(
 		auth.NewRepo(pool),
 		auth.NewMailer(cfg.ResendAPIKey, cfg.MailFrom),
@@ -72,11 +80,8 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 			DailyBudget: cfg.OTPDailyBudget,
 			MaxAttempts: cfg.OTPMaxAttempts,
 		},
+		quotaSvc,
 	)
-	// wallet 与 quota 要先于业务 service 构造：门槛检查需要读用户档位，
-	// 而档位来自 wallet（subscriptions 表）。
-	walletSvc := wallet.NewService(wallet.NewRepo(pool))
-	quotaSvc := quota.NewService(pool, walletSvc)
 
 	pageSvc := page.NewService(page.NewRepo(pool), quotaSvc)
 	tagRepo := tag.NewRepo(pool)
@@ -94,19 +99,28 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, quotaSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
-	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool))
+	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc)
+
+	// 价目表解析失败只让购买入口不可用，不让进程起不来：
+	// 一个填错的环境变量不该把收款问题放大成一次全站故障。
+	priceBook, err := subscriptions.NewPriceBook(cfg.StripePrices)
+	if err != nil {
+		slog.Error("Stripe 价目表解析失败，购买入口将不可用", "err", err)
+	}
+	checkoutSvc := subscriptions.NewCheckout(cfg.StripeSecretKey, priceBook, cfg.CheckoutReturnBase)
 	claimSvc := claim.NewService(pool, quotaSvc)
 
 	s := &Server{
 		cfg: cfg, pool: pool, engine: engine,
 		authSvc: authSvc, pageSvc: pageSvc, tagRepo: tagRepo,
 		snipSvc: snipSvc, fileSvc: fileSvc, parsSvc: parsSvc, tgSvc: tgSvc,
-		passkeySvc: passkeySvc,
-		walletSvc:  walletSvc,
-		subSvc:     subSvc,
-		claimSvc:   claimSvc,
-		extapiSvc:  extapiSvc,
-		quotaSvc:   quotaSvc,
+		checkoutSvc: checkoutSvc,
+		passkeySvc:  passkeySvc,
+		walletSvc:   walletSvc,
+		subSvc:      subSvc,
+		claimSvc:    claimSvc,
+		extapiSvc:   extapiSvc,
+		quotaSvc:    quotaSvc,
 	}
 	s.routes()
 	return s
@@ -200,13 +214,17 @@ func (s *Server) routes() {
 	walletHandler.RegisterInternal(adminInternal)
 	extapi.NewHandler(s.extapiSvc).RegisterInternal(adminInternal)
 
-	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）
-	subscriptions.NewHandler(
+	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）。
+	// 购买入口则相反 —— 它要知道是谁在买，挂在 /me 上。
+	subHandler := subscriptions.NewHandler(
 		s.subSvc,
+		s.checkoutSvc,
 		s.cfg.StripeWebhookSecret,
 		s.cfg.AppleSharedSecret,
 		s.cfg.GooglePubsubAud,
-	).Register(s.engine.Group("/webhooks"))
+	)
+	subHandler.Register(s.engine.Group("/webhooks"))
+	subHandler.RegisterUser(meGroup)
 }
 
 func (s *Server) handleHealth(c *gin.Context) {

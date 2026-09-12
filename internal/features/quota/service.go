@@ -39,6 +39,16 @@ func (s *Service) tierOf(ctx context.Context, userID uuid.UUID) (entitlement.Tie
 	return entitlement.MustOf(plan), plan, nil
 }
 
+// DeviceLimit 返回该用户档位允许的设备数。0 表示该档位不适用设备概念
+// （免费档纯本地），调用方**不能**把它理解成「一台都不许有」。
+func (s *Service) DeviceLimit(ctx context.Context, userID uuid.UUID) (int, error) {
+	t, _, err := s.tierOf(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	return t.Devices, nil
+}
+
 // PlanOf 暴露用户当前档位字符串，供需要在错误响应里回填 plan 的调用方使用。
 func (s *Service) PlanOf(ctx context.Context, userID uuid.UUID) (string, error) {
 	return s.plans.ActivePlan(ctx, userID)

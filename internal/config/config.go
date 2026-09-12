@@ -94,8 +94,21 @@ type Config struct {
 
 	// 订阅 webhook 签名密钥（任一为空表示该 provider 不启用）
 	StripeWebhookSecret string `env:"SQUYRRL_STRIPE_WEBHOOK_SECRET"`
-	AppleSharedSecret   string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
-	GooglePubsubAud     string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
+	// StripeSecretKey 用于调 Stripe API 创建 Checkout Session。留空 ⇒ 购买入口返回 503
+	// （fail-closed，与边缘直传同一个态度：没有一条「退化成别的方式收款」的暗路）。
+	StripeSecretKey string `env:"SQUYRRL_STRIPE_SECRET_KEY"`
+	// StripePrices 是 SKU → Stripe price id 的 JSON 映射，键为 `kind:tier:period`
+	// （代币加购的 period 固定为 `once`）。例：
+	//   {"plan:basic:monthly":"price_1A...","storage:s50:yearly":"price_1B...","credits:p5:once":"price_1C..."}
+	//
+	// 放环境变量而不是数据库：**Stripe 的测试模式与正式模式是两套完全不同的 price id**，
+	// 它属于环境配置而非业务数据。放进库里意味着每次换环境都要改数据，
+	// 而那正是环境变量存在的理由。
+	StripePrices string `env:"SQUYRRL_STRIPE_PRICES"`
+	// CheckoutReturnBase 是结账完成/取消后跳回的站点前缀，例如 https://squyrrl.com。
+	CheckoutReturnBase string `env:"SQUYRRL_CHECKOUT_RETURN_BASE" envDefault:"https://squyrrl.com"`
+	AppleSharedSecret  string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
+	GooglePubsubAud    string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
 }
 
 func Load() (*Config, error) {

@@ -1,6 +1,7 @@
 package pricing
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -98,6 +99,43 @@ var storageTiers = []StorageTier{
 	{GB: 500, PriceUSDYear: 150},
 	{GB: 1024, PriceUSDYear: 300},
 	{GB: 2048, PriceUSDYear: 600},
+}
+
+// StorageTierKey 是存储档位在三家支付渠道里的商品标识后缀：20 GB → "s20"。
+//
+// 用容量本身当键，而不是另起一套 tier1/tier2：后者要求所有人都记住
+// 「tier3 是多少 GB」，而那个映射只存在于某个文件里。容量是用户、运营、
+// 支付后台三方都直接认得的东西。
+func StorageTierKey(gb int) string { return fmt.Sprintf("s%d", gb) }
+
+// StorageGBForKey 由商品标识反查容量，未知档位返回 false。
+//
+// **必须是查表而不是从 "s50" 里 parse 出 50**：那样任何人在支付后台建一个
+// "s999" 的商品都能凭空创造配额，而 webhook 会照单全收。查表意味着
+// 我们只认自己上架过的档位。
+func StorageGBForKey(key string) (int, bool) {
+	for _, t := range storageTiers {
+		if StorageTierKey(t.GB) == key {
+			return t.GB, true
+		}
+	}
+	return 0, false
+}
+
+// CreditPackKey 是代币加购在支付渠道里的商品标识后缀：$5 档 → "p5"。
+// 与存储同样用面值当键，理由相同：面值是三方都直接认得的东西。
+func CreditPackKey(usd int) string { return fmt.Sprintf("p%d", usd) }
+
+// CreditsForPackKey 由商品标识反查代币数，未知档位返回 false。
+// 与 StorageGBForKey 同理：**查表而不是从键里 parse**，否则任何人在支付后台
+// 建一个 "p9999" 的商品就能凭空创造代币。
+func CreditsForPackKey(key string) (int64, bool) {
+	for _, p := range creditPacks {
+		if CreditPackKey(p.PriceUSD) == key {
+			return p.Credits, true
+		}
+	}
+	return 0, false
 }
 
 // creditPacks 买得多送得多。面值按 CreditsPerUSD 折算，加成写在 Credits 里。

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,11 +61,10 @@ func ParseAppleNotification(payload []byte) (*SubscriptionEvent, error) {
 		return nil, ErrUnknownUser
 	}
 
-	parts := strings.Split(n.Data.ProductID, ".")
-	if len(parts) != 3 {
-		return nil, ErrUnknownTier
+	kind, tier, period, storageGB, err := ParseProductID(n.Data.ProductID, ".")
+	if err != nil {
+		return nil, err
 	}
-	tier, period := parts[1], parts[2]
 
 	status := "active"
 	switch n.NotificationType {
@@ -82,8 +80,9 @@ func ParseAppleNotification(payload []byte) (*SubscriptionEvent, error) {
 		Provider:               ProviderApple,
 		ProviderSubscriptionID: n.Data.OriginalTransactionID,
 		UserID:                 uid,
-		Kind:                   "plan",
+		Kind:                   kind,
 		Tier:                   tier,
+		BonusStorageGB:         storageGB,
 		BillingPeriod:          period,
 		Status:                 status,
 		PeriodStart:            time.UnixMilli(n.Data.PurchaseDate),
