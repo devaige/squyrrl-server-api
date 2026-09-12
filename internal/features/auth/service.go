@@ -13,6 +13,8 @@ import (
 const (
 	otpTTL          = 10 * time.Minute
 	accessTokenTTL  = 1 * time.Hour
+	// refreshTokenTTL 是**滑动**窗口：每次 Refresh 都从当下重新起算（见 Service.Refresh）。
+	// 它因此是「最长闲置时长」而不是「会话最长寿命」—— 连续 30 天没打开过 App 才需要重登。
 	refreshTokenTTL = 30 * 24 * time.Hour
 )
 
@@ -240,7 +242,17 @@ func (s *Service) issueSession(ctx context.Context, user *User, device *Device) 
 	}, nil
 }
 
-// Refresh 用 refresh token 旋转出新的 access token；refresh 不旋转
+// Refresh 旋转 access token，并把 refresh 的到期时间顺延（滑动过期，2026-09-12 用户决策）。
+//
+// refresh 令牌本身仍然**不轮换**（ADR-019），变的只是到期锚点。原先锚在签发时刻，
+// 意味着任何会话满 refreshTokenTTL 必死 —— 包括天天在用的那些，而它们重新登录的
+// 唯一途径是再发一封验证码。Resend 免费档 100 封/天是全系统最早撞到的外部硬上限，
+// 而「老用户按月重登」这条发信量随 MAU 线性增长、与新增用户完全无关。
+//
+// 代价说清楚：被盗的 refresh 令牌只要持续使用就不会自然过期。兜底不在有效期上，
+// 而在撤销侧 —— 登出写 sessions.revoked_at、设备逐出写 devices.revoked_at，
+// 而 findSession 两者都判（见 repo.findSession 的 JOIN），撤销即刻生效。
+// access TTL 仍是 1 小时，不受影响。
 func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair, error) {
 	sess, err := s.repo.FindSessionByRefreshHash(ctx, hashSHA256(refreshToken))
 	if err != nil {
@@ -254,8 +266,10 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair,
 	if err != nil {
 		return nil, err
 	}
-	accessExp := time.Now().Add(accessTokenTTL)
-	if err := s.repo.RotateAccessToken(ctx, sess.ID, hashSHA256(accessTok), accessExp); err != nil {
+	now := time.Now()
+	accessExp := now.Add(accessTokenTTL)
+	refreshExp := now.Add(refreshTokenTTL)
+	if err := s.repo.RefreshSession(ctx, sess.ID, hashSHA256(accessTok), accessExp, refreshExp); err != nil {
 		return nil, err
 	}
 
@@ -263,7 +277,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair,
 		AccessToken:      accessTok,
 		RefreshToken:     refreshToken,
 		AccessExpiresAt:  accessExp,
-		RefreshExpiresAt: sess.RefreshExpiresAt,
+		RefreshExpiresAt: refreshExp,
 	}, nil
 }
 

@@ -337,13 +337,27 @@ func (r *Repo) findSession(ctx context.Context, hashCol, expCol string, hash []b
 	return &s, err
 }
 
-// RotateAccessToken 仅旋转 access；refresh 维持不变
-func (r *Repo) RotateAccessToken(ctx context.Context, sessionID uuid.UUID, accessHash []byte, accessExp time.Time) error {
+// RefreshSession 旋转 access 并把 refresh 的到期时间顺延（滑动过期）。
+//
+// refresh 令牌本身**不换**（ADR-019 的不轮换决定不变，理由仍是并发刷新互相失效的竞态），
+// 变的只是 refresh_expires_at 的锚点：原先锚在签发时刻，于是任何会话满 30 天必死，
+// 天天在用的用户也要重新走一遍邮件验证码。轮换与顺延是两件事，这里只动后者。
+func (r *Repo) RefreshSession(
+	ctx context.Context,
+	sessionID uuid.UUID,
+	accessHash []byte,
+	accessExp, refreshExp time.Time,
+) error {
+	// refresh_expires_at 用 GREATEST 而不是直接赋值：两次并发刷新中先到的那次可能
+	// 算出更晚的时间戳，后到的那次若无条件覆盖就会把到期时间**往回拨**。
+	// 差值只有毫秒级，但这类回拨正是没人能复现的「偶尔被登出」。
 	_, err := r.pool.Exec(ctx, `
 		UPDATE sessions
-		SET access_token_hash = $1, access_expires_at = $2
-		WHERE id = $3`,
-		accessHash, accessExp, sessionID)
+		SET access_token_hash = $1,
+		    access_expires_at = $2,
+		    refresh_expires_at = GREATEST(refresh_expires_at, $3::timestamptz)
+		WHERE id = $4`,
+		accessHash, accessExp, refreshExp, sessionID)
 	return err
 }
 
