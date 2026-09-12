@@ -98,6 +98,15 @@ type Config struct {
 	// 设 0 可回到旧的「永不过期」行为，但那正是 000019 要修的东西。
 	ParseCacheTTL time.Duration `env:"SQUYRRL_PARSE_CACHE_TTL" envDefault:"720h"`
 
+	// GET /me/export 的每用户冷却期。
+	//
+	// 这是整套 API 里单次代价最高的端点：一次全表流式导出，上限是至尊档的
+	// 1000 万条碎片。1 小时不是在限制正常使用 —— 一个人一天导两次已属罕见，
+	// 而这条路径的消费者（降级用户）有 30 天宽限期 —— 它是为了让
+	// 「反复打同一条」不再免费，尤其是「打一半就断开」这种最省事的打法。
+	// 设 0 关闭这一层（dev 调导出格式时会用到）。
+	ExportCooldown time.Duration `env:"SQUYRRL_EXPORT_COOLDOWN" envDefault:"1h"`
+
 	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
 	// 跨环境统一走默认值 2，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。
 	ParseCost int64 `env:"SQUYRRL_PARSE_COST" envDefault:"2"`

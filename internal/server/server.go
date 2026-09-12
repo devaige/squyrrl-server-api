@@ -201,7 +201,7 @@ func (s *Server) routes() {
 	// GET /me/export：整批导出云端数据（ADR-075 降级生命周期的出口）。
 	// 挂在 /me 而不是 /snippets：它导的是「我的全部数据」而不是碎片列表的一种查询，
 	// 且将来页面、标签、附件清单都会进同一份文件。
-	snippet.NewExportHandler(snippet.NewExporter(s.pool)).RegisterUser(meGroup)
+	snippet.NewExportHandler(snippet.NewExporter(s.pool), s.cfg.ExportCooldown).RegisterUser(meGroup)
 
 	// TG 绑定归属于「我的账户设置」，故挂 /me/tg 而非顶层 /tg：
 	// 兑换码、列出已绑 TG 号、解绑，都是对当前登录用户自身的操作。

@@ -1320,6 +1320,11 @@ paths:
 
         不返回 `Content-Length`：内容是流式产出的。写入中途失败时连接会被中断，
         客户端拿到的是一份**解析失败**的截断 JSON，而不是一份静默残缺的备份。
+
+        **按用户冷却，默认 1 小时**（`SQUYRRL_EXPORT_COOLDOWN`）。这是整套 API 里
+        单次代价最高的端点，一次调用就是一次全表扫描加等量出网。名额在开始写出之前
+        就被占用，且**失败的导出同样占用** —— 否则「打一半就断开」会成为一条免费的
+        无限重放通道。超出冷却返回 `429` 并带 `Retry-After`。
       responses:
         '200':
           description: 导出文件
@@ -1337,6 +1342,20 @@ paths:
                   tags: { type: array, items: { type: object } }
                   snippets: { type: array, items: { type: object } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: 距上次导出未满冷却期
+          headers:
+            Retry-After:
+              description: 还需等待的秒数。恒 >= 1，绝不为 0。
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, retry_after_seconds]
+                properties:
+                  error: { type: string }
+                  retry_after_seconds: { type: integer, minimum: 1 }
 
   /me/wallet:
     get:
