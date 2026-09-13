@@ -57,7 +57,7 @@ func (h *Handler) parse(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	res, err := h.svc.Parse(c.Request.Context(), id.UserID, in.URI)
+	res, err := h.svc.Parse(c.Request.Context(), id.UserID, in)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrNoParser):

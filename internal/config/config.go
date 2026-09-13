@@ -98,6 +98,16 @@ type Config struct {
 	// 设 0 可回到旧的「永不过期」行为，但那正是 000019 要修的东西。
 	ParseCacheTTL time.Duration `env:"SQUYRRL_PARSE_CACHE_TTL" envDefault:"720h"`
 
+	// 强制刷新（POST /uris/parse 带 force）的冷却窗口，**按资源**计而不是按用户。
+	//
+	// 它防的不是滥用，是浪费：同一条内容在几分钟内被重复重取，平台要为每一次
+	// 付上游的钱，而第二次拿回来的几乎必然与第一次一字不差。冷却期内的请求不报错，
+	// 退回读缓存 —— 读到的正是刚刚刷新的那一版。
+	//
+	// 5 分钟是「用户觉得内容不对、点一下刷新」这个动作的现实间隔量级；
+	// 设 0 关闭这一层（dev 调刷新链路时会用到）。
+	ParseRefreshCooldown time.Duration `env:"SQUYRRL_PARSE_REFRESH_COOLDOWN" envDefault:"5m"`
+
 	// GET /me/export 的每用户冷却期。
 	//
 	// 这是整套 API 里单次代价最高的端点：一次全表流式导出，上限是至尊档的

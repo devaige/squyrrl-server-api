@@ -11,6 +11,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// VersionsPerResource 是同一资源保留的历史版本数上限，超出的由清理循环按「最近抓取」淘汰。
+//
+// 读路径只取最新一版，所以第 2..N 版**永远不会被下发** —— 它们的价值全在两个
+// 消费者身上：强制刷新后的撤销（只需要 2），以及「此内容已更新」的差异展示。
+// 取 10 是给后者留的余量。绝大多数资源从不变更，恒为 1 行，这个上界只对被反复
+// 编辑的资源生效，所以放大存储的风险远小于它看上去的样子。
+const VersionsPerResource = 10
+
 // Cache 封装对 parse_cache 表的存取。同 URI 跨用户复用解析结果。
 //
 // 保留期由 Cache 自己持有而不是由 Service 逐次传入：写入 TTL 和清理过期行
@@ -27,33 +35,51 @@ func NewCache(pool *pgxpool.Pool, ttl time.Duration) *Cache {
 	return &Cache{pool: pool, ttl: ttl}
 }
 
-// Get 命中返回 ParsedSnippet（含 type/subtype/title/payload/source_*）；未命中返回 false
-func (c *Cache) Get(ctx context.Context, provider, resourceID string) (*ParsedSnippet, bool, error) {
+// Get 返回该资源**最新**一版的解析结果及其 version；未命中返回 false。
+//
+// 排序用 created_at（抓取时刻）而不是 version 本身，尽管「按内容的真实先后序」
+// 听起来更对。原因是 version 由各 provider 自行定义，形态互不兼容：TG 是 epoch
+// 秒、别处可能是 ISO 时间戳或内容哈希，作为 TEXT 比较时 "9" > "10"、哈希则根本
+// 无序。用一个在所有 provider 上都成立的序（我们什么时候抓到的），比用一个只在
+// 部分 provider 上成立的序要诚实。代价是上游若返回了一个更旧的版本，我们会把它
+// 当成最新 —— 那是上游抖动，而不是这里能靠排序修好的问题。
+// id 参与兜底排序，保证同一时刻写入的多行有稳定次序（同 restriction.go 的处理）。
+func (c *Cache) Get(ctx context.Context, provider, resourceID string) (*ParsedSnippet, string, bool, error) {
 	var raw []byte
+	var version string
 	err := c.pool.QueryRow(ctx, `
-		SELECT payload FROM parse_cache
+		SELECT payload, version FROM parse_cache
 		WHERE provider = $1 AND provider_resource_id = $2
-		  AND (expires_at IS NULL OR expires_at > now())`,
-		provider, resourceID).Scan(&raw)
+		  AND (expires_at IS NULL OR expires_at > now())
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1`,
+		provider, resourceID).Scan(&raw, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
+		return nil, "", false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	var snip ParsedSnippet
 	if err := json.Unmarshal(raw, &snip); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
-	return &snip, true, nil
+	return &snip, version, true, nil
 }
 
-// Put 落库或更新缓存，带上 Cache 的保留期。
+// Put 追加一版解析结果。version 为空串表示该 provider 不提供版本信息，
+// 此时唯一约束退化成 (provider, resource_id)，行为与改版前一致（每资源恒一行）。
 //
-// 冲突时 expires_at 取 EXCLUDED（即从现在起重新计时）而不是保留旧值：
-// 走到这里说明刚刚有人真的解析了这个资源，它显然还在被使用中 ——
-// 让活跃条目续期、让没人再碰的条目自然老死，正是保留期该有的形状。
-func (c *Cache) Put(ctx context.Context, provider, resourceID string, snip *ParsedSnippet) error {
+// 冲突（同一 version 被重复解析）时 expires_at 取 EXCLUDED，即从现在起重新计时：
+// 走到这里说明刚刚有人真的解析了这个资源，它显然还在被使用中 —— 让活跃条目续期、
+// 让没人再碰的条目自然老死，正是保留期该有的形状。
+//
+// payload 则**有条件**覆盖：新结果没有 title 而旧结果有时，保留旧的。
+// 同一 version 意味着上游内容逐字未变，那么两次解析本应得到同样的结果；真出现
+// 差异只可能是上游这次降级了（限流、部分字段缺失）。而这张表是跨用户共享的，
+// 一次降级返回会把一条好缓存换成坏缓存，代价由**所有**后来者承担，且没人会发现。
+// 宁可丢弃这次的结果 —— 它按定义不比已有的更新。
+func (c *Cache) Put(ctx context.Context, provider, resourceID, version string, snip *ParsedSnippet) error {
 	raw, err := json.Marshal(snip)
 	if err != nil {
 		return err
@@ -64,11 +90,17 @@ func (c *Cache) Put(ctx context.Context, provider, resourceID string, snip *Pars
 		expires = &t
 	}
 	_, err = c.pool.Exec(ctx, `
-		INSERT INTO parse_cache (provider, provider_resource_id, payload, file_ids, expires_at)
-		VALUES ($1, $2, $3, '{}', $4)
-		ON CONFLICT (provider, provider_resource_id) DO UPDATE
-			SET payload = EXCLUDED.payload, expires_at = EXCLUDED.expires_at`,
-		provider, resourceID, raw, expires)
+		INSERT INTO parse_cache (provider, provider_resource_id, version, payload, file_ids, expires_at)
+		VALUES ($1, $2, $3, $4, '{}', $5)
+		ON CONFLICT (provider, provider_resource_id, version) DO UPDATE
+			SET payload = CASE
+					WHEN EXCLUDED.payload->>'title' IS NULL
+					 AND parse_cache.payload->>'title' IS NOT NULL
+					THEN parse_cache.payload
+					ELSE EXCLUDED.payload
+				END,
+			    expires_at = EXCLUDED.expires_at`,
+		provider, resourceID, version, raw, expires)
 	return err
 }
 
@@ -92,6 +124,35 @@ func (c *Cache) Sweep(ctx context.Context, limit int) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// PruneVersions 让每个资源只保留最近 keep 版，多余的删除，返回删除条数。
+//
+// 与 Sweep 是两件事，不能合并：Sweep 清的是**整条**过期的资源，这里清的是
+// 未过期资源里过多的历史版本 —— 一个被频繁编辑的热门资源永远不会过期，却会
+// 无上界地累积版本行。
+//
+// 窗口函数要全表排一次序，和 extapi.PruneLiveSamples 同样的代价与同样的理由：
+// 一天一轮，而这是唯一能在「不知道有哪些资源」的前提下按组裁剪的写法。
+// 同样带 LIMIT 分批，原因见 Sweep。
+func (c *Cache) PruneVersions(ctx context.Context, keep, limit int) (int64, error) {
+	tag, err := c.pool.Exec(ctx, `
+		DELETE FROM parse_cache
+		WHERE id IN (
+			SELECT id FROM (
+				SELECT id, row_number() OVER (
+					PARTITION BY provider, provider_resource_id
+					ORDER BY created_at DESC, id DESC
+				) AS rn
+				FROM parse_cache
+			) ranked
+			WHERE rn > $1
+			LIMIT $2
+		)`, keep, limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // sweepBatch 是单轮清理的批大小。
 const sweepBatch = 5000
 
@@ -106,7 +167,7 @@ func (c *Cache) RunSweeper(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
-	slog.Info("解析缓存清理启动", "interval", interval, "ttl", c.ttl)
+	slog.Info("解析缓存清理启动", "interval", interval, "ttl", c.ttl, "versions_per_resource", VersionsPerResource)
 	c.sweepOnce(ctx)
 	for {
 		select {
@@ -119,13 +180,18 @@ func (c *Cache) RunSweeper(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// sweepOnce 先清过期行再裁剪版本。顺序有意义：过期清理会顺带带走整个资源的所有
+// 版本行，先跑它能让版本裁剪少扫一批注定要消失的数据。
 func (c *Cache) sweepOnce(ctx context.Context) {
-	n, err := c.Sweep(ctx, sweepBatch)
-	if err != nil {
+	if n, err := c.Sweep(ctx, sweepBatch); err != nil {
 		slog.Warn("解析缓存清理失败", "err", err)
-		return
-	}
-	if n > 0 {
+	} else if n > 0 {
 		slog.Info("解析缓存清理完成", "removed", n)
+	}
+
+	if n, err := c.PruneVersions(ctx, VersionsPerResource, sweepBatch); err != nil {
+		slog.Warn("解析缓存版本裁剪失败", "err", err)
+	} else if n > 0 {
+		slog.Info("解析缓存版本裁剪完成", "removed", n, "keep", VersionsPerResource)
 	}
 }

@@ -80,6 +80,17 @@ type ParseResult struct {
 	Payload     json.RawMessage `json:"payload"`     // type-specific 数据
 	SourceData  json.RawMessage `json:"source_data"` // upstream author 信息
 	Assets      []Asset         `json:"assets,omitempty"`
+
+	// Version 是上游给出的**内容版本标记**，作为 parse_cache 的第三段键。
+	//
+	// 只有在 provider 能真正区分「同一资源的不同内容」时才填（TG 的 edit_date、
+	// 带 revision 的 API、兜底可用内容哈希）。留空表示「本 provider 无版本信息」，
+	// 缓存退化为每资源一行 —— 内置的 YouTube/Gist/Reddit/GenericOG 全在这一档。
+	//
+	// **不要用 "0" 之类的哨兵冒充「未编辑」**：那会让「上游说了它没被编辑」和
+	// 「上游根本没告诉我」挤进同一个值，于是一份新鲜度未知的内容会被当成已确认
+	// 是当前版本存下来。拿不到就留空，让它老老实实走 TTL。
+	Version string `json:"version,omitempty"`
 }
 
 // ParsedSnippet 是解析产物的**原始/中间形态**，不是可直接入库的成品碎片。
@@ -116,6 +127,14 @@ type ParseResponse struct {
 	Snippet    *ParsedSnippet `json:"snippet"`
 	Cached     bool           `json:"cached"`
 
+	// Version 回传本次结果对应的内容版本（可能为空，见 ParseResult.Version）。
+	//
+	// 客户端应把它连同碎片一起存下来。这是「强制刷新后内容到底有没有变」唯一
+	// 可判定的依据 —— 服务端答不了这个问题，因为它不知道用户手里那份是哪一版。
+	// 有了它，刷新回来 version 相同就可以如实告诉用户「已是最新」，而不是让
+	// 用户花了 credits 盯着一个看不出区别的界面猜。
+	Version string `json:"version,omitempty"`
+
 	// CreditsCharged 是本次实际扣掉的代币数。
 	//
 	// 必须回传，因为价格自 2026-09-12 起随 provider 接的上游而变，客户端无从预知：
@@ -126,4 +145,14 @@ type ParseResponse struct {
 
 type ParseInput struct {
 	URI string `json:"uri" binding:"required,url"`
+
+	// Force 跳过缓存，强制向上游重取一次。
+	//
+	// 存在的理由：TTL 是对「这个资源多久会变一次」的猜测，而缓存键指向的是
+	// 内容的某一版 —— 猜错时用户会一直看到旧内容，且**没有任何自助手段**。
+	// 这是所有 provider 的通用逃生口，不是某个平台的补丁。
+	//
+	// 计费与普通解析完全一致（扣费发生在缓存查询之前，见 Service.Parse），
+	// 所以这个参数不影响价格，只影响拿到的是不是新鲜数据。
+	Force bool `json:"force,omitempty"`
 }

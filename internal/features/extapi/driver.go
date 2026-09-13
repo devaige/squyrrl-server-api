@@ -119,6 +119,7 @@ func (s *Service) callEndpoint(ctx context.Context, ep Endpoint, cfg EndpointCon
 		ThumbnailURL: getPath(parsed, rm.ThumbnailURL),
 		AuthorName:   getPath(parsed, rm.AuthorName),
 		AuthorURL:    getPath(parsed, rm.AuthorURL),
+		Version:      getPath(parsed, rm.Version),
 		Raw:          json.RawMessage(raw),
 	}, trace, nil
 }

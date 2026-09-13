@@ -65,6 +65,18 @@ type ResponseMap struct {
 	ThumbnailURL string `json:"thumbnail_url"`
 	AuthorName   string `json:"author_name"`
 	AuthorURL    string `json:"author_url"`
+
+	// Version 指向上游响应里能区分「同一资源的不同内容」的那个字段，
+	// 成为 parse_cache 的第三段键（见 parser.ParseResult.Version）。
+	//
+	// 刻意取通用名而不是 edit_date：这张 map 所有 provider 共用，而各家对
+	// 「内容变了」的表达互不相同 —— TG 是编辑时间戳，别处可能是 revision 号、
+	// updated_at 或 ETag。此处只要求它「内容变则变」，不要求它是时间。
+	//
+	// 留空 = 该 endpoint 无法提供版本信息，缓存退化为每资源一行 + TTL。
+	// 接入一个新 endpoint 时，这一项能不能填上应当在 api_samples 里用一条真实
+	// 响应先验过 —— 对内容可变的 provider，它是准入条件而不是可选优化。
+	Version string `json:"version"`
 }
 
 // FetchResult 是供应层对上层暴露的中立结果；由 parser 侧组装成 provider-specific 的 snippet。
@@ -74,6 +86,7 @@ type FetchResult struct {
 	ThumbnailURL string
 	AuthorName   string
 	AuthorURL    string
+	Version      string          // 内容版本标记；空串表示该 endpoint 不提供，见 ResponseMap.Version
 	Raw          json.RawMessage // 原始响应体，parser 需要额外字段时可自取
 	EndpointID   uuid.UUID
 	EndpointSlug string

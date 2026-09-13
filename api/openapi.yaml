@@ -877,9 +877,20 @@ paths:
       tags: [URIs]
       summary: 解析 URI 为结构化碎片
       description: |
-        服务端按已注册的 provider 顺序匹配 URI（Phase 1.5：YouTube oEmbed），
-        命中后调上游 API 解析并写入跨用户共享缓存（ADR-005）。
-        响应中的 `snippet` 字段可直接 POST 给 `/snippets` 创建特殊碎片。
+        服务端按已注册的 provider 顺序匹配 URI，命中后调上游 API 解析并写入
+        跨用户共享缓存（ADR-005）。响应中的 `snippet` 字段可直接 POST 给
+        `/snippets` 创建特殊碎片。
+
+        **缓存按「资源的某个版本」寻址**（migration 000022）。多数 provider 的
+        资源 ID 稳定但内容可变（YouTube 能改标题、Gist 指向最新 revision、
+        Telegram 消息原地编辑），所以缓存行带一个上游给出的 `version`；
+        读取恒取最新一版。provider 给不出版本信息时 `version` 为空串，
+        缓存退化为每资源一行 + TTL。
+
+        `force=true` 跳过缓存读、强制重取一次，供客户端的「强制刷新」入口使用。
+        它**不改变计价**（见 `credits_charged`）。冷却窗口内（按资源计，
+        `SQUYRRL_PARSE_REFRESH_COOLDOWN`，默认 5 分钟）的重复强制刷新会被
+        静默降级为一次普通读 —— 不报错，返回的正是刚刷新过的那一版。
       requestBody:
         required: true
         content:
@@ -889,6 +900,13 @@ paths:
               required: [uri]
               properties:
                 uri: { type: string, format: uri }
+                force:
+                  type: boolean
+                  default: false
+                  description: >-
+                    跳过缓存强制重取。用于用户主动发起的「强制刷新」：TTL 是对
+                    「这个资源多久变一次」的猜测，猜错时这是唯一的自助手段。
+                    计价与普通解析一致。
       responses:
         '200':
           description: 解析成功
@@ -899,8 +917,9 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402':
           description: |
-            credits 余额不足。cache 命中不收费；cache miss 时按 `SQUYRRL_PARSE_COST` 扣减（dev 默认 0 即不强制，生产推荐 2）。
-            客户端应引导用户充值后重试，或读取 `/me/wallet` 查询当前余额。
+            credits 余额不足。**缓存命中同样计费**（按请求计价，见 ADR-046 与 `credits_charged`）——
+            缓存只为平台节约上游成本，与用户侧定价解耦，好处是价格不随缓存命中率波动。
+            `force=true` 也走同一价格。客户端应引导用户充值后重试，或读取 `/me/wallet` 查询当前余额。
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2171,6 +2190,17 @@ components:
         cached:
           type: boolean
           description: true 表示命中跨用户解析缓存，未触发上游调用
+        version:
+          type: string
+          description: >-
+            本次结果对应的上游内容版本标记（Telegram 的 edit_date、revision、
+            内容哈希等）。provider 给不出版本信息时为空/缺省。
+
+            **客户端应连同碎片一起存下来**：这是「强制刷新后内容到底有没有变」
+            唯一可判定的依据 —— 服务端答不了，它不知道用户手里那份是哪一版。
+            刷新回来 version 相同即可如实提示「已是最新」，而不是让用户花了
+            credits 却盯着一个看不出区别的界面猜。
+          examples: ['1756219865']
         credits_charged:
           type: integer
           format: int64

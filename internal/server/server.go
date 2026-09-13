@@ -97,7 +97,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	registry.Register(parser.NewGenericOGProvider())
 	extapiSvc := extapi.NewService(extapi.NewRepo(pool))
 	parseCache := parser.NewCache(pool, cfg.ParseCacheTTL)
-	parsSvc := parser.NewService(registry, parseCache, walletSvc, extapiSvc, cfg.ParseCost)
+	parsSvc := parser.NewService(registry, parseCache, walletSvc, extapiSvc, cfg.ParseCost, cfg.ParseRefreshCooldown)
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, quotaSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
