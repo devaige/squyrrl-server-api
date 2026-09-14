@@ -65,6 +65,15 @@ func (s *Service) IssueBindingLink(ctx context.Context, userID uuid.UUID) (*Bind
 	if s.botUsername == "" {
 		return nil, ErrBotUnconfigured
 	}
+	// 档位门槛提到签发之前。bindIdentity 里那道检查是权威的（5 分钟 TTL 内档位
+	// 可能失效），但把**唯一**的检查点留在那里，用户要先看二维码、切到 Telegram、
+	// 再切回来点确认，才会被告知这功能要付费 —— 前面每一步都是白做的。
+	// 这里已经知道是谁在问了，能拒绝的最早时刻就是该拒绝的时刻。
+	if s.quota != nil {
+		if err := s.quota.CheckBindingCreate(ctx, userID, PlatformTelegram); err != nil {
+			return nil, err
+		}
+	}
 	t, err := s.repo.IssueToken(ctx, userID, PlatformTelegram, tokenTTL)
 	if err != nil {
 		return nil, err

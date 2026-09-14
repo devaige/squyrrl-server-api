@@ -33,6 +33,12 @@ type Catalog struct {
 	// CreditPacks 代币加购档位，一次性购买、永不过期。
 	CreditPacks []CreditPack `json:"credit_packs"`
 
+	// SignupGrantCredits 注册赠额。客户端拿它当「代币是否该补」的水位线：
+	// 余额低于新手额度，就说明赠额已经用得差不多了。
+	// 发出来而不是让客户端自己写一个常量 —— 那个数字改一次，两侧就分了家，
+	// 而分家的表现只是推荐组合悄悄变得不合适，没有任何报错。
+	SignupGrantCredits int64 `json:"signup_grant_credits"`
+
 	// MaxFileSize 单文件上限随总存储配额变化，不是订阅属性。
 	// 做成阶梯而非订阅字段，是因为存储可叠加，写成字段就要回答
 	// 「叠加时取最大档还是取总和」这个没有好答案的问题。
@@ -198,5 +204,7 @@ func (h *Handler) get(c *gin.Context) {
 		Storage:       storageTiers,
 		CreditPacks:   creditPacks,
 		MaxFileSize:   fileSizeTiers,
+
+		SignupGrantCredits: SignupGrantCredits,
 	})
 }

@@ -40,6 +40,11 @@ func (h *Handler) issueLink(c *gin.Context) {
 	id := auth.MustIdentity(c)
 	link, err := h.svc.IssueBindingLink(c.Request.Context(), id.UserID)
 	if err != nil {
+		// 402 要在这里就能出去：客户端据它把用户带去商品页，而不是让他走完
+		// 「扫码 → 发短码 → 回来确认」再撞墙。
+		if quota.WriteIfQuota(c, err) {
+			return
+		}
 		if errors.Is(err, ErrBotUnconfigured) {
 			// 503 而非 500：这是部署缺一个环境变量，不是代码出错，
 			// 客户端据此提示「功能暂未开放」而不是「出错了，重试」。
