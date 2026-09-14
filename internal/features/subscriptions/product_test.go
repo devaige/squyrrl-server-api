@@ -16,7 +16,7 @@ func TestParseProductID(t *testing.T) {
 		{"老三段式默认 plan", "squyrrl.basic.monthly", ".", "plan", "basic", "monthly", 0, false},
 		{"四段式 plan", "squyrrl.plan.premium.yearly", ".", "plan", "premium", "yearly", 0, false},
 		{"四段式 storage", "squyrrl.storage.s50.yearly", ".", "storage", "s50", "yearly", 50, false},
-		{"Google 下划线分隔", "squyrrl_storage_s1024_yearly", "_", "storage", "s1024", "yearly", 1024, false},
+		{"Google 下划线分隔", "squyrrl_storage_s1000_yearly", "_", "storage", "s1000", "yearly", 1000, false},
 
 		// 未上架的容量必须拒绝，而不是从 "s999" 里 parse 出 999 ——
 		// 那样任何人在支付后台建一个商品就能凭空创造配额。

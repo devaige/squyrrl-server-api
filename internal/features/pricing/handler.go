@@ -98,13 +98,20 @@ func GraceFor(billingPeriod string) time.Duration {
 // storageTiers 按 $0.03/GB·月 × 10 个月定价，线性。
 // 线性是叠加安全的前提：5 份 20 GB 与 1 份 100 GB 严格同价，
 // 阶梯价会让前者更贵，用户有理由认为那是陷阱。
+//
+// 大档用 1000/2000 而不是 1024/2048（2026-09-14 用户决策）：二进制那两档
+// 在这张表里**只在名字上像整数**，定价仍按十进制取整（1024 GB 收 $300 而非
+// $307.2），于是「每档翻倍、每档单价一致」这个用户能一眼验证的规律被打断了。
+// 改成十进制后整张表严格 $0.30/GB·年，倍数与价格同步翻倍。
+// 代价是商品标识从 s1024/s2048 变成 s1000/s2000 —— 支付渠道尚未上架任何存储
+// 商品，现在是改这个键唯一不需要迁移存量订阅的时间窗。
 var storageTiers = []StorageTier{
 	{GB: 20, PriceUSDYear: 6},
 	{GB: 50, PriceUSDYear: 15},
 	{GB: 100, PriceUSDYear: 30},
 	{GB: 500, PriceUSDYear: 150},
-	{GB: 1024, PriceUSDYear: 300},
-	{GB: 2048, PriceUSDYear: 600},
+	{GB: 1000, PriceUSDYear: 300},
+	{GB: 2000, PriceUSDYear: 600},
 }
 
 // StorageTierKey 是存储档位在三家支付渠道里的商品标识后缀：20 GB → "s20"。
@@ -145,10 +152,18 @@ func CreditsForPackKey(key string) (int64, bool) {
 }
 
 // creditPacks 买得多送得多。面值按 CreditsPerUSD 折算，加成写在 Credits 里。
+//
+// 赠额每档 +5%，是为了让**加成本身成为一条可读的规律**而不是三个孤立的数字：
+// 用户看到 $3 送 5%、$5 送 10%，不用算就知道再往上一档还会更划算。
+// 客户端不另发「赠额」字段，它 = Credits − PriceUSD × CreditsPerUSD，
+// 两边各算各的就会在改价那天分家。
 var creditPacks = []CreditPack{
-	{PriceUSD: 1, Credits: 10_000},
+	{PriceUSD: 1, Credits: 10_000},   // 面值，无赠额
+	{PriceUSD: 3, Credits: 31_500},   // +5%
 	{PriceUSD: 5, Credits: 55_000},   // +10%
+	{PriceUSD: 10, Credits: 115_000}, // +15%
 	{PriceUSD: 20, Credits: 240_000}, // +20%
+	{PriceUSD: 50, Credits: 625_000}, // +25%
 }
 
 // fileSizeTiers 单文件上限。
@@ -160,7 +175,7 @@ var creditPacks = []CreditPack{
 var fileSizeTiers = []FileSizeTier{
 	{MinQuotaGB: 20, MaxFileBytes: 2 << 30},   // 2 GB
 	{MinQuotaGB: 200, MaxFileBytes: 10 << 30}, // 10 GB
-	{MinQuotaGB: 1024, MaxFileBytes: 50 << 30},
+	{MinQuotaGB: 1000, MaxFileBytes: 50 << 30},
 }
 
 // MaxFileBytesFor 按总配额算出单文件上限。配额为 0（未购买存储）时返回 0，
