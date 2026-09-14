@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/snippet"
+	"github.com/squyrrl/api/internal/infra/ratelimit"
 )
 
 // tokenTTL 比手输码时代的 10 分钟更短：deep link 是「点开就用」的，
@@ -25,15 +26,33 @@ type QuotaChecker interface {
 	CheckUpload(ctx context.Context, userID uuid.UUID, size int64) error
 }
 
+// 短码认领的限流。按平台账号（TG 号）分桶而非按 IP：请求全部来自 Bot 那一台
+// 机器，IP 没有区分度。
+//
+// 8 位码有 31^8 ≈ 2^39.6 种，配合 5 分钟 TTL，这个额度下猜中任何一枚活跃码
+// 需要的账号数远超注册 TG 号的成本。额度给到 10 是留给真实用户的手误：
+// 敲错一两次、把码连着发两遍都不该被挡。
+const (
+	claimAttemptLimit  = 10
+	claimAttemptWindow = 10 * time.Minute
+)
+
 type Service struct {
 	repo        *Repo
 	snipSvc     *snippet.Service
 	quota       QuotaChecker
 	botUsername string
+	claimLimit  *ratelimit.Limiter
 }
 
 func NewService(repo *Repo, snipSvc *snippet.Service, quota QuotaChecker, botUsername string) *Service {
-	return &Service{repo: repo, snipSvc: snipSvc, quota: quota, botUsername: botUsername}
+	return &Service{
+		repo:        repo,
+		snipSvc:     snipSvc,
+		quota:       quota,
+		botUsername: botUsername,
+		claimLimit:  ratelimit.New(claimAttemptLimit, claimAttemptWindow),
+	}
 }
 
 // =============================================================================
@@ -46,26 +65,35 @@ func (s *Service) IssueBindingLink(ctx context.Context, userID uuid.UUID) (*Bind
 	if s.botUsername == "" {
 		return nil, ErrBotUnconfigured
 	}
-	token, exp, err := s.repo.IssueToken(ctx, userID, PlatformTelegram, tokenTTL)
+	t, err := s.repo.IssueToken(ctx, userID, PlatformTelegram, tokenTTL)
 	if err != nil {
 		return nil, err
 	}
 	return &BindingLink{
-		Token:     token,
-		URL:       fmt.Sprintf("https://t.me/%s?start=%s", s.botUsername, token),
-		ExpiresAt: exp,
+		Token:     t.Token,
+		URL:       fmt.Sprintf("https://t.me/%s?start=%s", s.botUsername, t.Token),
+		ShortCode: t.ShortCode,
+		ExpiresAt: t.ExpiresAt,
 	}, nil
 }
 
 // Bind Bot 端调用：核销令牌，把提交上来的 TG 号绑到令牌所属的 Squyrrl 账户。
+// 这是 deep link / 扫码那条路径 —— 载体没经人手搬运，核销即绑定，不要确认。
 func (s *Service) Bind(ctx context.Context, token string, id TGIdentity) (*Binding, error) {
 	userID, err := s.repo.ConsumeToken(ctx, token, PlatformTelegram)
 	if err != nil {
 		return nil, err
 	}
-
 	acc := id.identity()
+	return s.bindIdentity(ctx, userID, acc, deviceNameFor(acc))
+}
 
+// bindIdentity 是「令牌已核销，该真正建立绑定了」这一段，由 deep link 与短码确认
+// 两条路径共用。抽出来是因为配额门槛、建设备、失败回收这三步的顺序有讲究，
+// 两份拷贝迟早会在其中一处分叉。
+func (s *Service) bindIdentity(
+	ctx context.Context, userID uuid.UUID, acc Identity, devName string,
+) (*Binding, error) {
 	// 档位门槛卡在核销之后、建设备之前。放在核销之前做不到 —— 那时还不知道这枚
 	// 令牌属于谁；放在建绑定之后则要多回滚一次。令牌被白白消费掉是可接受的代价：
 	// 用户升档后重点一次按钮即可，而这条路径本来就不该走通。
@@ -75,7 +103,7 @@ func (s *Service) Bind(ctx context.Context, token string, id TGIdentity) (*Bindi
 		}
 	}
 
-	deviceID, err := s.repo.CreateBindingDevice(ctx, userID, PlatformTelegram, deviceName(id))
+	deviceID, err := s.repo.CreateBindingDevice(ctx, userID, acc.Platform, devName)
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +114,44 @@ func (s *Service) Bind(ctx context.Context, token string, id TGIdentity) (*Bindi
 		return nil, err
 	}
 	return s.repo.FindByAccount(ctx, acc.Platform, acc.UserID)
+}
+
+// =============================================================================
+// 短码路径：Bot 认领 → App 确认
+// =============================================================================
+
+// ClaimBindingCode Bot 端调用：登记「这个 TG 号拿着这枚短码来申请绑定」。
+//
+// **这里不建立任何绑定**，也因此不查配额门槛 —— 认领不是一次授权，它只是把
+// 申请者的身份摆到账户主人面前。真正的门槛在 ConfirmBindingClaim。
+func (s *Service) ClaimBindingCode(ctx context.Context, code string, id TGIdentity) (time.Time, error) {
+	acc := id.identity()
+	if !s.claimLimit.Allow(acc.Platform + ":" + acc.UserID) {
+		return time.Time{}, ErrTooManyAttempts
+	}
+	return s.repo.ClaimToken(ctx, code, PlatformTelegram, acc)
+}
+
+// PendingBindingClaim 用户端轮询：当前有没有人拿着我的短码在等确认。
+func (s *Service) PendingBindingClaim(ctx context.Context, userID uuid.UUID) (*PendingClaim, error) {
+	return s.repo.FindPendingClaim(ctx, userID, PlatformTelegram)
+}
+
+// ConfirmBindingClaim 用户端确认：核销令牌并建立绑定。
+// expectPlatformUserID 是 App 展示给用户看的那个账号，必须与待确认的一致。
+func (s *Service) ConfirmBindingClaim(
+	ctx context.Context, userID uuid.UUID, expectPlatformUserID string,
+) (*Binding, error) {
+	acc, err := s.repo.ConsumeClaimedToken(ctx, userID, PlatformTelegram, expectPlatformUserID)
+	if err != nil {
+		return nil, err
+	}
+	return s.bindIdentity(ctx, userID, acc, deviceNameFor(acc))
+}
+
+// RejectBindingClaim 用户端拒绝
+func (s *Service) RejectBindingClaim(ctx context.Context, userID uuid.UUID) error {
+	return s.repo.RejectClaim(ctx, userID, PlatformTelegram)
 }
 
 // CheckUploadFor 在 Bot 代传文件之前，按 tg_user_id 找到账户并校验存储配额。
@@ -144,14 +210,21 @@ func (s *Service) Status(ctx context.Context, tgUserID int64) (*BindingStatusRes
 	return &BindingStatusResponse{Bound: true, TGUsername: deref(b.Username)}, nil
 }
 
-func deviceName(id TGIdentity) string {
+// deviceNameFor 给绑定占位设备起名。平台前缀由 Identity.Platform 决定而不是写死
+// "Telegram"：这个名字直接出现在用户的设备列表里，接入第二个平台时最不该还叫
+// Telegram，而那种错误不会有任何测试发现。
+func deviceNameFor(acc Identity) string {
+	label := acc.Platform
+	if acc.Platform == PlatformTelegram {
+		label = "Telegram"
+	}
 	switch {
-	case id.Username != "":
-		return "Telegram @" + id.Username
-	case id.Name != "":
-		return "Telegram " + id.Name
+	case acc.Username != "":
+		return label + " @" + acc.Username
+	case acc.Name != "":
+		return label + " " + acc.Name
 	default:
-		return fmt.Sprintf("Telegram %d", id.TGUserID)
+		return label + " " + acc.UserID
 	}
 }
 

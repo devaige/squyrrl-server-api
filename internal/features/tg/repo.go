@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -41,38 +42,187 @@ func generateToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+// shortCodeAlphabet 与 auth 的 QR 登录码用同一套字符集，刻意不另立门户：
+// 两处都是「屏幕上显示、人照着敲」，排除 I/L/O/0/1 的理由完全相同，
+// 而两套相似但不同的字符集只会让排错的人多一次核对。
+const shortCodeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+const shortCodeLen = 8
+
+func generateShortCode() (string, error) {
+	buf := make([]byte, shortCodeLen)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	out := make([]byte, shortCodeLen)
+	for i, b := range buf {
+		out[i] = shortCodeAlphabet[int(b)%len(shortCodeAlphabet)]
+	}
+	return string(out), nil
+}
+
 // =============================================================================
 // 绑定令牌：App 为已登录用户签发 → Bot 在 /start <token> 时核销
 // =============================================================================
 
+// issuedToken 是 IssueToken 的返回形状。用结构体而非四个返回值，是因为
+// token 与 short_code 都是字符串，位置写反了编译器一句话都不会说。
+type issuedToken struct {
+	Token     string
+	ShortCode string
+	ExpiresAt time.Time
+}
+
 // IssueToken 先找该用户手上未核销的令牌，有就复用。
 // 绑定页每次重建都会请求一次，不复用的话二维码会在用户正扫的时候换掉；
 // 复用让令牌在 TTL 内是稳定的一张。
-func (r *Repo) IssueToken(ctx context.Context, userID uuid.UUID, platform string, ttl time.Duration) (string, time.Time, error) {
-	var token string
-	var exp time.Time
+//
+// 复用条件多了一个 short_code IS NOT NULL：000022 之前签发的令牌没有短码，
+// 复用它会让绑定页少掉一条搬运路径。这类行最多存活 5 分钟（TTL），
+// 让它们自然过期比写一次回填迁移便宜。
+func (r *Repo) IssueToken(ctx context.Context, userID uuid.UUID, platform string, ttl time.Duration) (*issuedToken, error) {
+	// 顺手清掉这个用户自己那些过期未核销的令牌。短码的唯一索引只按 consumed_at
+	// 筛，不清理的话每个开过绑定页却没绑成的用户都会永久占着一个码名。
+	// 按 user_id 收窄，走的是既有的 idx_binding_tokens_live。
+	_, _ = r.pool.Exec(ctx, `
+		DELETE FROM binding_tokens
+		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL AND expires_at <= now()`,
+		userID, platform)
+
+	var out issuedToken
 	err := r.pool.QueryRow(ctx, `
-		SELECT token, expires_at FROM binding_tokens
-		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL AND expires_at > now()
-		ORDER BY expires_at DESC LIMIT 1`, userID, platform).Scan(&token, &exp)
+		SELECT token, short_code, expires_at FROM binding_tokens
+		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL
+		  AND expires_at > now() AND short_code IS NOT NULL
+		ORDER BY expires_at DESC LIMIT 1`, userID, platform).
+		Scan(&out.Token, &out.ShortCode, &out.ExpiresAt)
 	if err == nil {
-		return token, exp, nil
+		return &out, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", time.Time{}, err
+		return nil, err
 	}
 
-	token, err = generateToken()
+	token, err := generateToken()
 	if err != nil {
-		return "", time.Time{}, err
+		return nil, err
 	}
-	exp = time.Now().Add(ttl)
-	if _, err := r.pool.Exec(ctx, `
-		INSERT INTO binding_tokens (token, user_id, platform, expires_at)
-		VALUES ($1, $2, $3, $4)`, token, userID, platform, exp); err != nil {
-		return "", time.Time{}, err
+	exp := time.Now().Add(ttl)
+
+	// 短码只有 31^8 个，唯一索引理论上会撞。重试而非一次性放弃：撞一次的概率是
+	// 「当前活跃码数 / 8.5e11」，重试三次之后仍撞的概率不值得再写代码去处理。
+	for attempt := 0; attempt < 3; attempt++ {
+		code, err := generateShortCode()
+		if err != nil {
+			return nil, err
+		}
+		_, err = r.pool.Exec(ctx, `
+			INSERT INTO binding_tokens (token, user_id, platform, expires_at, short_code)
+			VALUES ($1, $2, $3, $4, $5)`, token, userID, platform, exp, code)
+		if err == nil {
+			return &issuedToken{Token: token, ShortCode: code, ExpiresAt: exp}, nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != pgErrUniqueViolation {
+			return nil, err
+		}
 	}
-	return token, exp, nil
+	return nil, errors.New("绑定码签发失败：短码空间冲突")
+}
+
+// pgErrUniqueViolation 是 PostgreSQL 的 23505。
+const pgErrUniqueViolation = "23505"
+
+// ClaimToken 登记「某个平台账号想兑换这枚短码」，但不建立绑定。
+//
+// 判定条件里的最后一项是要害：已被 A 认领的码，B 再来认领会被拒绝（409），
+// 而不是把 claim 覆盖掉。否则攻击者只要在受害者点「确认」的瞬间抢一次认领，
+// 就能让那次点头落到自己头上 —— 确认框显示的身份与实际绑定的身份将不一致。
+// 同一个账号重复发同一个码则是幂等的，用户手抖发两次不该报错。
+func (r *Repo) ClaimToken(ctx context.Context, code, platform string, id Identity) (time.Time, error) {
+	var exp time.Time
+	err := r.pool.QueryRow(ctx, `
+		UPDATE binding_tokens
+		SET claimed_at = now(), claim_platform_user_id = $3,
+		    claim_username = $4, claim_name = $5
+		WHERE short_code = $1 AND platform = $2
+		  AND consumed_at IS NULL AND expires_at > now()
+		  AND (claimed_at IS NULL OR claim_platform_user_id = $3)
+		RETURNING expires_at`,
+		code, platform, id.UserID, nilIfEmpty(id.Username), nilIfEmpty(id.Name)).Scan(&exp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 码不存在、已过期、已核销，与「被别人占着」在这里合流。分开回答等于
+		// 告诉猜码的人「这个码是存在的」，而这条端点本来就是拿来猜的。
+		return time.Time{}, ErrCodeInvalid
+	}
+	return exp, err
+}
+
+// FindPendingClaim 取该用户当前那枚令牌上待确认的申请，没有就 ErrNoPendingClaim。
+func (r *Repo) FindPendingClaim(ctx context.Context, userID uuid.UUID, platform string) (*PendingClaim, error) {
+	var p PendingClaim
+	var username, name *string
+	err := r.pool.QueryRow(ctx, `
+		SELECT claim_platform_user_id, claim_username, claim_name, claimed_at, expires_at
+		FROM binding_tokens
+		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL
+		  AND expires_at > now() AND claimed_at IS NOT NULL
+		ORDER BY claimed_at DESC LIMIT 1`, userID, platform).
+		Scan(&p.PlatformUserID, &username, &name, &p.ClaimedAt, &p.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNoPendingClaim
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Platform = platform
+	p.Username, p.Name = deref(username), deref(name)
+	return &p, nil
+}
+
+// ConsumeClaimedToken 核销一枚「已被指定账号认领」的令牌，返回该账号身份。
+//
+// expectPlatformUserID 参与 WHERE 而不是事后比对：核销与比对必须是同一条语句，
+// 否则两者之间仍有空档。条件不满足时无从区分「没有待确认」与「待确认的不是这个」，
+// 统一回 ErrNoPendingClaim —— 两种情况用户的下一步动作相同（回 Bot 重发一次码）。
+func (r *Repo) ConsumeClaimedToken(
+	ctx context.Context, userID uuid.UUID, platform, expectPlatformUserID string,
+) (Identity, error) {
+	var username, name *string
+	err := r.pool.QueryRow(ctx, `
+		UPDATE binding_tokens SET consumed_at = now()
+		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL
+		  AND expires_at > now() AND claim_platform_user_id = $3
+		RETURNING claim_username, claim_name`,
+		userID, platform, expectPlatformUserID).Scan(&username, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Identity{}, ErrNoPendingClaim
+	}
+	if err != nil {
+		return Identity{}, err
+	}
+	return Identity{
+		Platform: platform,
+		UserID:   expectPlatformUserID,
+		Username: deref(username),
+		Name:     deref(name),
+	}, nil
+}
+
+// RejectClaim 用户拒绝了这次申请：整枚令牌作废（而不是只清 claim 字段）。
+// 码已经到过陌生人手里，留着它继续可兑换等于让对方再试一次。
+func (r *Repo) RejectClaim(ctx context.Context, userID uuid.UUID, platform string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE binding_tokens SET consumed_at = now()
+		WHERE user_id = $1 AND platform = $2 AND consumed_at IS NULL AND claimed_at IS NOT NULL`,
+		userID, platform)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNoPendingClaim
+	}
+	return nil
 }
 
 // ConsumeToken 原子地核销一枚未过期未使用的令牌，返回它代表的 Squyrrl 用户。

@@ -29,6 +29,9 @@ func NewHandler(svc *Service, fileSvc *file.Service) *Handler {
 
 func (h *Handler) RegisterUser(g *gin.RouterGroup) {
 	g.POST("/binding/link", h.issueLink)
+	g.GET("/binding/pending", h.pendingClaim)
+	g.POST("/binding/confirm", h.confirmClaim)
+	g.POST("/binding/reject", h.rejectClaim)
 	g.GET("/bindings", h.listBindings)
 	g.DELETE("/bindings/:id", h.unbind)
 }
@@ -47,6 +50,61 @@ func (h *Handler) issueLink(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, link)
+}
+
+// pendingClaim 被绑定面板每隔几秒轮询一次。「没有待确认」是最常见的结果，
+// 所以它是 200 + null 而不是 404 —— 404 会让客户端的错误拦截器（以及日志）
+// 把一条完全正常的轮询当成异常。
+func (h *Handler) pendingClaim(c *gin.Context) {
+	id := auth.MustIdentity(c)
+	p, err := h.svc.PendingBindingClaim(c.Request.Context(), id.UserID)
+	if err != nil {
+		if errors.Is(err, ErrNoPendingClaim) {
+			c.JSON(http.StatusOK, gin.H{"pending": nil})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"pending": p})
+}
+
+func (h *Handler) confirmClaim(c *gin.Context) {
+	id := auth.MustIdentity(c)
+	var in ConfirmClaimInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	b, err := h.svc.ConfirmBindingClaim(c.Request.Context(), id.UserID, in.PlatformUserID)
+	if err != nil {
+		if quota.WriteIfQuota(c, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, ErrNoPendingClaim):
+			c.JSON(http.StatusGone, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrAlreadyBound):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, b)
+}
+
+func (h *Handler) rejectClaim(c *gin.Context) {
+	id := auth.MustIdentity(c)
+	if err := h.svc.RejectBindingClaim(c.Request.Context(), id.UserID); err != nil {
+		if errors.Is(err, ErrNoPendingClaim) {
+			c.Status(http.StatusNoContent) // 已经没有待确认的了，用户要的结果已达成
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) listBindings(c *gin.Context) {
@@ -83,6 +141,7 @@ func (h *Handler) unbind(c *gin.Context) {
 
 func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 	g.POST("/binding/consume", h.consumeToken)
+	g.POST("/binding/claim", h.claimCode)
 	g.POST("/binding/revoke", h.revokeBinding)
 	g.GET("/binding/status", h.bindingStatus)
 	g.POST("/snippet", h.forwardSnippet)
@@ -117,6 +176,29 @@ func (h *Handler) consumeToken(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, b)
+}
+
+// claimCode 是短码路径的第一步。它**不建立绑定**，所以这里不会出现 402：
+// 档位门槛留到用户在 App 里点确认那一刻，那时才知道要往谁的账户上绑。
+func (h *Handler) claimCode(c *gin.Context) {
+	var in ClaimCodeInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	exp, err := h.svc.ClaimBindingCode(c.Request.Context(), in.Code, in.TGIdentity)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrTooManyAttempts):
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrCodeInvalid):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, ClaimCodeResponse{ExpiresAt: exp})
 }
 
 func (h *Handler) revokeBinding(c *gin.Context) {
