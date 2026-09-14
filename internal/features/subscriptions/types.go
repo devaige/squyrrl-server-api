@@ -13,16 +13,40 @@ var (
 	ErrBadSignature  = errors.New("webhook signature verification failed")
 	ErrUnknownEvent  = errors.New("webhook event type not handled")
 	ErrMalformedBody = errors.New("malformed webhook body")
+
+	// 以下四个是客户端上报内购凭证时的拒绝理由。分开命名而不是共用一个
+	// ErrBadSignature：这四种情况里凭证的**签名都是真的**，苹果确实签过它，
+	// 差别在于「它不是这个 App 的 / 不是这个环境的 / 不是你的」。
+	ErrAppleUnconfigured = errors.New("App Store 收单未配置")
+	ErrWrongApp          = errors.New("凭证不属于本应用")
+	ErrWrongEnvironment  = errors.New("凭证来自另一个购买环境")
+	ErrForeignReceipt    = errors.New("凭证不属于当前登录账号")
 )
 
-// Provider 区分三个支付渠道。落库到 subscriptions.payment_provider 字段。
+// Provider 区分支付渠道。落库到 subscriptions.payment_provider 字段。
+//
+// 这张表是客户端 payment_channel.dart 里 PaymentChannel 枚举的**服务端镜像**，
+// 两边必须同名同值：客户端按构建变体（area × market）决定走哪条通路，服务端按
+// 这个值决定用哪套验签去收单。两边分家的表现是一笔已完成的支付落不了库。
 type Provider string
 
 const (
 	ProviderStripe Provider = "stripe"
 	ProviderApple  Provider = "app_store"
 	ProviderGoogle Provider = "google_play"
+	ProviderHuawei Provider = "huawei_iap"
+	ProviderAlipay Provider = "alipay"
+	ProviderWechat Provider = "wechat_pay"
 )
+
+// knownProviders 只用于校验外部输入里的 provider 串。
+// 注意「已知」不等于「已接通」：后三家目前没有任何验签实现，收单入口会直接 501。
+var knownProviders = map[Provider]bool{
+	ProviderStripe: true, ProviderApple: true, ProviderGoogle: true,
+	ProviderHuawei: true, ProviderAlipay: true, ProviderWechat: true,
+}
+
+func KnownProvider(p Provider) bool { return knownProviders[p] }
 
 // SubscriptionEvent 是统一的内部事件结构，三家 webhook 各自映射到这里。
 // 这样 service 层只关心「该激活 / 该续期 / 该取消」三种语义，与具体 provider 解耦。

@@ -147,8 +147,22 @@ type Config struct {
 	StripePrices string `env:"SQUYRRL_STRIPE_PRICES"`
 	// CheckoutReturnBase 是结账完成/取消后跳回的站点前缀，例如 https://squyrrl.com。
 	CheckoutReturnBase string `env:"SQUYRRL_CHECKOUT_RETURN_BASE" envDefault:"https://squyrrl.com"`
-	AppleSharedSecret  string `env:"SQUYRRL_APPLE_SHARED_SECRET"`
-	GooglePubsubAud    string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"` // RTDN OIDC token 期望的 audience
+	// AppleBundleID / AppleEnvironment 是 App Store 收单的两道闸门，**两项缺一
+	// 不可，缺了整体不收单**（`POST /me/purchases/app-store` 返回 503，webhook
+	// 拒收）。理由见 subscriptions.AppleGuard：苹果的根证书能验证 App Store 上
+	// **任何一个 App** 的凭证，不比对 bundle 就等于谁的收据都认；Sandbox 的凭证
+	// 同样由苹果正常签发，但背后没有真实付款。
+	//
+	// 这里原本是 SQUYRRL_APPLE_SHARED_SECRET，配的是一段共享密钥 HMAC ——
+	// 而苹果从不发那个头，那条 webhook 实际上从未被验证过。已删除。
+	AppleBundleID    string `env:"SQUYRRL_APPLE_BUNDLE_ID"`
+	AppleEnvironment string `env:"SQUYRRL_APPLE_ENVIRONMENT" envDefault:"Production"`
+	// GooglePubsubAud RTDN OIDC token 期望的 audience；留空 ⇒ webhook 一律 401
+	GooglePubsubAud string `env:"SQUYRRL_GOOGLE_PUBSUB_AUD"`
+	// GooglePubsubEmail 是 Pub/Sub 订阅里配的推送服务账号邮箱。可选但强烈建议：
+	// 签 OIDC token 的是 Google 给所有人共用的那套密钥，不比对签发对象，
+	// 任何 Google 账号签出来的 token 都能通过验签。
+	GooglePubsubEmail string `env:"SQUYRRL_GOOGLE_PUBSUB_EMAIL"`
 }
 
 func Load() (*Config, error) {

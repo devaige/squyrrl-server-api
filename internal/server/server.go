@@ -229,8 +229,12 @@ func (s *Server) routes() {
 		s.subSvc,
 		s.checkoutSvc,
 		s.cfg.StripeWebhookSecret,
-		s.cfg.AppleSharedSecret,
-		s.cfg.GooglePubsubAud,
+		subscriptions.AppleGuard{
+			BundleID:    s.cfg.AppleBundleID,
+			Environment: s.cfg.AppleEnvironment,
+		},
+		subscriptions.NewGoogleOIDCVerifier(
+			s.cfg.GooglePubsubAud, s.cfg.GooglePubsubEmail, nil),
 	)
 	subHandler.Register(s.engine.Group("/webhooks"))
 	subHandler.RegisterUser(meGroup)

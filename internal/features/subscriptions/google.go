@@ -3,7 +3,6 @@ package subscriptions
 import (
 	"encoding/base64"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,39 +12,10 @@ import (
 // {"message": {"data": "<base64 of JSON>", ...}}
 // 内层 JSON 即 SubscriptionNotification 结构。
 //
-// 验签由 Cloud Pub/Sub 用 OIDC bearer token 在 Authorization 头上完成；
-// 我们检查这个 token 的 audience 是否匹配 SQUYRRL_GOOGLE_PUBSUB_AUD。
-// 完整 RSA 验签留作 Phase 2，目前先做 audience claim 校验。
-
-// VerifyGoogleOIDC 简化校验：解析 JWT payload（不验签）拿 aud 字段比对。
-// 注意：仅当部署在 GCP 内网 / 经由可信网关时安全；公网部署需补 Google JWKS RSA 校验。
-func VerifyGoogleOIDC(bearer, expectedAud string) error {
-	if expectedAud == "" {
-		return ErrBadSignature
-	}
-	parts := strings.Split(strings.TrimPrefix(bearer, "Bearer "), ".")
-	if len(parts) != 3 {
-		return ErrBadSignature
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ErrBadSignature
-	}
-	var claims struct {
-		Aud string `json:"aud"`
-		Exp int64  `json:"exp"`
-	}
-	if err := json.Unmarshal(raw, &claims); err != nil {
-		return ErrBadSignature
-	}
-	if claims.Aud != expectedAud {
-		return ErrBadSignature
-	}
-	if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
-		return ErrBadSignature
-	}
-	return nil
-}
+// 请求身份由 Pub/Sub 在 Authorization 头上的 OIDC token 证明，验签见
+// GoogleOIDCVerifier（jws.go）。此前那段只解 payload 比对 aud、**不验签名**
+// 的实现已删除：/webhooks/google 挂在公网根上、没有 Bearer 中间件，
+// 伪造一个 aud 对得上的 base64 串就能给任意用户开任意档位的订阅。
 
 // googlePushEnvelope Pub/Sub push 的外层结构
 type googlePushEnvelope struct {
@@ -110,8 +80,7 @@ func ParseGoogleRTDN(payload []byte) (*SubscriptionEvent, error) {
 
 	// subscriptionId 命名约定见 ParseProductID：'squyrrl_<kind>_<tier>_<period>'，
 	// 三段式（无 kind）向后兼容为 plan。
-	kind, tier, period, storageGB, err := ParseProductID(
-		rtdn.SubscriptionNotification.SubscriptionID, "_")
+	sku, err := ParseProductID(rtdn.SubscriptionNotification.SubscriptionID, "_")
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +93,7 @@ func ParseGoogleRTDN(payload []byte) (*SubscriptionEvent, error) {
 	now := time.UnixMilli(rtdn.EventTimeMillis)
 	// Google webhook 不直接给 period_end —— 简化用 +30 天 / +365 天
 	var end time.Time
-	switch period {
+	switch sku.Period {
 	case "yearly":
 		end = now.AddDate(1, 0, 0)
 	default:
@@ -135,10 +104,10 @@ func ParseGoogleRTDN(payload []byte) (*SubscriptionEvent, error) {
 		Provider:               ProviderGoogle,
 		ProviderSubscriptionID: rtdn.SubscriptionNotification.PurchaseToken,
 		UserID:                 uid,
-		Kind:                   kind,
-		Tier:                   tier,
-		BonusStorageGB:         storageGB,
-		BillingPeriod:          period,
+		Kind:                   sku.Kind,
+		Tier:                   sku.Tier,
+		BonusStorageGB:         sku.StorageGB,
+		BillingPeriod:          sku.Period,
 		Status:                 status,
 		PeriodStart:            now,
 		PeriodEnd:              end,
