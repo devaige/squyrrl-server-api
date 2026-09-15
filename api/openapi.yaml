@@ -1400,6 +1400,97 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /me/purchases/google-play:
+    post:
+      operationId: reportGooglePlayPurchase
+      tags: [Billing]
+      summary: 上报一笔已完成的 Google Play 内购
+      description: |
+        与 App Store 那条同向（用户付完了回来兑现），但**凭证的性质完全不同**。
+
+        StoreKit 2 交给客户端的是一张苹果签名过的 JWS：上面写着买了什么、买了几份、
+        属于谁，服务端拿内置根证书就能独立验完。Play 交给客户端的 `purchaseToken`
+        只是一串不透明句柄，自己不承载任何信息、也没有签名 —— 唯一能说明它代表什么的
+        地方是 Play Developer API。所以这条路上服务端必须出网回源，且「商店说查无此单」
+        与「我们暂时问不到商店」是两种必须分开处置的失败（见下面的 400 / 503）。
+
+        `product_id` 只决定**去查哪个接口**（`credits` 查一次性商品，其余查
+        `subscriptionsv2`），不决定买了什么：订阅的商品号以 API 返回的 `lineItems` 为准，
+        一次性商品的商品号是 API 路径的一部分，对不上直接 404。客户端谎报档位无效。
+
+        账号绑定靠 `obfuscatedAccountId`（Flutter 侧是 `PurchaseParam.applicationUserName`），
+        对应 Apple 的 `appAccountToken`，必须等于当前用户的 UUID。
+
+        **重复上报是正常的**：客户端在没能 consume / acknowledge 的情况下会重报，RTDN
+        也会重投。服务端幂等 —— 订阅按 `purchaseToken` upsert，代币按 `orderId` 去重。
+
+        客户端接入要点见 `docs/readme/14-iap.md` §4。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [purchase_token, product_id]
+              properties:
+                purchase_token:
+                  type: string
+                  description: |
+                    Play Billing 的 `Purchase.getPurchaseToken()`。在 Flutter 的
+                    `in_app_purchase` 里它是 `verificationData.serverVerificationData`
+                    （Android 侧该字段装的就是 purchaseToken，与 iOS 同名不同物）。
+                product_id:
+                  type: string
+                  description: |
+                    `squyrrl_<kind>_<tier>_<period>`，下划线分隔（Apple 用点号）。
+                    例：`squyrrl_plan_basic_monthly` / `squyrrl_credits_p5_once`。
+      responses:
+        '200':
+          description: |
+            已兑现。客户端可以了结这笔交易 —— 代币走 `consumePurchase`，
+            订阅走 `completePurchase`（acknowledge）。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '202':
+          description: |
+            认得这笔单，但此刻没有权益要发放 —— 待付款（`SUBSCRIPTION_STATE_PENDING`、
+            `purchaseState=2`，如巴西的 boleto）或已取消。客户端**不应**了结：
+            付成之后 Play 会再来一条通知，那时才该发货。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+        '400':
+          description: |
+            商店查无此单、商品号解不出、或来自许可测试名单（`purchaseType=0` /
+            `testPurchase`，那类购买不扣款）。**这类失败不会因为重试而改变**，
+            客户端应当了结掉这笔交易 —— 未消耗的商品会让用户再也买不了它。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            这笔购买绑定的是另一个 Squyrrl 账号（`obfuscatedAccountId` 对不上，或整个缺失）。
+            客户端**不应**了结：换回那个账号登录后它还要能兑现。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            未配置 Play 收单（`SQUYRRL_GOOGLE_PACKAGE_NAME` /
+            `SQUYRRL_GOOGLE_PLAY_SERVICE_ACCOUNT`），或此刻问不到 Play Developer API。
+            客户端**绝不能**了结这笔交易 —— 下次启动还要重报。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /me/export:
     get:
       operationId: exportMyData

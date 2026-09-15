@@ -21,6 +21,17 @@ var (
 	ErrWrongApp          = errors.New("凭证不属于本应用")
 	ErrWrongEnvironment  = errors.New("凭证来自另一个购买环境")
 	ErrForeignReceipt    = errors.New("凭证不属于当前登录账号")
+
+	// Google Play 侧多出来的两个。它们存在的理由是 Play 的凭证不自证：
+	// purchaseToken 只是个句柄，必须回源去问（见 play.go），于是「这笔单不成立」
+	// 和「我们这会儿问不到」成了两种完全不同的失败。
+	//
+	// 分开命名不是为了措辞好看 —— 客户端对它们的处置**相反**：前者要把这笔
+	// 交易了结掉（永远不会成立，留着只会占住这个商品），后者绝不能了结
+	// （下次启动还要重报）。混成一个错误，二选一都会出事。
+	ErrPlayUnconfigured = errors.New("Google Play 收单未配置")
+	ErrUnknownPurchase  = errors.New("商店里查无此单")
+	ErrStoreUnavailable = errors.New("商店暂时不可用")
 )
 
 // Provider 区分支付渠道。落库到 subscriptions.payment_provider 字段。

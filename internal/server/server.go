@@ -225,17 +225,29 @@ func (s *Server) routes() {
 
 	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）。
 	// 购买入口则相反 —— 它要知道是谁在买，挂在 /me 上。
-	subHandler := subscriptions.NewHandler(
-		s.subSvc,
-		s.checkoutSvc,
-		s.cfg.StripeWebhookSecret,
-		subscriptions.AppleGuard{
+	playGuard := subscriptions.PlayGuard{
+		PackageName: s.cfg.GooglePackageName,
+		AllowTest:   s.cfg.GooglePlayEnvironment == "Test",
+	}
+	// 凭据坏掉不阻断启动：Play 收单会 503，其它渠道照常。反过来（panic 退出）
+	// 意味着一个只影响 Android 购买的配置错误能让整个 API 起不来。
+	playAPI, err := subscriptions.NewPlayAPI(playGuard, s.cfg.GooglePlayServiceAccount)
+	if err != nil {
+		slog.Warn("Google Play 收单未启用", "err", err)
+	}
+	subHandler := subscriptions.NewHandler(subscriptions.Deps{
+		Service:      s.subSvc,
+		Checkout:     s.checkoutSvc,
+		StripeSecret: s.cfg.StripeWebhookSecret,
+		AppleGuard: subscriptions.AppleGuard{
 			BundleID:    s.cfg.AppleBundleID,
 			Environment: s.cfg.AppleEnvironment,
 		},
-		subscriptions.NewGoogleOIDCVerifier(
+		GoogleOIDC: subscriptions.NewGoogleOIDCVerifier(
 			s.cfg.GooglePubsubAud, s.cfg.GooglePubsubEmail, nil),
-	)
+		PlayGuard: playGuard,
+		PlayAPI:   playAPI,
+	})
 	subHandler.Register(s.engine.Group("/webhooks"))
 	subHandler.RegisterUser(meGroup)
 }

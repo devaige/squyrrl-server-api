@@ -163,6 +163,23 @@ type Config struct {
 	// 签 OIDC token 的是 Google 给所有人共用的那套密钥，不比对签发对象，
 	// 任何 Google 账号签出来的 token 都能通过验签。
 	GooglePubsubEmail string `env:"SQUYRRL_GOOGLE_PUBSUB_EMAIL"`
+	// GooglePackageName 是 Android 应用的包名，Play Developer API 路径的一部分。
+	// 留空 ⇒ Play 收单整体 503（`POST /me/purchases/google-play` 与
+	// `/webhooks/google` 都不工作）。
+	GooglePackageName string `env:"SQUYRRL_GOOGLE_PACKAGE_NAME"`
+	// GooglePlayServiceAccount 是有 androidpublisher 权限的服务账号凭据，
+	// **可以是 JSON 原文，也可以是一个文件路径**（见 subscriptions.NewPlayAPI）。
+	//
+	// Play 的 purchaseToken 不像苹果的 JWS 那样自证 —— 它只是个不透明句柄，
+	// 服务端必须拿这份凭据去 Play Developer API 回源，才知道它代表什么、属于谁。
+	// 所以这一项不是「可选的增强」，而是 Play 收单的前提。
+	//
+	// 它是真正的私钥：只进环境变量或挂载的文件，不进仓库、不进日志。
+	GooglePlayServiceAccount string `env:"SQUYRRL_GOOGLE_PLAY_SERVICE_ACCOUNT"`
+	// GooglePlayEnvironment 对应 AppleEnvironment：Production | Test。
+	// Test 放行 Play Console「许可测试」名单里的免费购买 —— 那个名单能随时加人，
+	// 生产环境放行它等于开了一条免费领权益的口子。
+	GooglePlayEnvironment string `env:"SQUYRRL_GOOGLE_PLAY_ENVIRONMENT" envDefault:"Production"`
 }
 
 func Load() (*Config, error) {
