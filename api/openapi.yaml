@@ -1327,6 +1327,79 @@ paths:
                     价目表里多一个未上架的键不构成一条能买到未定义商品的通路。
                 period: { type: string, enum: [monthly, yearly, once] }
 
+  /me/purchases/app-store:
+    post:
+      operationId: reportAppStorePurchase
+      tags: [Billing]
+      summary: 上报一笔已完成的 App Store 内购
+      description: |
+        与 `/me/checkout` 方向相反：结账是「把用户送去付款」，上报是「用户在别处付完了
+        回来兑现」。原生内购只能是后者 —— 支付在 StoreKit 里闭环完成，服务端事后才从
+        一张凭证上知道发生过什么。
+
+        **只收 JWS**，不收 productId / 数量 / 金额：这些苹果都签在凭证里了，客户端另报
+        一份只会制造两个信息源，而其中一个是攻击者能改的那个。
+
+        验签之后还有三道 fail-closed 闸门：`bundleId`（苹果的根证书能验证 App Store 上
+        任何一个 App 的凭证）、`environment`（Sandbox 凭证由苹果正常签发，只是没付钱）、
+        `appAccountToken` 必须等于当前登录用户（苹果不知道 Squyrrl 有账号这回事，
+        这是两套身份之间唯一的绑定点）。
+
+        **重复上报是正常的**：客户端重启会把还没 `completePurchase` 的交易重报一遍。
+        服务端幂等 —— 订阅按 `originalTransactionId` upsert，代币按 `transactionId` 去重。
+
+        客户端接入要点见 `docs/readme/14-iap.md` §4。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signed_transaction]
+              properties:
+                signed_transaction:
+                  type: string
+                  description: |
+                    StoreKit 2 的 `VerificationResult.jwsRepresentation`。在 Flutter 的
+                    `in_app_purchase` 里它是 `verificationData.serverVerificationData`
+                    —— **不是** `localVerificationData`（那是同一笔交易未签名的 JSON）。
+      responses:
+        '200':
+          description: |
+            已兑现，或识别为「已知但无需发放」的事件（例如已退款的消耗品）。
+            两种情况都表示客户端可以 `completePurchase`。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  ignored:
+                    type: boolean
+                    description: 认得这个事件，但没有权益要发放
+        '400':
+          description: |
+            凭证不合法、不属于本应用、或来自另一个购买环境。**这类失败不会因为重试而改变**，
+            客户端应当 `completePurchase` 把它清掉 —— 留着会让这个商品再也买不了。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            凭证属于另一个 Squyrrl 账号（`appAccountToken` 对不上，或整个缺失）。
+            客户端**不应** `completePurchase`：换回那个账号登录后它还要能兑现。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            未配置 App Store 收单（`SQUYRRL_APPLE_BUNDLE_ID` / `SQUYRRL_APPLE_ENVIRONMENT`
+            缺一即整体不收单）。fail-closed：没有「退化成不检查」的暗路。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /me/export:
     get:
       operationId: exportMyData
