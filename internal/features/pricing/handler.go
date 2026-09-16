@@ -57,11 +57,37 @@ type StorageTier struct {
 	GB int `json:"gb"`
 	// PriceCentsMonthly 月付价（美分）。单位与 entitlement.Tier 一致，理由同上。
 	PriceCentsMonthly int `json:"price_cents_monthly"`
+
+	// NativeOnly 表示这一档**只在商店内购里上架**，站外结账不卖。
+	//
+	// 不是商业偏好，是算术：Stripe 每笔收 2.9% + $0.30 的**固定**费，而固定
+	// 那部分不随金额缩小。10 GB 档卖 $0.29，扣完手续费到手是负数 —— 卖一份
+	// 亏一份；20 GB 档到手 $0.176，不够付 $0.30 的存储成本。商店按比例抽成，
+	// 没有固定项，所以同样两档在内购通路上分别是 135% 和 114% 的保本占用率。
+	//
+	// 表达成「哪一档不卖」而不是「Stripe 上另一套价格」：同一容量两个价钱，
+	// 用户在网页和 App 里看到的数字对不上，那是要写一整段解释的东西。
+	// 判据锁在 [TestStripeEligibleTiersBreakEven]。
+	NativeOnly bool `json:"native_only,omitempty"`
 }
 
 type CreditPack struct {
-	PriceUSD int   `json:"price_usd"`
-	Credits  int64 `json:"credits"`
+	// PriceUSD 是**面值档**，只用来生成商品键（`p1` / `p5`）和标注这一档「值多少钱」。
+	// 它不是收款额 —— 见 [PriceCents]。
+	PriceUSD int `json:"price_usd"`
+
+	// PriceCents 实收价（美分）。
+	//
+	// 与面值差 1 分是被商店的价格点逼出来的：App Store 的消耗型和订阅共用一套
+	// 价格点，而那套点位没有整数美元，$1 只能落到 $0.99。跨渠道同价（2026-09-16
+	// 用户决策）意味着 Stripe 也跟着收 $0.99，否则网页和 App 里同一个包两个价。
+	//
+	// 少收的那 1 分**不影响发放量**：到账代币由 [CreditsForPackKey] 查表决定，
+	// 与商店收了多少钱无关。代价是每档让出约 1% 的毛利，在 $1 档上把 2.0 倍的
+	// 加价压到约 1.32 倍（站外还要再扣 $0.30 固定费）—— 最小档本来就是引流档。
+	PriceCents int `json:"price_cents"`
+
+	Credits int64 `json:"credits"`
 }
 
 type FileSizeTier struct {
@@ -118,12 +144,11 @@ func GraceFor(billingPeriod string) time.Duration {
 // 大档卖的就不再是空间，而是「用户不会把买到的空间用完」这个赌注 ——
 // 而那个赌注需要一个占用率中位数来支撑，那个数字没有任何权威公开来源。
 //
-// **最小档是 40 GB，这是被 App Store 的最低价格点 $0.99 决定的**，不是选出来的：
-// 低于它的容量只能同样收 $0.99，那等于让小用户按 4 倍单价付钱。反过来 $0.99
-// 按上面那条线能覆盖到 46 GB，所以 40 GB 是这个价位上最接近的 ×2 档位。
-// （Google Play 没有这条下限，但两边同价省掉一整类跨渠道差异。）
+// **最小档是 10 GB。** App Store 的最低价格点是 $0.29 而不是 $0.99（2026-09-16
+// 更正：控制台默认只展示常用价位，全表里还有更低的）。$0.29 在保本线上覆盖
+// 13 GB，所以 10 GB 是能建出来的最小 ×2 档位。
 //
-// 单价因此不是一个常数（$0.0248 → $0.0215）：价格点只有 .99 这一种粒度，
+// 单价因此不是一个常数（$0.029 → $0.0215）：价格点只有 .99 / .49 / .29 这种粒度，
 // 贴着地板向上取整，容量越大取整损失的占比越小。方向是对的 —— 大档更便宜。
 //
 // 档位序列是严格 ×2（2026-09-16），显示除数也跟着回到 1024，
@@ -131,14 +156,15 @@ func GraceFor(billingPeriod string) time.Duration {
 // 订阅的续期事件变成未知档位），这次可以改只因为**还没有任何渠道上架过存储
 // 商品** —— 上架第一个就关窗。
 //
-// $0.99 的起步价顺带解决了站外渠道：Stripe 每笔 $0.30 的固定费在 $0.99 上占 30%，
-// 最小档在那条通路上的保本点是 110% —— 仍然成立。更小的档位（$0.29 / $0.49）
-// 曾经是亏的，而它们已经被 App Store 的价格点下限挡在门外了。
+// **最小的两档只在内购上卖**（[StorageTier.NativeOnly]）。这是本表唯一一处
+// 跨渠道差异，理由是 Stripe 的固定手续费在小额上吃掉全部毛利，推导见那个字段。
 //
 // ⚠️ 真正没有余量的是**各区价格表**：Apple 不按汇率等值换算，同一个价格点在
 // 低价区的美元等值可能只有七八成。这张表按美国区刚好 100% 保本，
 // 那些区就在 100% 以下。真要留余量，第一个该加的地方在这里，不是大档。
 var storageTiers = []StorageTier{
+	{GB: 10, PriceCentsMonthly: 29, NativeOnly: true},
+	{GB: 20, PriceCentsMonthly: 49, NativeOnly: true},
 	{GB: 40, PriceCentsMonthly: 99},
 	{GB: 80, PriceCentsMonthly: 199},
 	{GB: 160, PriceCentsMonthly: 399},
@@ -171,6 +197,21 @@ func StorageGBForKey(key string) (int, bool) {
 	return 0, false
 }
 
+// StorageTierByKey 由商品标识反查整档，供调用方自己判断通路限制
+// （[StorageTier.NativeOnly]）。
+//
+// 与 [StorageGBForKey] 并存而不是取而代之：原生内购那条路认全部档位，
+// 站外结账要多问一句「这档卖不卖」。把选择权交给调用方，而不是在这里塞一个
+// 通路参数 —— 那样每加一条通路就要改这个函数的签名和每一个调用点。
+func StorageTierByKey(key string) (StorageTier, bool) {
+	for _, t := range storageTiers {
+		if StorageTierKey(t.GB) == key {
+			return t, true
+		}
+	}
+	return StorageTier{}, false
+}
+
 // CreditPackKey 是代币加购在支付渠道里的商品标识后缀：$5 档 → "p5"。
 // 与存储同样用面值当键，理由相同：面值是三方都直接认得的东西。
 func CreditPackKey(usd int) string { return fmt.Sprintf("p%d", usd) }
@@ -193,13 +234,16 @@ func CreditsForPackKey(key string) (int64, bool) {
 // 用户看到 $3 送 5%、$5 送 10%，不用算就知道再往上一档还会更划算。
 // 客户端不另发「赠额」字段，它 = Credits − PriceUSD × CreditsPerUSD，
 // 两边各算各的就会在改价那天分家。
+//
+// **面值与实收价差 1 分**：商店的价格点没有整数美元，$1 只能落到 $0.99，
+// 而跨渠道同价要求 Stripe 跟着收同样的数。赠额仍按面值算，理由见 [CreditPack.PriceCents]。
 var creditPacks = []CreditPack{
-	{PriceUSD: 1, Credits: 10_000},   // 面值，无赠额
-	{PriceUSD: 3, Credits: 31_500},   // +5%
-	{PriceUSD: 5, Credits: 55_000},   // +10%
-	{PriceUSD: 10, Credits: 115_000}, // +15%
-	{PriceUSD: 20, Credits: 240_000}, // +20%
-	{PriceUSD: 50, Credits: 625_000}, // +25%
+	{PriceUSD: 1, PriceCents: 99, Credits: 10_000},     // 面值，无赠额
+	{PriceUSD: 3, PriceCents: 299, Credits: 31_500},    // +5%
+	{PriceUSD: 5, PriceCents: 499, Credits: 55_000},    // +10%
+	{PriceUSD: 10, PriceCents: 999, Credits: 115_000},  // +15%
+	{PriceUSD: 20, PriceCents: 1999, Credits: 240_000}, // +20%
+	{PriceUSD: 50, PriceCents: 4999, Credits: 625_000}, // +25%
 }
 
 // fileSizeTiers 单文件上限。
@@ -209,9 +253,13 @@ var creditPacks = []CreditPack{
 // 与 Cloudflare 按账户 plan 计的请求体上限之间，不能随意调大。
 // 50 GB 留了 36% 余量，**不要把这个数字往 78 GB 附近抬**。
 // 阈值必须落在 storageTiers 真实存在的档位上，否则某一档的买家会够不到他
-// 刚买下的那级上限。三个数跟着 2026-09-16 的新序列一起挪：40（最小档就给
-// 2 GB，否则入门档传不了一个视频）、160、1280。
+// 刚买下的那级上限。
+//
+// **最低那条必须跟着最小档走**：10 GB / 20 GB 补回来之后若最低阈值还停在 40，
+// `MaxFileBytesFor` 对这两档返回 0，而 0 的语义是「没买存储，不许上传」——
+// 表现是用户刚买完存储、一个文件也传不了，且错误信息说的是「请先购买存储」。
 var fileSizeTiers = []FileSizeTier{
+	{MinQuotaGB: 10, MaxFileBytes: 1 << 30},   // 1 GB，入门两档
 	{MinQuotaGB: 40, MaxFileBytes: 2 << 30},   // 2 GB
 	{MinQuotaGB: 160, MaxFileBytes: 10 << 30}, // 10 GB
 	{MinQuotaGB: 1280, MaxFileBytes: 50 << 30},

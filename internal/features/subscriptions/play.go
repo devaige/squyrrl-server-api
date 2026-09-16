@@ -277,6 +277,15 @@ type PlaySubscription struct {
 	StartTime            string `json:"startTime"`
 	LatestOrderID        string `json:"latestOrderId"`
 	AcknowledgementState string `json:"acknowledgementState"`
+
+	// LinkedPurchaseToken 是被这笔购买**取代掉**的那条订阅的 token（升降档、
+	// 重新订阅时出现）。Play 不会为被取代的那条单独推一条过期通知 ——
+	// 这个字段就是它唯一的死亡证明，不读它那条订阅会永远停在 active。
+	//
+	// 这在客户端接入换档替换流程之后才真正致命：在那之前用户换档会开出第二条
+	// 并行订阅（两笔都扣钱），两条都 active 至少和账单对得上；之后是一笔钱、
+	// 两份配额。
+	LinkedPurchaseToken string `json:"linkedPurchaseToken"`
 	// TestPurchase 只要存在就说明这是许可测试单（结构体内容我们不关心）。
 	TestPurchase               *struct{}               `json:"testPurchase"`
 	ExternalAccountIdentifiers *PlayExternalAccountIDs `json:"externalAccountIdentifiers"`

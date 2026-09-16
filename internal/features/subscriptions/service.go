@@ -58,6 +58,18 @@ func (s *Service) Apply(ctx context.Context, e *SubscriptionEvent) error {
 		return err
 	}
 
+	// 换档换了 token 的，让被换掉的那条退场。
+	//
+	// 放在 Upsert **之后**：顺序反过来的话，一次 Upsert 失败会留下一个既没了
+	// 旧订阅、也没有新订阅的用户 —— 而这一步只是记账，Upsert 才是发货。
+	// 与下面的 SupersedeActivePlan 不同，这条对 storage 同样生效，
+	// 而且必须如此：plan 有唯一约束兜底，storage 的配额是 SUM，没有任何兜底。
+	if e.SupersedesProviderID != "" && e.SupersedesProviderID != e.ProviderSubscriptionID {
+		if err := s.repo.ExpireByProviderID(ctx, e.UserID, e.Provider, e.SupersedesProviderID); err != nil {
+			return err
+		}
+	}
+
 	// active plan 取代之前的：同用户同时只能有一条，见 uq_subscriptions_one_active_plan
 	if e.Kind == "plan" && e.Status == "active" {
 		if err := s.repo.SupersedeActivePlan(ctx, e.UserID, id); err != nil {

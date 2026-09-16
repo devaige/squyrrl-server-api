@@ -182,14 +182,54 @@ func TestStackingIsNeverCheaperThanASingleTier(t *testing.T) {
 	// 不影响谁更便宜。
 	const stripeFixedFeeCents = 30
 
-	for _, target := range storageTiers {
-		// 用最便宜的单位价档位去凑 target.GB
-		best := storageTiers[0]
-		n := (target.GB + best.GB - 1) / best.GB
-		stacked := n*best.PriceCentsMonthly + (n-1)*stripeFixedFeeCents
-		if stacked < target.PriceCentsMonthly {
-			t.Errorf("%d GB 单档 %d 分，用 %d 份 %d GB 叠加只要 %d 分（含手续费）",
-				target.GB, target.PriceCentsMonthly, n, best.GB, stacked)
+	// 只在**站外可售**的档位之间检查：叠加需要重复购买，而那在两家原生商店上
+	// 根本做不到，所以唯一真能拆的通路是 Stripe，而 Stripe 不卖 NativeOnly 那两档。
+	var sold []StorageTier
+	for _, t := range storageTiers {
+		if !t.NativeOnly {
+			sold = append(sold, t)
+		}
+	}
+
+	// 逐对枚举而不是只拿第一档当「最便宜的单位」：单价随容量递减之后，
+	// 第一档恰好是**最贵**的单位，拿它当基准这条测试就永远通过、什么也没测。
+	for _, target := range sold {
+		for _, unit := range sold {
+			if unit.GB >= target.GB {
+				continue // 凑不出「更小的积木」，n=1 时比的是两个单档的价格
+			}
+			n := (target.GB + unit.GB - 1) / unit.GB
+			stacked := n*unit.PriceCentsMonthly + (n-1)*stripeFixedFeeCents
+			if stacked < target.PriceCentsMonthly {
+				t.Errorf("%d GB 单档 %d 分，用 %d 份 %d GB 叠加只要 %d 分（含手续费）",
+					target.GB, target.PriceCentsMonthly, n, unit.GB, stacked)
+			}
+		}
+	}
+}
+
+// 站外可售的每一档，扣掉 Stripe 的 **2.9% + $0.30** 之后仍要覆盖满配额成本。
+//
+// 这条测试是 [StorageTier.NativeOnly] 存在的全部理由，也是它的判据：固定那
+// $0.30 不随金额缩小，所以小额档在站外的净额会塌掉 —— 10 GB 卖 $0.29 时净额
+// 直接是**负数**，卖一份亏一份。断言写成「不满足就必须标 NativeOnly」而不是
+// 「这两档必须标」：将来调价让某一档掉到线下时，红的是这条测试而不是财务报表。
+func TestStripeEligibleTiersBreakEven(t *testing.T) {
+	const r2CentsPerGBMonth = 1.5
+	const stripeRate = 0.029
+	const stripeFixedFeeCents = 30.0
+
+	for _, tier := range storageTiers {
+		net := float64(tier.PriceCentsMonthly)*(1-stripeRate) - stripeFixedFeeCents
+		cost := float64(tier.GB) * r2CentsPerGBMonth
+		ok := net >= cost
+		if !ok && !tier.NativeOnly {
+			t.Errorf("%d GB：站外净额 %.1f 分 < 满配额成本 %.1f 分，"+
+				"这一档要么涨价要么标 NativeOnly", tier.GB, net, cost)
+		}
+		if ok && tier.NativeOnly {
+			t.Errorf("%d GB 站外净额 %.1f 分已覆盖成本 %.1f 分，"+
+				"不必再限制成仅内购", tier.GB, net, cost)
 		}
 	}
 }
@@ -200,8 +240,11 @@ func TestMaxFileBytesFor(t *testing.T) {
 		quotaGB int
 		want    int64
 	}{
-		{0, 0},  // 未购买存储：不允许上传
-		{39, 0}, // 不足最低档
+		{0, 0}, // 未购买存储：不允许上传
+		{9, 0}, // 不足最低档
+		{10, 1 * gb},
+		{20, 1 * gb},
+		{39, 1 * gb},
 		{40, 2 * gb},
 		{80, 2 * gb},
 		{160, 10 * gb},
@@ -235,9 +278,10 @@ func TestCreditPacksNeverGetWorse(t *testing.T) {
 		if hi.PriceUSD <= lo.PriceUSD {
 			t.Fatalf("加购档位未按价格升序")
 		}
-		// lo.Credits/lo.Price <= hi.Credits/hi.Price
-		if lo.Credits*int64(hi.PriceUSD) > hi.Credits*int64(lo.PriceUSD) {
-			t.Errorf("$%d 档每美元换到的代币少于 $%d 档", hi.PriceUSD, lo.PriceUSD)
+		// 按**实收价**比而不是面值：面值只是档位的名字，用户掏的是 PriceCents。
+		// 若某天两者的差不再是统一的 1 分，按面值比会漏掉真正的倒挂。
+		if lo.Credits*int64(hi.PriceCents) > hi.Credits*int64(lo.PriceCents) {
+			t.Errorf("$%d 档每分钱换到的代币少于 $%d 档", hi.PriceUSD, lo.PriceUSD)
 		}
 	}
 	// 最小档必须严格等于面值，否则汇率就不是 $1 = 10000 了
@@ -277,7 +321,7 @@ func TestSellableSKUCountMatchesConsole(t *testing.T) {
 
 	// plan 卖月付与年付两种周期；storage 只有月付；credits 是一次性。
 	got := paidPlans*2 + len(storageTiers) + len(creditPacks)
-	const want = 23
+	const want = 25
 	if got != want {
 		t.Fatalf("可售商品 %d 个，登记的是 %d 个 —— docs/readme/14-iap.md 附录 A 要跟着改", got, want)
 	}

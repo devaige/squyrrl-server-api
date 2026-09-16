@@ -244,9 +244,14 @@ type StorageStatus struct {
 
 // Storage 汇总用户的存储配额与实际占用。
 //
-// 配额来自所有 active 的 storage 订阅之和 —— 它们可以叠加（ADR-075），
-// 所以这里是 SUM 而不是取最新一条。plan **不贡献任何配额**：三块商品互相独立，
-// 免费档和至尊版自带的存储都是 0。
+// 配额来自所有 active 的 storage 订阅之和。SUM 而不是取最新一条：站外结账
+// （Stripe）确实可以持有多份，`bonus_storage_gb` 也走同一条路。两条原生通路
+// 上不会出现多行 —— App Store 靠订阅群组互斥，Play 靠客户端的换档替换流程
+// 加服务端对 `linkedPurchaseToken` 的处理（subscriptions.ExpireByProviderID）。
+//
+// ⚠️ 这个 SUM 只看 status，不看 current_period_end，所以一条该退场却没退场的
+// active 行是**永久**多给，不会自愈。这就是上面那条链路必须闭合的原因。
+// plan **不贡献任何配额**：三块商品互相独立，免费档和至尊版自带的存储都是 0。
 //
 // 占用按「每个引用者全额计」口径（ADR-075 用户决策）：
 // DISTINCT 在用户内部去重（同一用户的多条碎片引用同一文件只算一次），
@@ -269,8 +274,8 @@ func (s *Service) Storage(ctx context.Context, userID uuid.UUID) (StorageStatus,
 	// 这一侧的后果比 plan 轻 —— 配额掉零只是传不了新文件，已传的字节不会消失 ——
 	// 但两处用不同的判据会制造一种没人能解释的中间态：订阅还在服务，
 	// 而同一次扣款失败已经让存储停摆。
-	// 存储只提供年付（ADR-075），所以这里事实上恒取年付窗口；仍写成 CASE 是为了
-	// 让「万一以后开了月付存储」不会静默套用一个更长的窗口。
+	// 存储只提供月付（2026-09-16），所以这里事实上恒取月付窗口（7 天）；
+	// 仍写成 CASE 是为了让「万一以后开了年付存储」不会静默套用一个更短的窗口。
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(bonus_storage_gb), 0)::bigint * 1024 * 1024 * 1024
 		FROM subscriptions

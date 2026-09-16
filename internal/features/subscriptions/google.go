@@ -233,6 +233,8 @@ func googleSubscription(
 		// 读 current_period_end，编出来的 start 不会有人用，却会有人信。
 		PeriodStart: start,
 		PeriodEnd:   end,
+		// 升降档换 token 时，被换掉的那条只能从这里得知。
+		SupersedesProviderID: sub.LinkedPurchaseToken,
 	}
 	if sub.SubscriptionState == "SUBSCRIPTION_STATE_CANCELED" {
 		// 这是我们**观察到**取消的时间，不是用户点取消的时间 ——

@@ -243,3 +243,44 @@ func TestGooglePurchaseStatusMapping(t *testing.T) {
 		}
 	}
 }
+
+// 换档换 token：被换掉的那条只能从 linkedPurchaseToken 得知。
+//
+// Play **不会**为被取代的订阅单独推一条过期通知，所以漏读这个字段的后果不是
+// 少给而是多给 —— 存储配额是所有 active 行的 SUM，旧行留着就是一笔钱两份空间，
+// 而且那个 SUM 只看 status、不看周期末尾，不会自愈。
+func TestGoogleSubscriptionCarriesLinkedPurchaseToken(t *testing.T) {
+	const oldToken = "old-purchase-token"
+	api, _, _ := newStubPlay(t, serve(subJSON(t, map[string]any{
+		"linkedPurchaseToken": oldToken,
+	})))
+	n, err := ParseGoogleRTDN(rtdn(t, map[string]any{
+		"subscriptionNotification": map[string]any{
+			"notificationType": 4, // PURCHASED
+			"purchaseToken":    playToken,
+			"subscriptionId":   "squyrrl_storage_s320_monthly",
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evt, err := GoogleEventFromNotification(context.Background(), api, playGuardProd, n, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evt.Subscription.SupersedesProviderID != oldToken {
+		t.Errorf("SupersedesProviderID = %q，想要 %q",
+			evt.Subscription.SupersedesProviderID, oldToken)
+	}
+	// 没有这个字段时必须是空串，而不是拿新 token 顶上 —— 那会让每一笔正常
+	// 续期都去「让自己退场」。
+	api2, _, _ := newStubPlay(t, serve(subJSON(t, nil)))
+	evt2, err := GoogleEventFromNotification(context.Background(), api2, playGuardProd, n, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evt2.Subscription.SupersedesProviderID != "" {
+		t.Errorf("没有 linkedPurchaseToken 时应为空，得到 %q",
+			evt2.Subscription.SupersedesProviderID)
+	}
+}

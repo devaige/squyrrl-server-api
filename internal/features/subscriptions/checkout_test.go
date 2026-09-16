@@ -97,3 +97,28 @@ func TestSKUKeysMatchCatalog(t *testing.T) {
 		t.Error("未上架的代币档位不该查得到")
 	}
 }
+
+// 仅内购的档位：原生通路照常解析，站外结账那道闸门读的是 NativeOnly。
+//
+// 两侧分开断言是有意的 —— 把 s10 从 ParseProductID 里一并拒掉是个看着更简单、
+// 实则丢钱的做法：用户在 App Store 里买到的那笔真实付款会解不出档位，
+// webhook 判 ErrUnknownTier 丢弃，钱收了、配额没发。「谁不卖」和「谁不认」
+// 是两件事。
+func TestNativeOnlyTiersParseButAreNotSoldOffStore(t *testing.T) {
+	for _, key := range []string{"s10", "s20"} {
+		tier, ok := pricing.StorageTierByKey(key)
+		if !ok {
+			t.Fatalf("%s 应当是上架档位", key)
+		}
+		if !tier.NativeOnly {
+			t.Errorf("%s 应标记为仅内购（站外卖它是亏的）", key)
+		}
+		// 原生通路必须认得它，否则 App Store 上的真实付款会解不出档位。
+		if _, err := ParseProductID("squyrrl.storage."+key+".monthly", "."); err != nil {
+			t.Errorf("原生商品号 %s 应当解析得出：%v", key, err)
+		}
+	}
+	if tier, ok := pricing.StorageTierByKey("s40"); !ok || tier.NativeOnly {
+		t.Error("s40 起在站外正常可售，不该被限制成仅内购")
+	}
+}

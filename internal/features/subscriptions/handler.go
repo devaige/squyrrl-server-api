@@ -81,12 +81,19 @@ func (h *Handler) checkout(c *gin.Context) {
 			return
 		}
 	case "storage":
-		gb, ok := pricing.StorageGBForKey(in.Tier)
+		t, ok := pricing.StorageTierByKey(in.Tier)
 		if !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "未知存储档位"})
 			return
 		}
-		storageGB = gb
+		// 这条路只通向 Stripe。最小两档在站外是亏本卖（固定手续费吃掉全部毛利，
+		// 推导见 pricing.StorageTier.NativeOnly），客户端已经不展示它们 ——
+		// 但商品页不是唯一入口，这个接口本身就是公开的。
+		if t.NativeOnly {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "该存储档位仅在 App 内购买"})
+			return
+		}
+		storageGB = t.GB
 	case "credits":
 		n, ok := pricing.CreditsForPackKey(in.Tier)
 		if !ok {

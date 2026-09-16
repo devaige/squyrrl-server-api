@@ -73,6 +73,11 @@ type SubscriptionEvent struct {
 	PeriodEnd              time.Time
 	CanceledAt             *time.Time
 	BonusStorageGB         *int // storage 类型时填入
+
+	// SupersedesProviderID 是被这笔购买取代掉的上一条订阅在渠道侧的 ID。
+	// 目前只有 Google 会填（`linkedPurchaseToken`）。空串表示「没有取代任何人」，
+	// 而不是「不知道」—— 两者在这里没有区别：都不该动别的行。
+	SupersedesProviderID string
 }
 
 // OneTimePurchase 是一次性支付（代币加购）的内部事件。

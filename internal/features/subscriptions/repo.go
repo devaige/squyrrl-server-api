@@ -64,6 +64,30 @@ func (r *Repo) Upsert(ctx context.Context, e *SubscriptionEvent) (uuid.UUID, err
 	return id, err
 }
 
+// ExpireByProviderID 把渠道侧的某一条订阅标为 expired。
+//
+// 供 Play 的 `linkedPurchaseToken` 用：换档会换一个新 purchaseToken，而被换掉的
+// 那条**不会另外收到过期通知**。不标它的后果不是少给而是多给 —— 存储配额是
+// 所有 active 行的 SUM，旧行留在那里等于用户付一份钱拿两份空间，
+// 且不会自愈（那个 SUM 只看 status，不看 current_period_end）。
+//
+// 限定同一 provider 与同一 user：purchaseToken 只在 Google 的命名空间里唯一，
+// 而「取代」永远发生在同一个账号内部。跨出这两条的匹配一律是错的。
+func (r *Repo) ExpireByProviderID(ctx context.Context, userID uuid.UUID, provider Provider, providerID string) error {
+	if providerID == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = 'expired', updated_at = now()
+		WHERE user_id = $1
+		  AND provider = $2
+		  AND provider_subscription_id = $3
+		  AND status <> 'expired'`,
+		userID, string(provider), providerID)
+	return err
+}
+
 // SupersedeActivePlan 把同用户下其它 active plan 标为 expired，给新 plan 让路。
 // 在跨等级升降级场景下避免触发 uq_subscriptions_one_active_plan 唯一冲突。
 func (r *Repo) SupersedeActivePlan(ctx context.Context, userID uuid.UUID, keepID uuid.UUID) error {
