@@ -11,7 +11,7 @@ import (
 )
 
 func TestPriceBook(t *testing.T) {
-	pb, err := NewPriceBook(`{"plan:basic:monthly":"price_a","storage:s50:yearly":"price_b"}`)
+	pb, err := NewPriceBook(`{"plan:basic:monthly":"price_a","storage:s40:monthly":"price_b"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,11 +72,16 @@ func TestCheckoutRejectsUnknownSKU(t *testing.T) {
 // 商品标识与 pricing 的目录必须对得上 —— 两边各写一套键，
 // 表现是「后台配了价格但服务端说商品不存在」。
 func TestSKUKeysMatchCatalog(t *testing.T) {
-	if got := pricing.StorageTierKey(50); got != "s50" {
-		t.Errorf("存储档位键应为 s50，实际 %s", got)
+	if got := pricing.StorageTierKey(40); got != "s40" {
+		t.Errorf("存储档位键应为 s40，实际 %s", got)
 	}
-	if gb, ok := pricing.StorageGBForKey("s50"); !ok || gb != 50 {
-		t.Errorf("s50 应反查出 50 GB，得到 %d %v", gb, ok)
+	if gb, ok := pricing.StorageGBForKey("s40"); !ok || gb != 40 {
+		t.Errorf("s40 应反查出 40 GB，得到 %d %v", gb, ok)
+	}
+	// 旧序列的档位必须查不到：2026-09-16 换成 ×2 序列后 s50 不再存在，
+	// 而「认得一个已经不卖的档位」等于允许它继续被兑现。
+	if _, ok := pricing.StorageGBForKey("s50"); ok {
+		t.Error("已下架的 s50 不该还查得到")
 	}
 	if got := pricing.CreditPackKey(5); got != "p5" {
 		t.Errorf("代币档位键应为 p5，实际 %s", got)

@@ -118,7 +118,7 @@ func TestAppleEventStorageCarriesQuota(t *testing.T) {
 	sign := appleFixture(t)
 	now := time.Now()
 	txn, err := VerifyAppleTransaction(
-		sign(map[string]any{"productId": "squyrrl.storage.s1000.yearly"}), now)
+		sign(map[string]any{"productId": "squyrrl.storage.s1280.monthly"}), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +126,8 @@ func TestAppleEventStorageCarriesQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if evt.Subscription.BonusStorageGB == nil || *evt.Subscription.BonusStorageGB != 1000 {
-		t.Fatalf("容量应为 1000，实际 %v", evt.Subscription.BonusStorageGB)
+	if evt.Subscription.BonusStorageGB == nil || *evt.Subscription.BonusStorageGB != 1280 {
+		t.Fatalf("容量应为 1280，实际 %v", evt.Subscription.BonusStorageGB)
 	}
 }
 

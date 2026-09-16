@@ -124,16 +124,49 @@ func TestRateConstantsAreConsistent(t *testing.T) {
 // 严格线性 $0.30/GB·年，但断言仍写成「不上升」而不是「相等」：未来给大档让点
 // 利是合理的商业动作，而反过来 —— 某个大档单价更高、拆成小档叠加反而便宜 ——
 // 是用户完全有正当理由称之为陷阱的那一种，那才是这条测试要挡住的。
-func TestStorageUnitPriceNeverIncreases(t *testing.T) {
+// 判据从「单价逐档不增」放宽成「都不高于最小档」（2026-09-16）。
+//
+// .99 价格点装不下严格单调：$X.99 的两倍是 $2X.98，而下一档是 $2X.99，
+// 每一级恒差 1 分。那 1 分在原生通路上不可能被利用 —— 两家商店都不让重复
+// 购买同一个订阅商品；Stripe 上倒是可以，但那条通路的小额档本就该从 40 GB
+// 起售（每笔 $0.30 的固定费在 $0.29 的月付上占 103%）。
+//
+// 真正要挡住的形态没变：某个大档单价明显更高，拆成小档反而便宜。
+func TestStorageUnitPriceNeverExceedsSmallestTier(t *testing.T) {
+	base := storageTiers[0]
 	for i := 1; i < len(storageTiers); i++ {
-		lo, hi := storageTiers[i-1], storageTiers[i]
-		if hi.GB <= lo.GB {
-			t.Fatalf("档位未按容量升序：%d GB 出现在 %d GB 之后", hi.GB, lo.GB)
+		cur := storageTiers[i]
+		if cur.GB <= storageTiers[i-1].GB {
+			t.Fatalf("档位未按容量升序：%d GB 出现在 %d GB 之后",
+				cur.GB, storageTiers[i-1].GB)
 		}
-		// 比较 lo.Price/lo.GB >= hi.Price/hi.GB，用交叉相乘避免浮点
-		if lo.PriceUSDYear*hi.GB < hi.PriceUSDYear*lo.GB {
-			t.Errorf("%d GB 的单价高于 %d GB —— 拆成小档叠加会更便宜",
-				hi.GB, lo.GB)
+		// cur.Price/cur.GB <= base.Price/base.GB，交叉相乘避免浮点
+		if cur.PriceCentsMonthly*base.GB > base.PriceCentsMonthly*cur.GB {
+			t.Errorf("%d GB 的单价高于最小档 %d GB —— 拆成小档会更便宜",
+				cur.GB, base.GB)
+		}
+	}
+}
+
+// 每一档在配额被**填满**时都必须仍然盈利（2026-09-16 用户决策）。
+//
+// 这是整张表的地板，也是它必须线性的原因：R2 的成本严格随容量线性，
+// 单价一旦随容量递减，大档的保本点就掉到 100% 占用率以下 —— 那时卖的不再是
+// 空间，而是「用户不会把买到的空间用完」这个赌注，而大容量买家恰恰最可能用满。
+//
+// 按商店抽成 **30%** 算，即尚未加入 App Store 小企业计划的情形。加入之后抽 15%，
+// 余量只会更大 —— 这里锁住的是最坏的那一侧。
+func TestStorageBreaksEvenAtFullOccupancy(t *testing.T) {
+	// R2 标准存储 $0.015/GB·月 = 1.5 分。
+	const r2CentsPerGBMonth = 1.5
+	const storeCut = 0.30
+
+	for _, tier := range storageTiers {
+		net := float64(tier.PriceCentsMonthly) * (1 - storeCut)
+		cost := float64(tier.GB) * r2CentsPerGBMonth
+		if net < cost {
+			t.Errorf("%d GB：满配额成本 %.1f 分，抽成后到手 %.1f 分 —— 填满就亏",
+				tier.GB, cost, net)
 		}
 	}
 }
@@ -144,10 +177,10 @@ func TestStackingIsNeverCheaperThanASingleTier(t *testing.T) {
 		// 用最便宜的单位价档位去凑 target.GB
 		best := storageTiers[0]
 		n := (target.GB + best.GB - 1) / best.GB
-		stacked := n * best.PriceUSDYear
-		if stacked < target.PriceUSDYear {
-			t.Errorf("%d GB 单档 $%d，用 %d 份 %d GB 叠加只要 $%d",
-				target.GB, target.PriceUSDYear, n, best.GB, stacked)
+		stacked := n * best.PriceCentsMonthly
+		if stacked < target.PriceCentsMonthly {
+			t.Errorf("%d GB 单档 %d 分，用 %d 份 %d GB 叠加只要 %d 分",
+				target.GB, target.PriceCentsMonthly, n, best.GB, stacked)
 		}
 	}
 }
@@ -158,14 +191,14 @@ func TestMaxFileBytesFor(t *testing.T) {
 		quotaGB int
 		want    int64
 	}{
-		{0, 0},  // 未购买存储：不允许上传
-		{19, 0}, // 不足最低档
-		{20, 2 * gb},
-		{100, 2 * gb},
-		{200, 10 * gb},
-		{999, 10 * gb},
-		{1000, 50 * gb},
-		{5000, 50 * gb}, // 超出最高档仍取最高档
+		{0, 0}, // 未购买存储：不允许上传
+		{9, 0}, // 不足最低档
+		{10, 2 * gb},
+		{80, 2 * gb},
+		{160, 10 * gb},
+		{1279, 10 * gb},
+		{1280, 50 * gb},
+		{10240, 50 * gb}, // 超出最高档仍取最高档
 	}
 	for _, c := range cases {
 		if got := MaxFileBytesFor(c.quotaGB); got != c.want {

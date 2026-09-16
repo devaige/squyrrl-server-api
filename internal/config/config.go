@@ -139,7 +139,7 @@ type Config struct {
 	StripeSecretKey string `env:"SQUYRRL_STRIPE_SECRET_KEY"`
 	// StripePrices 是 SKU → Stripe price id 的 JSON 映射，键为 `kind:tier:period`
 	// （代币加购的 period 固定为 `once`）。例：
-	//   {"plan:basic:monthly":"price_1A...","storage:s50:yearly":"price_1B...","credits:p5:once":"price_1C..."}
+	//   {"plan:basic:monthly":"price_1A...","storage:s40:monthly":"price_1B...","credits:p5:once":"price_1C..."}
 	//
 	// 放环境变量而不是数据库：**Stripe 的测试模式与正式模式是两套完全不同的 price id**，
 	// 它属于环境配置而非业务数据。放进库里意味着每次换环境都要改数据，

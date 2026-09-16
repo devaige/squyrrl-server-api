@@ -23,11 +23,19 @@ type Catalog struct {
 	// 客户端不该自己排序（价格相同的档位排序会不稳定）。
 	Plans []entitlement.Tier `json:"plans"`
 
-	// YearlyMonths 年付相当于几个月的价格。10 表示省两个月。
+	// YearlyMonths 年付大约相当于几个月的价格，**只用于展示**（「省两个月」）。
+	//
+	// 不要再拿它去乘出年付价：商店的价格点让实际年价落在 $19.99 而不是
+	// $19.90，两者差 9 分，而客户端一旦自己乘一遍，显示的价格就和扣款对不上。
+	// 权威年价是 entitlement.Tier.PriceCentsYearly。
 	YearlyMonths int `json:"yearly_months"`
 
-	// Storage 云存储档位。**仅年付**：存储是唯一的累积型成本，
-	// 预收一年正好对冲一年的字节支出，也把小额支付的固定手续费摊薄。
+	// Storage 云存储档位。**仅月付**（2026-09-16 用户决策，推翻了原先的仅年付）。
+	//
+	// 换成月付是因为年付把大档的单期金额推出了商店的价格点范围：10 TB 年付
+	// 需要 $3000 上下，而自动续期订阅的价格点到 $999.99 为止 —— 那一档在
+	// App Store Connect 里根本建不出来。月付把同一个价格摊成 1/12，上限不再
+	// 是约束，代价见 [storageTiers] 上那条关于站外渠道的警告。
 	Storage []StorageTier `json:"storage"`
 
 	// CreditPacks 代币加购档位，一次性购买、永不过期。
@@ -46,8 +54,9 @@ type Catalog struct {
 }
 
 type StorageTier struct {
-	GB           int `json:"gb"`
-	PriceUSDYear int `json:"price_usd_year"`
+	GB int `json:"gb"`
+	// PriceCentsMonthly 月付价（美分）。单位与 entitlement.Tier 一致，理由同上。
+	PriceCentsMonthly int `json:"price_cents_monthly"`
 }
 
 type CreditPack struct {
@@ -95,23 +104,40 @@ func GraceFor(billingPeriod string) time.Duration {
 	return GraceMonthly
 }
 
-// storageTiers 按 $0.03/GB·月 × 10 个月定价，线性。
-// 线性是叠加安全的前提：5 份 20 GB 与 1 份 100 GB 严格同价，
-// 阶梯价会让前者更贵，用户有理由认为那是陷阱。
+// storageTiers 按 $0.025/GB·月 线性定价，每档容量翻倍，价格同步翻倍。
 //
-// 大档用 1000/2000 而不是 1024/2048（2026-09-14 用户决策）：二进制那两档
-// 在这张表里**只在名字上像整数**，定价仍按十进制取整（1024 GB 收 $300 而非
-// $307.2），于是「每档翻倍、每档单价一致」这个用户能一眼验证的规律被打断了。
-// 改成十进制后整张表严格 $0.30/GB·年，倍数与价格同步翻倍。
-// 代价是商品标识从 s1024/s2048 变成 s1000/s2000 —— 支付渠道尚未上架任何存储
-// 商品，现在是改这个键唯一不需要迁移存量订阅的时间窗。
+// **线性在这里换了一条理由，结论没变。** 原先它是「可叠加」的前提（5 份 20 GB
+// 与 1 份 100 GB 必须同价，阶梯价会让前者更贵，用户有理由认为那是陷阱）。
+// 叠加后来被证明在两条原生通路上都做不到 —— App Store 与 Google Play 都拒绝
+// 重复购买同一个订阅商品（Play 直接回 ITEM_ALREADY_OWNED）——那条理由随之消失。
+//
+// 现在支撑线性的是**保本占用率**（2026-09-16 用户决策：每一档都要 ≥100%）。
+// 成本严格随容量线性（R2 $0.015/GB·月），所以「配额被填满时也不亏」这个要求
+// 等价于「每一档的单价都不低于同一个下限」。单价一旦随容量递减，大档的保本点
+// 就掉到 100% 以下 —— 那时卖的不再是空间，而是「用户不会把买到的空间用完」
+// 这个赌注，而大容量买家恰恰是最可能用满的人。
+//
+// 档位序列从 1000/2000 那套十进制改回严格 ×2（2026-09-16）：序列本身是二进制的，
+// 显示除数也跟着回到 1024，于是 10240 GB 正好显示成「10 TB」。
+// 改 SKU 键正常是禁止的（会让每一条存量订阅的续期事件变成未知档位），
+// 这次可以改只因为**还没有任何渠道上架过存储商品** —— 上架第一个就关窗。
+//
+// ⚠️ 代价全部落在站外渠道：Stripe 每笔收 $0.30 固定费，在 $0.29 的月付上占 103%,
+// 最小的两档（10 / 20 GB）在那条通路上是亏的。原先「仅年付」的理由之一正是把这笔
+// 固定费摊到 12 个月。站外要么从 40 GB 起售、要么单独保留年付 SKU ——
+// **不能只是打折**，那个方向只会亏得更多。
 var storageTiers = []StorageTier{
-	{GB: 20, PriceUSDYear: 6},
-	{GB: 50, PriceUSDYear: 15},
-	{GB: 100, PriceUSDYear: 30},
-	{GB: 500, PriceUSDYear: 150},
-	{GB: 1000, PriceUSDYear: 300},
-	{GB: 2000, PriceUSDYear: 600},
+	{GB: 10, PriceCentsMonthly: 29},
+	{GB: 20, PriceCentsMonthly: 49},
+	{GB: 40, PriceCentsMonthly: 99},
+	{GB: 80, PriceCentsMonthly: 199},
+	{GB: 160, PriceCentsMonthly: 399},
+	{GB: 320, PriceCentsMonthly: 799},
+	{GB: 640, PriceCentsMonthly: 1599},
+	{GB: 1280, PriceCentsMonthly: 3199},
+	{GB: 2560, PriceCentsMonthly: 6399},
+	{GB: 5120, PriceCentsMonthly: 12799},
+	{GB: 10240, PriceCentsMonthly: 25599},
 }
 
 // StorageTierKey 是存储档位在三家支付渠道里的商品标识后缀：20 GB → "s20"。
@@ -172,10 +198,13 @@ var creditPacks = []CreditPack{
 // （8 MiB × 10000 = 78.125 GB），且分片大小被 ADR-069 夹在 R2 的 5 MiB 下限
 // 与 Cloudflare 按账户 plan 计的请求体上限之间，不能随意调大。
 // 50 GB 留了 36% 余量，**不要把这个数字往 78 GB 附近抬**。
+// 阈值必须落在 storageTiers 真实存在的档位上，否则某一档的买家会够不到他
+// 刚买下的那级上限。三个数跟着 2026-09-16 的新序列一起挪：10（最小档就给
+// 2 GB，否则入门档传不了一个视频）、160、1280。
 var fileSizeTiers = []FileSizeTier{
-	{MinQuotaGB: 20, MaxFileBytes: 2 << 30},   // 2 GB
-	{MinQuotaGB: 200, MaxFileBytes: 10 << 30}, // 10 GB
-	{MinQuotaGB: 1000, MaxFileBytes: 50 << 30},
+	{MinQuotaGB: 10, MaxFileBytes: 2 << 30},   // 2 GB
+	{MinQuotaGB: 160, MaxFileBytes: 10 << 30}, // 10 GB
+	{MinQuotaGB: 1280, MaxFileBytes: 50 << 30},
 }
 
 // MaxFileBytesFor 按总配额算出单文件上限。配额为 0（未购买存储）时返回 0，

@@ -33,7 +33,8 @@ func TestLaddersAreMonotonic(t *testing.T) {
 		"Devices":             func(x Tier) int { return x.Devices },
 		"BindingsPerPlatform": func(x Tier) int { return x.BindingsPerPlatform },
 		"TrashDays":           func(x Tier) int { return x.TrashDays },
-		"PriceUSDMonthly":     func(x Tier) int { return x.PriceUSDMonthly },
+		"PriceCentsMonthly":   func(x Tier) int { return x.PriceCentsMonthly },
+		"PriceCentsYearly":    func(x Tier) int { return x.PriceCentsYearly },
 	}
 	for name, get := range nums {
 		for i := 1; i < len(Order); i++ {
@@ -95,8 +96,9 @@ func TestFreeIsLocalOnly(t *testing.T) {
 	if f.TrashDays != 0 {
 		t.Errorf("free 的 TrashDays 应为 0（回收站也在本地），实际 %d", f.TrashDays)
 	}
-	if f.PriceUSDMonthly != 0 {
-		t.Errorf("free 应免费，实际 $%d", f.PriceUSDMonthly)
+	if f.PriceCentsMonthly != 0 || f.PriceCentsYearly != 0 {
+		t.Errorf("free 应免费，实际 %d / %d 分",
+			f.PriceCentsMonthly, f.PriceCentsYearly)
 	}
 }
 

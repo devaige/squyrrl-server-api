@@ -18,9 +18,21 @@ package entitlement
 type Tier struct {
 	Key string `json:"key"`
 
-	// PriceUSDMonthly 月付价（美元）。年付 = 该值 × 10（省两个月）。
+	// PriceCentsMonthly / PriceCentsYearly 月付价与年付价，单位是**美分**。
+	//
+	// 用分而不是美元：商店只卖预置价格点，而那些点都是 .99 结尾的（$1.99），
+	// 整数美元根本表达不了。差这 99 分不是四舍五入的问题 —— 界面上的价格与
+	// 实际扣款对不上是 App Review 直接拒的一条。
+	//
+	// 年付价**显式列出**，不由月价 × YearlyMonths 算出来：价格点把那个比例
+	// 打散了（$1.99 × 10 = $19.90，而能挑的最近价格点是 $19.99）。逐档取整会让
+	// 四档的年付折扣变成 5.0 / 7.5 / 8.6 / 9.2 个月 —— 越贵的档越不划算，
+	// 与所有人的直觉相反。现在四档都落在「月价 × 10 的最近价格点」上，
+	// YearlyMonths 因此只剩展示用途（「年付约省两个月」）。
+	//
 	// 暂时硬编码：调价目前需要发版，后续由 GET /pricing 从 DB 覆盖（ADR-075 待办 ⑥）。
-	PriceUSDMonthly int `json:"price_usd_monthly"`
+	PriceCentsMonthly int `json:"price_cents_monthly"`
+	PriceCentsYearly  int `json:"price_cents_yearly"`
 
 	// Sync 决定碎片元数据是否同步到服务端。
 	//
@@ -78,33 +90,33 @@ var table = map[string]Tier{
 	// 游客（未登录）与 free 共用同一份门槛（2026-09-10 用户决策）：
 	// 两者唯一的区别是数据有没有归属，配额上不作区分。
 	Free: {
-		Key: Free, PriceUSDMonthly: 0,
+		Key: Free, PriceCentsMonthly: 0, PriceCentsYearly: 0,
 		Sync:     false,
 		Snippets: 1_000, Pages: 8, Tags: 16,
 		Devices: 0, BindingsPerPlatform: 0, TrashDays: 0,
 	},
 	Basic: {
-		Key: Basic, PriceUSDMonthly: 1,
+		Key: Basic, PriceCentsMonthly: 199, PriceCentsYearly: 1999,
 		Sync:     true,
 		Snippets: 10_000, Pages: 16, Tags: 32,
 		Devices: 2, BindingsPerPlatform: 1, TrashDays: 30,
 	},
 	Standard: {
-		Key: Standard, PriceUSDMonthly: 3,
+		Key: Standard, PriceCentsMonthly: 399, PriceCentsYearly: 3999,
 		Sync:     true,
 		Snippets: 100_000, Pages: 32, Tags: 64,
 		Devices: 3, BindingsPerPlatform: 2, TrashDays: 90,
 		HiddenPages: true,
 	},
 	Premium: {
-		Key: Premium, PriceUSDMonthly: 6,
+		Key: Premium, PriceCentsMonthly: 699, PriceCentsYearly: 6999,
 		Sync:     true,
 		Snippets: 1_000_000, Pages: 64, Tags: 128,
 		Devices: 4, BindingsPerPlatform: 4, TrashDays: 180,
 		HiddenPages: true, Rules: true, Import: true,
 	},
 	Maximum: {
-		Key: Maximum, PriceUSDMonthly: 12,
+		Key: Maximum, PriceCentsMonthly: 1299, PriceCentsYearly: 12999,
 		Sync:     true,
 		Snippets: 10_000_000, Pages: 128, Tags: 256,
 		Devices: 5, BindingsPerPlatform: 8, TrashDays: 365,

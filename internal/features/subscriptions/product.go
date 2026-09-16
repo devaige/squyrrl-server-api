@@ -26,7 +26,7 @@ type SKU struct {
 // （Apple 用 `.`，Google 用 `_`）。例如：
 //
 //	squyrrl.plan.basic.monthly
-//	squyrrl.storage.s50.yearly
+//	squyrrl.storage.s40.monthly
 //	squyrrl.credits.p5.once
 //
 // **三段式向后兼容**：`squyrrl.basic.monthly` 仍解析为 plan。基础订阅是先上线的

@@ -16,8 +16,8 @@ func TestParseProductID(t *testing.T) {
 		// SKU 一夜失效，那意味着所有存量订阅的续期事件同时开始报错。
 		{"老三段式默认 plan", "squyrrl.basic.monthly", ".", "plan", "basic", "monthly", 0, 0, false},
 		{"四段式 plan", "squyrrl.plan.premium.yearly", ".", "plan", "premium", "yearly", 0, 0, false},
-		{"四段式 storage", "squyrrl.storage.s50.yearly", ".", "storage", "s50", "yearly", 50, 0, false},
-		{"Google 下划线分隔", "squyrrl_storage_s1000_yearly", "_", "storage", "s1000", "yearly", 1000, 0, false},
+		{"四段式 storage", "squyrrl.storage.s40.monthly", ".", "storage", "s40", "monthly", 40, 0, false},
+		{"Google 下划线分隔", "squyrrl_storage_s1280_monthly", "_", "storage", "s1280", "monthly", 1280, 0, false},
 
 		// 代币加购此前整类解不出来（kind 只认 plan/storage）：在 App Store 里买
 		// 一笔代币，事件收到后判未知档位丢弃，用户付了钱一个币都没有。
@@ -27,8 +27,10 @@ func TestParseProductID(t *testing.T) {
 
 		// 未上架的容量必须拒绝，而不是从 "s999" 里 parse 出 999 ——
 		// 那样任何人在支付后台建一个商品就能凭空创造配额。
-		{"未上架的容量", "squyrrl.storage.s999.yearly", ".", "", "", "", 0, 0, true},
-		{"未知 kind", "squyrrl.sticker.s50.yearly", ".", "", "", "", 0, 0, true},
+		{"未上架的容量", "squyrrl.storage.s999.monthly", ".", "", "", "", 0, 0, true},
+		// 旧序列的档位：2026-09-16 换成 ×2 序列前卖过的键，现在必须拒收。
+		{"已下架的容量", "squyrrl.storage.s1000.monthly", ".", "", "", "", 0, 0, true},
+		{"未知 kind", "squyrrl.sticker.s40.monthly", ".", "", "", "", 0, 0, true},
 		{"段数不对", "squyrrl.basic", ".", "", "", "", 0, 0, true},
 		{"段数过多", "a.b.c.d.e", ".", "", "", "", 0, 0, true},
 	}
