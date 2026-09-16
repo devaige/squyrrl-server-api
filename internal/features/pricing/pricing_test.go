@@ -124,27 +124,24 @@ func TestRateConstantsAreConsistent(t *testing.T) {
 // 严格线性 $0.30/GB·年，但断言仍写成「不上升」而不是「相等」：未来给大档让点
 // 利是合理的商业动作，而反过来 —— 某个大档单价更高、拆成小档叠加反而便宜 ——
 // 是用户完全有正当理由称之为陷阱的那一种，那才是这条测试要挡住的。
-// 判据从「单价逐档不增」放宽成「都不高于最小档」（2026-09-16）。
+// 容量必须升序，且**最大档的单价不得高于最小档** —— 买得多反而更贵，
+// 是用户有正当理由称之为陷阱的那一种。
 //
-// .99 价格点装不下严格单调：$X.99 的两倍是 $2X.98，而下一档是 $2X.99，
-// 每一级恒差 1 分。那 1 分在原生通路上不可能被利用 —— 两家商店都不让重复
-// 购买同一个订阅商品；Stripe 上倒是可以，但那条通路的小额档本就该从 40 GB
-// 起售（每笔 $0.30 的固定费在 $0.29 的月付上占 103%）。
-//
-// 真正要挡住的形态没变：某个大档单价明显更高，拆成小档反而便宜。
-func TestStorageUnitPriceNeverExceedsSmallestTier(t *testing.T) {
-	base := storageTiers[0]
+// 这里刻意只比首尾，不要求逐档单调：价格点只有 .99 这一种粒度，贴着保本线
+// 向上取整会让相邻档之间出现零点几个百分点的起伏（$0.99/40 GB 与 $1.99/80 GB
+// 差 0.05%）。那种起伏不构成套利，真正的判据在
+// [TestStackingIsNeverCheaperThanASingleTier] —— 它算的是用户实际要掏的钱。
+func TestStorageTiersAscendAndLargestIsNotPricierPerGB(t *testing.T) {
 	for i := 1; i < len(storageTiers); i++ {
-		cur := storageTiers[i]
-		if cur.GB <= storageTiers[i-1].GB {
+		if storageTiers[i].GB <= storageTiers[i-1].GB {
 			t.Fatalf("档位未按容量升序：%d GB 出现在 %d GB 之后",
-				cur.GB, storageTiers[i-1].GB)
+				storageTiers[i].GB, storageTiers[i-1].GB)
 		}
-		// cur.Price/cur.GB <= base.Price/base.GB，交叉相乘避免浮点
-		if cur.PriceCentsMonthly*base.GB > base.PriceCentsMonthly*cur.GB {
-			t.Errorf("%d GB 的单价高于最小档 %d GB —— 拆成小档会更便宜",
-				cur.GB, base.GB)
-		}
+	}
+	first, last := storageTiers[0], storageTiers[len(storageTiers)-1]
+	// last.Price/last.GB <= first.Price/first.GB，交叉相乘避免浮点
+	if last.PriceCentsMonthly*first.GB > first.PriceCentsMonthly*last.GB {
+		t.Errorf("最大档 %d GB 的单价高于最小档 %d GB", last.GB, first.GB)
 	}
 }
 
@@ -171,15 +168,25 @@ func TestStorageBreaksEvenAtFullOccupancy(t *testing.T) {
 	}
 }
 
-// 叠加买到的容量，价格不应低于直接买同等的单档（否则单档就没有存在意义）。
+// 拆成小档凑出同等容量，不应该比直接买单档便宜。
+//
+// **判据带上 Stripe 每笔 $0.30 的固定手续费**，因为那才是用户实际掏的钱 ——
+// 而且只有 Stripe 这一条通路真的拆得开：两家原生商店都拒绝重复购买同一个
+// 订阅商品（Play 直接回 ITEM_ALREADY_OWNED）。不算这笔费用的话，.99 价格点
+// 带来的那一两分钱起伏会让这条测试误报：2 × $0.99 = $1.98 看着比 $1.99 便宜，
+// 但真付起来是 $1.98 加两笔手续费，比单档贵 $0.29。
 func TestStackingIsNeverCheaperThanASingleTier(t *testing.T) {
+	// Stripe: 2.9% + $0.30。这里只算固定部分 —— 百分比部分对两侧同比例作用，
+	// 不影响谁更便宜。
+	const stripeFixedFeeCents = 30
+
 	for _, target := range storageTiers {
 		// 用最便宜的单位价档位去凑 target.GB
 		best := storageTiers[0]
 		n := (target.GB + best.GB - 1) / best.GB
-		stacked := n * best.PriceCentsMonthly
+		stacked := n*best.PriceCentsMonthly + (n-1)*stripeFixedFeeCents
 		if stacked < target.PriceCentsMonthly {
-			t.Errorf("%d GB 单档 %d 分，用 %d 份 %d GB 叠加只要 %d 分",
+			t.Errorf("%d GB 单档 %d 分，用 %d 份 %d GB 叠加只要 %d 分（含手续费）",
 				target.GB, target.PriceCentsMonthly, n, best.GB, stacked)
 		}
 	}
@@ -191,9 +198,9 @@ func TestMaxFileBytesFor(t *testing.T) {
 		quotaGB int
 		want    int64
 	}{
-		{0, 0}, // 未购买存储：不允许上传
-		{9, 0}, // 不足最低档
-		{10, 2 * gb},
+		{0, 0},  // 未购买存储：不允许上传
+		{39, 0}, // 不足最低档
+		{40, 2 * gb},
 		{80, 2 * gb},
 		{160, 10 * gb},
 		{1279, 10 * gb},

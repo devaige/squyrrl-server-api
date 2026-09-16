@@ -14,14 +14,17 @@ func TestUploadThresholds(t *testing.T) {
 		quota, used, held, size int64
 		wantReject              bool
 	}{
-		{"空账户放得下", 20 * gb, 0, 0, gb, false},
-		{"正好填满，必须放行", 20 * gb, 19 * gb, 0, gb, false},
-		{"超出一个字节即拒", 20 * gb, 19 * gb, 0, gb + 1, true},
+		// 配额取 40 GB —— 那是在售的最小档（2026-09-16 起，被 App Store 的
+		// $0.99 最低价格点决定）。低于它 MaxFileBytesFor 返回 0，这几条用例
+		// 会一律落到「未购买存储」那一支，测不到本来要测的边界。
+		{"空账户放得下", 40 * gb, 0, 0, gb, false},
+		{"正好填满，必须放行", 40 * gb, 39 * gb, 0, gb, false},
+		{"超出一个字节即拒", 40 * gb, 39 * gb, 0, gb + 1, true},
 		// 在途预留是这套判据存在的理由：只比对已落库的占用，
 		// 并发上传会各自看到同一个「还剩多少」然后一起超卖，
 		// 而超出去的字节已经躺在 R2 上按月计费。
-		{"已占用够但在途预留把额度吃满", 20 * gb, 10 * gb, 10 * gb, 1, true},
-		{"在途预留刚好留出空间", 20 * gb, 10 * gb, 9 * gb, gb, false},
+		{"已占用够但在途预留把额度吃满", 40 * gb, 20 * gb, 20 * gb, 1, true},
+		{"在途预留刚好留出空间", 40 * gb, 20 * gb, 19 * gb, gb, false},
 		{"未购买存储", 0, 0, 0, 1, true},
 	}
 	for _, c := range cases {
