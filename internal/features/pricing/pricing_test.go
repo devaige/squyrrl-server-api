@@ -4,6 +4,8 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/squyrrl/api/internal/features/entitlement"
 )
 
 // ADR-075 里写死的三档参考价必须能被公式复现，否则文档与实现已经分家。
@@ -254,5 +256,29 @@ func TestSignupGrantCoversThreeExpensiveParses(t *testing.T) {
 	}
 	if SignupGrantCredits < cost*3 {
 		t.Errorf("赠送 %d 代币，但 3 条最贵解析需要 %d", SignupGrantCredits, cost*3)
+	}
+}
+
+// TestSellableSKUCountMatchesConsole 锁住「要在商店后台手工建几个商品」这个数。
+//
+// 商品号在 App Store Connect / Play Console 里是手工建的，没有任何一端能自动同步
+// （清单在 docs/readme/14-iap.md 附录 A）。加一档存储、加一个代币包都编得过、
+// 测得过，代价要到用户点下「购买」、商店回「查无此商品」时才出现 ——
+// 而那时新档位已经画在商品页上了。用一个数把这件事挡在 CI 上。
+//
+// 数字本身没有含义，改档位时连同附录 A 一起改。
+func TestSellableSKUCountMatchesConsole(t *testing.T) {
+	paidPlans := 0
+	for _, k := range entitlement.Order {
+		if tier, ok := entitlement.Of(k); ok && tier.PriceCentsMonthly > 0 {
+			paidPlans++
+		}
+	}
+
+	// plan 卖月付与年付两种周期；storage 只有月付；credits 是一次性。
+	got := paidPlans*2 + len(storageTiers) + len(creditPacks)
+	const want = 23
+	if got != want {
+		t.Fatalf("可售商品 %d 个，登记的是 %d 个 —— docs/readme/14-iap.md 附录 A 要跟着改", got, want)
 	}
 }
