@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	playPkg   = "com.squyrrl.android"
+	playPkg   = "com.squyrrl.and"
 	playUser  = "33333333-3333-3333-3333-333333333333"
 	playToken = "abcdefghijklmnop.AO-J1Ox"
 )
