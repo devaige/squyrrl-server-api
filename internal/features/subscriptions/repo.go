@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -13,15 +15,59 @@ type Repo struct {
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
+// querier 是 *pgxpool.Pool 与 pgx.Tx 的公共子集：同一段 SQL 既能单独跑，也能拼进事务。
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Upsert 根据 (provider, provider_subscription_id) 唯一性插入或更新订阅行。
 // 因 schema 上没建该唯一索引，这里手动 SELECT + UPDATE / INSERT。
 //
-// 同一用户的 active plan 受 uq_subscriptions_one_active_plan 部分唯一约束保护，
-// 所以「升级」场景需要先把旧 plan status 改成 canceled / expired 再 INSERT 新 plan。
-// 这部分由 service 层负责协调，repo 只做无脑落库。
+// 不处理 plan 的唯一约束：要成为 active plan 的事件走 ActivatePlan。
 func (r *Repo) Upsert(ctx context.Context, e *SubscriptionEvent) (uuid.UUID, error) {
+	return upsert(ctx, r.pool, e)
+}
+
+// ActivatePlan 让 e 成为该用户唯一的 active plan：先让其它 active plan 退场，再落 e。
+//
+// 顺序不能反过来。uq_subscriptions_one_active_plan 只允许一条 active plan，
+// 先 INSERT 的话，只要新旧两条的渠道 ID 不同（Play 换档换了 purchaseToken、
+// 用户换了渠道重新买）就当场撞约束，webhook 永远失败。
+// 两步放在同一事务里：退场成功而落库失败时，用户不会落到「一条 plan 都没有」。
+func (r *Repo) ActivatePlan(ctx context.Context, e *SubscriptionEvent) (uuid.UUID, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// 排除的是**同一条渠道订阅**而不是某个行 id：此刻新行可能还不存在。
+	// IS DISTINCT FROM 而不是 <>：admin 行的渠道 ID 是 NULL，<> 对 NULL 不成立，
+	// 那些行会被漏掉，随后的 INSERT 照样撞约束。
+	if _, err := tx.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = 'expired', updated_at = now()
+		WHERE user_id = $1
+		  AND kind = 'plan'
+		  AND status = 'active'
+		  AND (payment_provider <> $2
+		       OR payment_provider_subscription_id IS DISTINCT FROM $3)`,
+		e.UserID, string(e.Provider), e.ProviderSubscriptionID); err != nil {
+		return uuid.Nil, err
+	}
+
+	id, err := upsert(ctx, tx, e)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return id, tx.Commit(ctx)
+}
+
+func upsert(ctx context.Context, q querier, e *SubscriptionEvent) (uuid.UUID, error) {
 	var id uuid.UUID
-	err := r.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT id FROM subscriptions
 		WHERE payment_provider = $1 AND payment_provider_subscription_id = $2
 		LIMIT 1`,
@@ -30,7 +76,7 @@ func (r *Repo) Upsert(ctx context.Context, e *SubscriptionEvent) (uuid.UUID, err
 
 	if err == nil {
 		// update
-		_, err = r.pool.Exec(ctx, `
+		_, err = q.Exec(ctx, `
 			UPDATE subscriptions SET
 				kind = $1,
 				tier = $2,
@@ -48,7 +94,7 @@ func (r *Repo) Upsert(ctx context.Context, e *SubscriptionEvent) (uuid.UUID, err
 	}
 
 	// insert
-	err = r.pool.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		INSERT INTO subscriptions (
 			user_id, kind, tier, billing_period, status,
 			current_period_start, current_period_end,
@@ -81,23 +127,9 @@ func (r *Repo) ExpireByProviderID(ctx context.Context, userID uuid.UUID, provide
 		UPDATE subscriptions
 		SET status = 'expired', updated_at = now()
 		WHERE user_id = $1
-		  AND provider = $2
-		  AND provider_subscription_id = $3
+		  AND payment_provider = $2
+		  AND payment_provider_subscription_id = $3
 		  AND status <> 'expired'`,
 		userID, string(provider), providerID)
-	return err
-}
-
-// SupersedeActivePlan 把同用户下其它 active plan 标为 expired，给新 plan 让路。
-// 在跨等级升降级场景下避免触发 uq_subscriptions_one_active_plan 唯一冲突。
-func (r *Repo) SupersedeActivePlan(ctx context.Context, userID uuid.UUID, keepID uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE subscriptions
-		SET status = 'expired', updated_at = now()
-		WHERE user_id = $1
-		  AND kind = 'plan'
-		  AND status = 'active'
-		  AND id <> $2`,
-		userID, keepID)
 	return err
 }

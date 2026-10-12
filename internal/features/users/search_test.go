@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/squyrrl/api/internal/features/quota"
+	"github.com/squyrrl/api/internal/features/subscriptions"
 	"github.com/squyrrl/api/internal/features/wallet"
 	"github.com/squyrrl/api/internal/infra/db"
 )
@@ -75,7 +77,14 @@ func TestSearch(t *testing.T) {
 	if _, err := walletSvc.Grant(ctx, alice, 1234, "test", ""); err != nil {
 		t.Fatalf("发币失败: %v", err)
 	}
-	svc := NewService(NewRepo(pool), walletSvc)
+	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc)
+	if err := subSvc.SetAdminPlan(ctx, underscore, "premium"); err != nil {
+		t.Fatalf("设置手动档位失败: %v", err)
+	}
+	if _, err := subSvc.GrantAdminStorage(ctx, underscore, "s40"); err != nil {
+		t.Fatalf("授予存储失败: %v", err)
+	}
+	svc := NewService(NewRepo(pool), walletSvc, quota.NewService(pool, walletSvc), subSvc)
 
 	search := func(q string, limit int) []Summary {
 		t.Helper()
@@ -119,6 +128,24 @@ func TestSearch(t *testing.T) {
 		s := items[0]
 		if s.Plan != "free" || s.PlanStatus != wallet.PlanStatusNone || s.CreditsBalance != 1234 {
 			t.Fatalf("钱包字段不对: plan=%s status=%s balance=%d", s.Plan, s.PlanStatus, s.CreditsBalance)
+		}
+		if s.Storage.QuotaBytes != 0 || len(s.Subscriptions) != 0 {
+			t.Fatalf("无订阅用户不该有存储或订阅行: %+v %+v", s.Storage, s.Subscriptions)
+		}
+	})
+
+	t.Run("档位、存储与订阅明细同源", func(t *testing.T) {
+		items := search(underscore.String(), MaxLimit)
+		if len(items) != 1 {
+			t.Fatalf("期望命中 1 条，实际 %d 条", len(items))
+		}
+		s := items[0]
+		if s.Plan != "premium" || s.Storage.QuotaBytes != 40<<30 {
+			t.Fatalf("plan=%s quota=%d，期望 premium / 40 GiB", s.Plan, s.Storage.QuotaBytes)
+		}
+		if len(s.Subscriptions) != 2 || s.Subscriptions[0].Kind != "plan" ||
+			s.Subscriptions[1].Tier != "s40" || s.Subscriptions[1].Provider != subscriptions.ProviderAdmin {
+			t.Fatalf("订阅明细不对: %+v", s.Subscriptions)
 		}
 	})
 

@@ -211,7 +211,8 @@ func (s *Server) routes() {
 	adminInternal.Use(tg.InternalAuth(s.cfg.InternalToken))
 	walletHandler.RegisterInternal(adminInternal)
 	extapi.NewHandler(s.extapiSvc).RegisterInternal(adminInternal)
-	users.NewHandler(users.NewService(users.NewRepo(s.pool), s.walletSvc)).RegisterInternal(adminInternal)
+	users.NewHandler(users.NewService(users.NewRepo(s.pool), s.walletSvc, s.quotaSvc, s.subSvc)).RegisterInternal(adminInternal)
+	subscriptions.NewAdminHandler(s.subSvc).RegisterInternal(adminInternal)
 
 	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）。
 	// 购买入口则相反 —— 它要知道是谁在买，挂在 /me 上。
