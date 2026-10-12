@@ -111,8 +111,8 @@ type StorageView struct {
 // GrantInput 由内部端调用（管理后台 / 运营批处理 / 支付回调）
 type GrantInput struct {
 	UserID uuid.UUID `json:"user_id" binding:"required"`
-	Delta  int64     `json:"delta" binding:"required"` // 正数入账，负数也可（罚扣）
-	Reason string    `json:"reason" binding:"required"`
+	Delta  int64     `json:"delta" binding:"required"`  // 正数入账，负数也可（罚扣）
+	Reason string    `json:"reason" binding:"required"` // <类别>:<说明>，类别见 AdminReasonCategories
 
 	// IdempotencyKey 可选。给定后，同一个键重复提交只会落一笔流水，
 	// 后续请求原样返回首次的结果并把 Replayed 置为 true。

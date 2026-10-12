@@ -1463,7 +1463,13 @@ paths:
                   description: 正数入账，负数罚扣 / 退款冲销
                 reason:
                   type: string
-                  description: 流水原因，例如 'purchase' / 'admin_grant' / 'parse_uri' / 'refund'
+                  description: |
+                    `<类别>:<说明>`，例如 `admin_refund:工单1234 重复扣费退回`。服务端去掉首尾空白后入库。
+                    类别必须是 `admin_grant`（赠送）/ `admin_comp`（故障补偿）/ `admin_refund`（退回误扣）/
+                    `admin_revoke`（收回）/ `admin_correction`（冲正）/ `admin_test`（测试账号）之一；
+                    说明不可为空、单行、最多 200 字。系统写入的 `purchase:*` / `parse_uri:*` 不经过本端点，
+                    因此 `reason LIKE 'admin\_%'` 能筛出全部人工流水。
+                  example: 'admin_comp:10-10 解析服务故障补偿'
                 idempotency_key:
                   type: string
                   description: |
@@ -1477,7 +1483,7 @@ paths:
               schema: { $ref: '#/components/schemas/CreditsGrantResponse' }
         '400':
           description: |
-            扣减会使余额变负，或 `delta` 极端到令 int64 余额回绕。两种情况都不落流水。
+            `reason` 格式不符、扣减会使余额变负，或 `delta` 极端到令 int64 余额回绕。均不落流水。
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
