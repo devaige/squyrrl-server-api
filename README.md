@@ -3,7 +3,7 @@
 Squyrrl 主 API 单体（Go）。**独立仓库**，可单独开发、CI 与部署；作为 submodule 挂载在父仓库 [`squyrrl`](https://github.com/devaige/squyrrl) 的 `server/api`。
 
 全栈文档在父仓库 `docs/readme/`（本仓库不重复维护）：
-[服务端开发](https://github.com/devaige/squyrrl/blob/main/docs/readme/02-server-dev.md) ·
+[服务端代码与检查](https://github.com/devaige/squyrrl/blob/main/docs/readme/02-server-code.md) ·
 [生产部署](https://github.com/devaige/squyrrl/blob/main/docs/readme/03-server-prod.md) ·
 [环境变量字典](https://github.com/devaige/squyrrl/blob/main/docs/readme/08-env-vars.md)
 
@@ -17,7 +17,7 @@ make test
 make build
 ```
 
-数据库集成测试仅在显式提供一次性测试库时运行，见父仓库服务端开发手册。
+数据库集成测试仅在显式提供一次性测试库时运行，见父仓库服务端代码与检查手册。
 
 ## 生产部署
 
