@@ -57,6 +57,8 @@ tags:
     description: 扫码绑定新设备
   - name: Wallet
     description: 用户订阅 plan + 代币余额（只读视图 + 内部充值端点）
+  - name: Users
+    description: 管理后台的用户目录（内部端，只读）
 
 # 全局默认要求 Bearer。公开端点用 security: [] 显式覆盖
 security:
@@ -1485,6 +1487,56 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /internal/admin/users:
+    get:
+      operationId: adminSearchUsers
+      tags: [Users]
+      summary: 内部：按邮箱或用户 ID 搜索用户
+      description: |
+        受 X-Internal-Token 头保护，供管理后台调用。结果按注册时间倒序，软删除的用户不出现。
+
+        `q` 的解释：
+        - 留空：不过滤，返回最近注册的用户；
+        - 能解析成 UUID：按用户 ID 精确匹配（不做前缀匹配）；
+        - 其余：邮箱子串匹配，不区分大小写，`%` / `_` 按字面处理。
+
+        每行的档位与余额与该用户 `GET /me/wallet` 看到的一致（宽限期已算在内）。
+      security:
+        - internalToken: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: 邮箱片段或完整用户 ID
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+          description: 超出范围时收进 [1, 50]，不报错
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminUser' }
+        '400':
+          description: limit 不是整数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   # ---------------------------------------------------------------- Passkey (WebAuthn)
   /auth/passkey/register/begin:
     post:
@@ -2377,6 +2429,24 @@ components:
             为 true 表示本次请求命中了既有的 `idempotency_key`，没有产生新流水，
             返回的是首次写入的结果。两种情况都算成功，但含义不同：
             调用方据此区分「刚扣成功」与「之前就扣过了」。
+
+    AdminUser:
+      type: object
+      required: [id, created_at, plan, plan_status, credits_balance]
+      description: 管理后台用户列表的一行。`plan` / `plan_status` / `grace_until` / `credits_balance` 与 Wallet 同义。
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        handle: { type: string }
+        created_at: { type: string, format: date-time }
+        plan:
+          type: string
+          enum: [free, basic, standard, premium, maximum]
+        plan_status:
+          type: string
+          enum: [none, active, past_due]
+        grace_until: { type: string, format: date-time }
+        credits_balance: { type: integer, format: int64 }
 
     # ---------- QR 扫码绑定 ----------
     QRCode:
