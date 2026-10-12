@@ -2,14 +2,14 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"log/slog"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// Client 封装 S3 协议的对象存储（dev 接 MinIO，生产接 R2）
+// Client 封装 R2 的 S3 协议访问。
 type Client struct {
 	mc     *minio.Client
 	core   *minio.Core
@@ -29,7 +29,7 @@ func New(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*Client, e
 	return &Client{mc: mc, core: &minio.Core{Client: mc}, bucket: bucket}, nil
 }
 
-// EnsureBucket 在启动时确保 bucket 存在，dev 环境下首次启动 MinIO 自动建桶
+// EnsureBucket 在启动时检查预建的 R2 bucket，不自动创建资源。
 func (c *Client) EnsureBucket(ctx context.Context) error {
 	exists, err := c.mc.BucketExists(ctx, c.bucket)
 	if err != nil {
@@ -38,11 +38,7 @@ func (c *Client) EnsureBucket(ctx context.Context) error {
 	if exists {
 		return nil
 	}
-	if err := c.mc.MakeBucket(ctx, c.bucket, minio.MakeBucketOptions{}); err != nil {
-		return err
-	}
-	slog.Info("已创建对象存储 bucket", "bucket", c.bucket)
-	return nil
+	return fmt.Errorf("对象存储 bucket %q 不存在，请先创建 R2 桶", c.bucket)
 }
 
 // Put 上传字节；contentType 不影响存储，仅作元数据
@@ -51,16 +47,6 @@ func (c *Client) Put(ctx context.Context, key string, r io.Reader, size int64, c
 		ContentType: contentType,
 	})
 	return err
-}
-
-// Get 返回流式 reader；caller 负责 Close
-func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	// minio.Object 同时实现 io.ReadCloser；调用方需要 Close
-	return obj, nil
 }
 
 // Delete 删除对象，由 file GC 调用（当 ref_count 归零）
@@ -112,16 +98,4 @@ func (c *Client) StatObject(ctx context.Context, key string) (int64, error) {
 		return 0, err
 	}
 	return info.Size, nil
-}
-
-// PutPart 上传一片，返回 ETag。仅由 dev 的内嵌边缘使用 —— 生产由 Cloudflare Worker
-// 经 R2 binding 直写，字节根本不进这个进程。
-func (c *Client) PutPart(ctx context.Context, key, uploadID string, partNumber int,
-	r io.Reader, size int64) (string, error) {
-	p, err := c.core.PutObjectPart(ctx, c.bucket, key, uploadID, partNumber, r, size,
-		minio.PutObjectPartOptions{})
-	if err != nil {
-		return "", err
-	}
-	return p.ETag, nil
 }

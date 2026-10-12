@@ -8,18 +8,17 @@ import (
 
 // 直传的 fail-closed 语义靠这几条守住：生产漏配不该「能跑但字节穿过服务器」，
 // 也不该「能跑但上传静默 503」，而应当直接拒绝启动。
-func TestValidateProdUploadConfig(t *testing.T) {
+func TestValidateUploadConfig(t *testing.T) {
 	tests := []struct {
 		name    string
 		cfg     Config
 		wantErr bool
 	}{
-		{"dev 允许全默认", Config{Env: "dev", UploadTokenSecret: devUploadTokenSecret}, false},
-		{"dev 允许空 edge base", Config{Env: "dev"}, false},
-		{"prod 缺 edge base", Config{Env: "prod", UploadTokenSecret: "real-secret"}, true},
-		{"prod 用 dev 密钥", Config{Env: "prod", UploadEdgeBase: "https://files.squyrrl.com", UploadTokenSecret: devUploadTokenSecret}, true},
-		{"prod 缺密钥", Config{Env: "prod", UploadEdgeBase: "https://files.squyrrl.com"}, true},
-		{"prod 齐备", Config{Env: "prod", UploadEdgeBase: "https://files.squyrrl.com", UploadTokenSecret: "real-secret"}, false},
+		{"全默认", Config{}, true},
+		{"缺 edge base", Config{UploadTokenSecret: "real-secret"}, true},
+		{"使用已废弃的开发密钥", Config{UploadEdgeBase: "https://files.squyrrl.com", UploadTokenSecret: "dev-upload-token-secret"}, true},
+		{"缺密钥", Config{UploadEdgeBase: "https://files.squyrrl.com"}, true},
+		{"齐备", Config{UploadEdgeBase: "https://files.squyrrl.com", UploadTokenSecret: "real-secret"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -30,16 +29,21 @@ func TestValidateProdUploadConfig(t *testing.T) {
 	}
 }
 
-// envDefault 只能写字面量，与 devUploadTokenSecret 常量之间没有编译期约束，
-// 靠这条断言防止两处漂移后 Validate 再也拦不住 dev 密钥进生产。
-func TestDevTokenSecretMatchesEnvDefault(t *testing.T) {
+// 旧的环境变量不能再绕过正式配置校验，签票密钥也不能隐式使用开发值。
+func TestLegacyDevEnvironmentDoesNotBypassValidation(t *testing.T) {
 	t.Setenv("SQUYRRL_DATABASE_URL", "postgres://localhost/x")
+	t.Setenv("SQUYRRL_ENV", "dev")
+	t.Setenv("SQUYRRL_UPLOAD_EDGE_BASE", "")
+	t.Setenv("SQUYRRL_UPLOAD_TOKEN_SECRET", "")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.UploadTokenSecret != devUploadTokenSecret {
-		t.Fatalf("envDefault=%q 与 devUploadTokenSecret=%q 不一致", cfg.UploadTokenSecret, devUploadTokenSecret)
+	if cfg.UploadTokenSecret != "" {
+		t.Fatal("签票密钥不应有默认值")
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("旧 SQUYRRL_ENV=dev 不应绕过配置校验")
 	}
 }
 

@@ -47,27 +47,8 @@ func NewService(repo *Repo, st *storage.Client, q UploadQuota, edgeBase, tokenSe
 // EdgeEnabled 报告边缘是否可用：边缘地址与令牌密钥缺一不可。上传与下载共用这一个
 // 开关，因为它们共用同一个 Worker、同一个密钥、同一个自定义域 —— 拆成两个开关就多出
 // 「能传不能取」这类没人想要的中间态。
-//
-// dev 也要显式配 edgeBase（指向 api 自己的 /edge），好让「有没有边缘」是一个二值问题，
-// 而不是「有边缘 / 有个悄悄改吃服务器带宽的替身」。
 func (s *Service) EdgeEnabled() bool {
 	return s.edgeBase != "" && s.tokenSecret != ""
-}
-
-// VerifyUploadToken 供内嵌边缘校验令牌；生产由 Worker 用同一套算法自行校验。
-func (s *Service) VerifyUploadToken(token string) (*UploadClaims, error) {
-	if s.tokenSecret == "" {
-		return nil, ErrEdgeDisabled
-	}
-	return VerifyUploadToken(s.tokenSecret, token)
-}
-
-// VerifyDownloadToken 同上，用途为下载。两种令牌签名互不通用（见 token.go 的用途常量）。
-func (s *Service) VerifyDownloadToken(token string) (*DownloadClaims, error) {
-	if s.tokenSecret == "" {
-		return nil, ErrEdgeDisabled
-	}
-	return VerifyDownloadToken(s.tokenSecret, token)
 }
 
 // 对象 key 的前缀。**用前缀区分类型，而不是分桶**（2026-09-08 用户决策）：
@@ -332,8 +313,7 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 	resp := &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
-		// 恒为非空（EdgeEnabled 已挡住空值）。dev 指向 api 自身的 /edge、
-		// 生产指向 Worker 自定义域，客户端两种环境共用同一条代码路径，只是终点不同。
+		// 恒为非空（EdgeEnabled 已挡住空值），指向 Worker 自定义域。
 		UploadURL: s.edgeBase,
 		Token:     token,
 		PartSize:  PartSize,

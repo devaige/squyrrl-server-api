@@ -1,7 +1,6 @@
 .git
 .env
 .env.*
-!.env.example
 bin/
 *.log
 README*.md

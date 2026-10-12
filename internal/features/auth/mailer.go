@@ -14,10 +14,7 @@ const resendEndpoint = "https://api.resend.com/emails"
 
 // Mailer 通过 Resend HTTP API 发送邮件。
 //
-// apiKey 为空时进入「本地日志模式」：不外发，直接把验证码打到日志。这样本地开发
-// `cp .env.example .env` 后无需任何真实密钥即可跑通登录流程（OTP 从
-// `docker compose logs api` 里读）。这也是移除 Mailhog 依赖的前提——dev 不再需要
-// 一个 SMTP 捕获容器，空 key 即等价于「不发信」。
+// apiKey 为空时沿用日志模式，不会投递邮件；正式部署必须配置 Resend key。
 type Mailer struct {
 	apiKey string
 	from   string // 完整 From 头，例如 "Squyrrl <noreply@squyrrl.com>"；须为 Resend 已验证发信域
@@ -33,7 +30,7 @@ func NewMailer(apiKey, from string) *Mailer {
 }
 
 // Enabled 报告是否会真的外发邮件。发信预算只在「真会消耗配额」时才检查 ——
-// dev 无 key 时 SendOTP 只打日志，不该占用预算，否则本地开发跑几十次就把自己锁死。
+// 无 key 时 SendOTP 不外发，不消耗发信预算。
 func (m *Mailer) Enabled() bool { return m.apiKey != "" }
 
 // SendOTP 发送登录 OTP 邮件

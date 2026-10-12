@@ -18,10 +18,9 @@ import (
 //
 // CI 没有 Postgres（见 .github/workflows/ci.yml），所以**未设变量即跳过**而不是失败：
 // 让 CI 因为缺一个它从来就没有的依赖而变红，只会训练大家忽略红灯。
-// 本地跑：
+// 使用显式提供的一次性测试库运行，不能指向正式库：
 //
-//	docker compose -f docker-compose.dev.yml up -d postgres
-//	SQUYRRL_TEST_DATABASE_URL='postgres://squyrrl:squyrrl_dev@localhost:55432/squyrrl?sslmode=disable' go test ./internal/features/auth/ -run Slide -v
+//	SQUYRRL_TEST_DATABASE_URL='postgres://USER:PASS@HOST:5432/disposable_test_db' go test ./internal/features/auth/ -run Slide -v
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := os.Getenv("SQUYRRL_TEST_DATABASE_URL")

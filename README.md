@@ -7,24 +7,17 @@ Squyrrl 主 API 单体（Go）。**独立仓库**，可单独开发、CI 与部�
 [生产部署](https://github.com/devaige/squyrrl/blob/main/docs/readme/03-server-prod.md) ·
 [环境变量字典](https://github.com/devaige/squyrrl/blob/main/docs/readme/08-env-vars.md)
 
-## 本地开发
+## 检查
 
-本仓库的 dev compose 自带 postgres + minio，是全栈里唯一持有这两项依赖的仓库 —— 因此**本机开发要先起本仓库**，tgbot / admin 的 dev compose 以 external 方式加入这里创建的 `squyrrl` 网络。
-
-```bash
-cp .env.example .env
-docker compose -f docker-compose.dev.yml up -d --build
-docker compose -f docker-compose.dev.yml logs -f api
-```
-
-原生跑（不走容器，便于断点调试）：
+部署测试直接使用正式环境。本地运行编译、静态检查与单元测试：
 
 ```bash
-make infra   # 只起 postgres / minio
-make run     # go run ./cmd/api，读同目录 .env
+make vet
+make test
+make build
 ```
 
-`.env` 里写的是宿主地址（`localhost:55432` / `:59000`），容器化启动时由 `docker-compose.dev.yml` 的 `environment` 覆盖为服务名 —— 一份模板同时服务两种跑法。
+数据库集成测试仅在显式提供一次性测试库时运行，见父仓库服务端开发手册。
 
 ## 生产部署
 
@@ -33,7 +26,7 @@ cp .env.prod.example .env.prod && chmod 600 .env.prod   # 首次，填 CHANGE_ME
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ```
 
-`.github/workflows/deploy.yml` 在 push main 时自动做同样的事并跑数据库迁移。`nginx.conf` 是宿主反代配置（`api.squyrrl.com` → `127.0.0.1:10260`），安装方式见文件头注释。
+`.github/workflows/deploy.yml` 在 push main 时自动重建部署；数据库迁移由 API 启动时执行。`nginx.conf` 是宿主反代配置（`api.squyrrl.com` → `127.0.0.1:10260`），安装方式见文件头注释。
 
 ## 跨服务约定
 

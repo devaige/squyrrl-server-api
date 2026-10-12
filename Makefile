@@ -1,46 +1,18 @@
 SHELL := /bin/bash
 
-# dev 依赖栈随拆仓回到本仓库（与生产 compose 并排），不再依赖父仓库的总编排
-DOCKER_COMPOSE := docker compose -f docker-compose.dev.yml
 BIN_DIR := bin
 APP := squyrrl-api
 
-.PHONY: help dev infra infra-down infra-clean run build tidy fmt vet test migrate-create
+.PHONY: help build tidy fmt vet test migrate-create
 
 help:
 	@echo "可用目标："
-	@echo "  make dev              起开发依赖并运行 API"
-	@echo "  make infra            起开发依赖容器（postgres/minio）"
-	@echo "  make infra-down       停止依赖容器"
-	@echo "  make infra-clean      停止并清空依赖卷"
-	@echo "  make run              直接运行 API（依赖需先就绪）"
 	@echo "  make build            编译 API 二进制至 $(BIN_DIR)/$(APP)"
 	@echo "  make tidy             go mod tidy"
 	@echo "  make fmt              gofmt -s -w ."
 	@echo "  make vet              go vet ./..."
 	@echo "  make test             go test ./..."
 	@echo "  make migrate-create name=xxx   生成新迁移文件"
-
-dev: infra run
-
-# 只起依赖容器（应用已容器化，全栈由本目录 docker-compose.dev.yml 起；此目标供原生逃生跑 API 时用）
-infra:
-	$(DOCKER_COMPOSE) up -d postgres minio
-	@echo "等待依赖就绪..."
-	@sleep 3
-
-infra-down:
-	$(DOCKER_COMPOSE) down
-
-infra-clean:
-	$(DOCKER_COMPOSE) down -v
-
-run:
-	@if [ ! -f .env ]; then \
-		echo "未找到 .env，使用 .env.example 默认值"; \
-		cp .env.example .env; \
-	fi
-	go run ./cmd/api
 
 build:
 	mkdir -p $(BIN_DIR)

@@ -99,7 +99,7 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("HTTP 服务启动", "addr", cfg.HTTPAddr, "env", cfg.Env)
+		logger.Info("HTTP 服务启动", "addr", cfg.HTTPAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP 服务异常退出", "err", err)
 			cancelRoot()

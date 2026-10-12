@@ -18,10 +18,9 @@ import (
 // 永远给用户看旧内容，或者反过来把一条好缓存换成降级返回的坏缓存。所以必须打真库。
 //
 // 与 auth/refresh_slide_test.go 同一套约定：未设变量即跳过，不让 CI 因为缺一个
-// 它从来没有的依赖而变红。本地跑：
+// 它从来没有的依赖而变红。只允许显式提供一次性测试库，不能指向正式库：
 //
-//	docker compose -f docker-compose.dev.yml up -d postgres
-//	SQUYRRL_TEST_DATABASE_URL='postgres://squyrrl:squyrrl_dev@localhost:55432/squyrrl?sslmode=disable' go test ./internal/features/parser/ -run Cache -v
+//	SQUYRRL_TEST_DATABASE_URL='postgres://USER:PASS@HOST:5432/disposable_test_db' go test ./internal/features/parser/ -run Cache -v
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := os.Getenv("SQUYRRL_TEST_DATABASE_URL")

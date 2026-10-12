@@ -69,7 +69,7 @@ func SignDownloadToken(secret string, c DownloadClaims) (string, error) {
 }
 
 // VerifyUploadToken 校验签名与过期。api 侧 commit 时不重新解令牌
-// （意图表才是真相），这个函数主要供测试与本地 dev 边缘桩使用。
+// （意图表才是真相），这个函数用于令牌协议测试，运行时由 Worker 校验。
 func VerifyUploadToken(secret, token string) (*UploadClaims, error) {
 	var c UploadClaims
 	if err := verifyToken(secret, purposeUpload, token, &c); err != nil {
@@ -78,7 +78,7 @@ func VerifyUploadToken(secret, token string) (*UploadClaims, error) {
 	return &c, nil
 }
 
-// VerifyDownloadToken 供内嵌边缘校验下载令牌；生产由 Worker 用同一套算法自行校验。
+// VerifyDownloadToken 用于下载令牌协议测试；运行时由 Worker 校验。
 func VerifyDownloadToken(secret, token string) (*DownloadClaims, error) {
 	var c DownloadClaims
 	if err := verifyToken(secret, purposeDownload, token, &c); err != nil {

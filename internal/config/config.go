@@ -9,18 +9,16 @@ import (
 )
 
 type Config struct {
-	Env      string `env:"SQUYRRL_ENV"      envDefault:"dev"`
 	HTTPAddr string `env:"SQUYRRL_HTTP_ADDR" envDefault:":8080"`
 
 	DatabaseURL string `env:"SQUYRRL_DATABASE_URL,required"`
 
 	S3Endpoint string `env:"SQUYRRL_S3_ENDPOINT"`
-	// bucket 名跨环境固定为 squyrrl：设成默认值而非 required，好把这一行从所有 env 模板里彻底
-	// 移除（dev MinIO 启动自动建桶，prod R2 预建同名桶即可）。真要改仍可用环境变量覆盖。
+	// R2 预建 squyrrl 桶；需要其他桶名时可用环境变量覆盖。
 	S3Bucket    string `env:"SQUYRRL_S3_BUCKET" envDefault:"squyrrl"`
 	S3AccessKey string `env:"SQUYRRL_S3_ACCESS_KEY"`
 	S3SecretKey string `env:"SQUYRRL_S3_SECRET_KEY"`
-	S3UseSSL    bool   `env:"SQUYRRL_S3_USE_SSL" envDefault:"false"`
+	S3UseSSL    bool   `env:"SQUYRRL_S3_USE_SSL" envDefault:"true"`
 
 	// 邮件走 Resend HTTP API。ResendAPIKey 为空时进入本地日志模式（不外发，见 auth.Mailer）。
 	// 发信域用产品域 squyrrl.com（2026-09-09 改回）：Resend 免费版现已支持验证多个域，
@@ -50,18 +48,14 @@ type Config struct {
 
 	// 客户端与边缘之间的直连（ADR-069 上传 / ADR-070 下载）。两项**都必填**，
 	// 任一为空 ⇒ 上传与下载一起不可用（fail-closed）。
-	//   UploadEdgeBase：边缘基址。生产填 Worker 的自定义域（https://files.squyrrl.com）；
-	//     dev 填 api 自己的内嵌边缘（http://localhost:10260/edge，宿主端口而非容器内的
-	//     8080：这个值原样发给客户端当收发终点）——Worker 的 R2 binding
-	//     连不到 MinIO，wrangler dev 的本地 R2 是另一套存储，所以本地跑 Worker 走不通。
+	//   UploadEdgeBase：Worker 的自定义域（https://files.squyrrl.com）。
 	//     刻意**没有**「留空则回退到服务器中转」这一档：那一档会让文件字节穿过 api，
 	//     一次配置疏漏就变成持续的出网带宽账单，而它坏得毫无声响。宁可传不了，不可悄悄花钱。
 	//   UploadTokenSecret：api 与边缘共享的 HMAC 密钥，两侧必须同值否则边缘一律 401。
 	//     上传票与下载票同密钥不同用途，签名互不通用（见 file/token.go）。
 	// TG 的服务端中转（/internal/tg/files）不依赖这两项，永远可用。
-	UploadEdgeBase string `env:"SQUYRRL_UPLOAD_EDGE_BASE"`
-	// envDefault 与下方 devUploadTokenSecret 必须同值（Go 的 tag 只能写字面量）。
-	UploadTokenSecret string `env:"SQUYRRL_UPLOAD_TOKEN_SECRET" envDefault:"dev-upload-token-secret"`
+	UploadEdgeBase    string `env:"SQUYRRL_UPLOAD_EDGE_BASE"`
+	UploadTokenSecret string `env:"SQUYRRL_UPLOAD_TOKEN_SECRET"`
 
 	// OTP 发信防滥用三层（ADR-074）。全部走 envDefault、不进 .env 模板 ——
 	// 与 SQUYRRL_PARSE_COST 同例：跨环境统一，要调时显式覆盖即可。任一项 <=0 即关闭该层。
@@ -105,7 +99,7 @@ type Config struct {
 	// 退回读缓存 —— 读到的正是刚刚刷新的那一版。
 	//
 	// 5 分钟是「用户觉得内容不对、点一下刷新」这个动作的现实间隔量级；
-	// 设 0 关闭这一层（dev 调刷新链路时会用到）。
+	// 设 0 关闭这一层。
 	ParseRefreshCooldown time.Duration `env:"SQUYRRL_PARSE_REFRESH_COOLDOWN" envDefault:"5m"`
 
 	// GET /me/export 的每用户冷却期。
@@ -114,12 +108,12 @@ type Config struct {
 	// 1000 万条碎片。1 小时不是在限制正常使用 —— 一个人一天导两次已属罕见，
 	// 而这条路径的消费者（降级用户）有 30 天宽限期 —— 它是为了让
 	// 「反复打同一条」不再免费，尤其是「打一半就断开」这种最省事的打法。
-	// 设 0 关闭这一层（dev 调导出格式时会用到）。
+	// 设 0 关闭这一层。
 	ExportCooldown time.Duration `env:"SQUYRRL_EXPORT_COOLDOWN" envDefault:"1h"`
 
 	// 走**内置免费 provider**（YouTube oEmbed / Gist / Reddit / GenericOG）时，
 	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
-	// 跨环境统一走默认值，故不在 .env 模板出现；dev 想免费解析可显式设 0 覆盖。
+	// 使用默认值，故不在 .env.prod 模板出现。
 	//
 	// 接了付费第三方 endpoint 的 provider **不走这个值** —— 它们的价格由
 	// extapi.Quote 从上游单价 × 加价倍率算出（pricing.CreditCost）。
@@ -190,25 +184,18 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-func (c *Config) IsProd() bool { return c.Env == "prod" }
-
-const devUploadTokenSecret = "dev-upload-token-secret"
-
 // Validate 拦截「能正常启动、却会悄悄失效或悄悄花钱」的生产配置组合。
 //
 // 边缘的 fail-closed 设计意味着漏配 EDGE_BASE 只会让上传/下载 503，不会退回服务器中转 ——
 // 安全，但也安静：不在启动时喊出来，就要等第一个用户传不了/打不开文件才发现。
-// 只在 prod 收紧，dev 沿用默认值即可开箱即用。
 func (c *Config) Validate() error {
-	if !c.IsProd() {
-		return nil
-	}
 	var bad []string
 	if c.UploadEdgeBase == "" {
 		bad = append(bad, "SQUYRRL_UPLOAD_EDGE_BASE 未设置：客户端上传与下载将整体不可用")
 	}
-	if c.UploadTokenSecret == "" || c.UploadTokenSecret == devUploadTokenSecret {
-		bad = append(bad, "SQUYRRL_UPLOAD_TOKEN_SECRET 未覆盖 dev 默认值")
+	// 已移除的开发密钥是公开值，仍拒绝旧配置误用。
+	if c.UploadTokenSecret == "" || c.UploadTokenSecret == "dev-upload-token-secret" {
+		bad = append(bad, "SQUYRRL_UPLOAD_TOKEN_SECRET 未设置或使用了已废弃的开发密钥")
 	}
 	if len(bad) > 0 {
 		return fmt.Errorf("生产配置不合法：%s", strings.Join(bad, "；"))

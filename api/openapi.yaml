@@ -31,10 +31,8 @@ info:
     name: Proprietary
 
 servers:
-  - url: http://localhost:10260
-    description: 开发环境（本机 Docker Compose）
   - url: https://api.squyrrl.com
-    description: 生产环境（占位）
+    description: 正式环境（部署测试共用）
 
 tags:
   - name: System
@@ -85,7 +83,7 @@ paths:
                 required: [status, env]
                 properties:
                   status: { type: string, enum: [ok] }
-                  env: { type: string, examples: [dev, test, prod] }
+                  env: { type: string, enum: [prod] }
         '503':
           description: 数据库不通
           content:
@@ -599,8 +597,7 @@ paths:
 
         `exists=true` 时其余字段全部缺省：命中全局去重，一个字节都不用传。
 
-        `upload_url` 恒为非空：生产指向 Worker 自定义域，dev 指向 api 自带的 `/edge`
-        内嵌边缘（Worker 的 R2 binding 连不到 MinIO）。两者契约一致，客户端只需换终点。
+        `upload_url` 恒为非空，指向正式文件 Worker 的自定义域。
 
         `SQUYRRL_UPLOAD_EDGE_BASE` / `SQUYRRL_UPLOAD_TOKEN_SECRET` 任一为空 ⇒ **503**
         （fail-closed）。**没有服务端中转回退**：漏配的代价是传不了文件，而不是让文件字节
@@ -675,144 +672,6 @@ paths:
           description: 上传意图不存在或不属于当前用户
         '409':
           description: 该上传意图已收尾或已作废
-
-  /edge/v1/single:
-    put:
-      operationId: edgeUploadSingle
-      tags: [Files]
-      summary: 内嵌边缘 — 单片写入（仅 dev）
-      description: |
-        与 `server/edge/upload` 的 Cloudflare Worker **契约完全一致**的一份 Go 实现，
-        挂在 api 自身。**仅在 `SQUYRRL_ENV != prod` 时注册**，生产环境本端点不存在 ——
-        门闩按环境而非「是否配了 Worker」开，否则漏配一个环境变量就等于悄悄留下一条
-        绕开 CDN、改吃服务器出网带宽的上传路径。
-
-        存在的理由是 dev：本地接 MinIO，而 Worker 的 R2 binding 连不到 MinIO
-        （`wrangler dev` 的本地 R2 是另一套存储，commit 时 `StatObject` 必然找不到对象）。
-
-        认证用 `POST /files/intent` 签发的**上传令牌**，不是 Bearer access token。
-        请求体为该对象的全部混淆字节；服务端校验大小与整体 `cipher_hash` 后才写入。
-
-        上传令牌与下载令牌共用同一把密钥但用途不同，签名互不通用（见 `/edge/v1/blob`）。
-      security: []
-      parameters:
-        - in: header
-          name: Authorization
-          required: true
-          schema: { type: string }
-          description: '`Bearer <upload_token>`'
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema: { type: string, format: binary }
-      responses:
-        '200':
-          description: 已写入
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401':
-          description: 令牌缺失、签名不符或已过期
-
-  /edge/v1/part/{n}:
-    put:
-      operationId: edgeUploadPart
-      tags: [Files]
-      summary: 内嵌边缘 — 分片写入（仅 dev）
-      description: |
-        见 `/edge/v1/single`。`n` 为 1-based 分片序号，须落在 `1..part_count`。
-        末片大小是余数，其余恒为 `part_size`；大小不符直接拒绝，不必等到 commit
-        才拿一个 R2 的通用错误。
-
-        multipart 下整体哈希跨请求算不出来，故改为逐片校验可选的 `X-Part-Hash`。
-        两者都只挡传输损坏 —— `plain_hash` 与 `cipher_hash` 皆由客户端声称，
-        而服务端没有混淆密钥（ADR-003），从来就无法验证二者对应。
-      security: []
-      parameters:
-        - in: path
-          name: n
-          required: true
-          schema: { type: integer, minimum: 1 }
-        - in: header
-          name: Authorization
-          required: true
-          schema: { type: string }
-          description: '`Bearer <upload_token>`'
-        - in: header
-          name: X-Part-Hash
-          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
-          description: 该片密文的 SHA-256；提供则逐片校验
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema: { type: string, format: binary }
-      responses:
-        '200':
-          description: 分片已写入，返回 ETag 供 commit 使用
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [part_number, etag]
-                properties:
-                  part_number: { type: integer }
-                  etag: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401':
-          description: 令牌缺失、签名不符或已过期
-
-  /edge/v1/blob:
-    get:
-      operationId: edgeGetBlob
-      tags: [Files]
-      summary: 内嵌边缘 — 凭票读对象（仅 dev）
-      description: |
-        见 `/edge/v1/single` 的门闩说明，同样**仅在 `SQUYRRL_ENV != prod` 时注册**。
-        生产由 `server/edge/upload` 的 Worker 在自定义域上承担同一条路由。
-
-        认证用 `GET /files/{id}/ticket` 签发的**下载令牌**，不是 Bearer access token。
-        令牌两种取法都认：`?t=` 查询参数或 `Authorization: Bearer`。
-
-        **下载令牌与上传令牌签名互不通用**：用途字符串参与 HMAC 计算。否则一张下载票
-        （没有 `sz`/`ch`）就能拿去打 `/edge/v1/single`，边缘会解出「期望 0 字节、
-        无需校验哈希」，把那个内容寻址的 key 覆盖成空对象。
-
-        `Content-Type` 取自令牌而非 R2 元数据：直传是用 binding 的 `put(key, body)` 写的、
-        没带 httpMetadata，从 R2 读只会得到 `application/octet-stream`。
-      security: []
-      parameters:
-        - in: query
-          name: t
-          schema: { type: string }
-          description: '下载令牌；也可改用 `Authorization: Bearer <token>` 头'
-        - in: header
-          name: If-None-Match
-          schema: { type: string }
-          description: 命中则回 304，不传字节
-      responses:
-        '200':
-          description: 对象字节
-          headers:
-            ETag:
-              schema: { type: string }
-            Cache-Control:
-              schema: { type: string }
-              description: '`private, max-age=31536000, immutable`（key 是内容寻址的，字节永不改变）'
-          content:
-            application/octet-stream:
-              schema: { type: string, format: binary }
-        '304':
-          description: 与 If-None-Match 一致，未变更
-        '401':
-          description: 令牌缺失、签名不符、用途不对或已过期
-        '404':
-          description: 对象不存在
 
   /files/{id}:
     parameters:
