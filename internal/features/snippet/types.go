@@ -130,6 +130,36 @@ type UpdateInput struct {
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	TagIDs      *[]uuid.UUID    `json:"tag_ids,omitempty"`  // nil = 不变；空切片 = 清空所有标签
 	Elements    *[]ElementInput `json:"elements,omitempty"` // nil = 不变；空切片 = 清空所有元素
+
+	// Flatten 把非 normal 碎片坍塌为 normal（ADR-001，单向不可逆），与本次编辑在同一事务里生效。
+	// 见 applyFlatten。与 payload 互斥：坍塌就是丢弃 payload，同时再给一份是自相矛盾的请求。
+	Flatten bool `json:"flatten,omitempty"`
+}
+
+// ErrFlattenWithPayload 是 flatten 与 payload 同时出现时的拒绝原因。
+var ErrFlattenWithPayload = errors.New("flatten 与 payload 不能同时提交")
+
+// applyFlatten 对 cur 执行坍塌：只改「类型专属」的列 ——
+// type→normal，subtype / payload / source_data 清空，source_type→device，
+// text_format 未在本次请求里显式给出时→plain。标题、正文、附件、页面、标签都不动。
+//
+// 把链接等核心数据转写进 text_content 是客户端的事：正文由客户端混淆，服务端从不解读它。
+// 所以服务端这一侧只剩「清列」，也因此能和编辑放进同一个事务 —— 同一个 id、
+// 原 created_at、version 照常 +1，别的设备上的过期写入照常 409 进冲突收件箱。
+//
+// 对 normal 是空操作：重复提交不会把一条 markdown 碎片的格式悄悄改回 plain。
+func applyFlatten(cur *Snippet, in *UpdateInput) {
+	if !in.Flatten || cur.Type == "normal" {
+		return
+	}
+	cur.Type = "normal"
+	cur.Subtype = nil
+	cur.Payload = json.RawMessage("{}")
+	cur.SourceType = "device"
+	cur.SourceData = json.RawMessage("{}")
+	if in.TextFormat == nil {
+		cur.TextFormat = "plain"
+	}
 }
 
 type ListInput struct {

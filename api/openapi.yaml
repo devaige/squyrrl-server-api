@@ -492,7 +492,8 @@ paths:
         - body 中的 `version` 字段（兜底）
 
         字段存在即更新；缺省字段保持不变。`tag_ids` 为空数组表示清空所有标签。
-        type / source / 等不可变字段无法通过 PATCH 修改。
+        type / subtype / source 不能直接修改，唯一的例外是 `flatten`：把非 normal
+        碎片坍塌为 normal（ADR-001，单向）。
       parameters:
         - in: header
           name: If-Match
@@ -2089,6 +2090,14 @@ components:
           type: [array, 'null']
           description: nil = 不变；空数组 = 清空所有元素；非空 = 完整替换
           items: { $ref: '#/components/schemas/ElementInput' }
+        flatten:
+          type: boolean
+          description: |
+            把非 normal 碎片坍塌为 normal（ADR-001，单向不可逆），与本次其他字段的修改在同一事务里生效：
+            type→normal，subtype / payload / source_data 清空，source_type→device，
+            未同时提交 text_format 时→plain。id、created_at、标题、正文、附件、页面、标签不变，version 照常 +1。
+            把链接等核心数据转写进 text_content 由客户端完成（正文是客户端混淆的）。
+            对 normal 碎片是空操作。与 `payload` 同传返回 400。
 
     SnippetList:
       type: object

@@ -113,6 +113,10 @@ func (h *Handler) update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 version（请求体或 If-Match 头）"})
 		return
 	}
+	if in.Flatten && len(in.Payload) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": ErrFlattenWithPayload.Error()})
+		return
+	}
 
 	s, err := h.svc.Update(c.Request.Context(), id.UserID, sid, &in)
 	if err != nil {

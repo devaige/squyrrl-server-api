@@ -160,6 +160,15 @@ func (r *Repo) InsertConflictLoser(
 	if len(in.Payload) > 0 {
 		payload = in.Payload
 	}
+	typ, subtype := cur.Type, cur.Subtype
+	if in.Flatten && typ != "normal" {
+		// 输掉的那次编辑本来要坍塌：副本按坍塌后的形态落。否则冲突收件箱里会出现一条
+		// 正文已被改写、却仍挂着 special 专属渲染与上游链接的碎片。
+		typ, subtype, payload = "normal", nil, json.RawMessage("{}")
+		if in.TextFormat == nil {
+			textFormat = "plain"
+		}
+	}
 
 	sourceData, _ := json.Marshal(map[string]any{
 		"provider":                     "conflict",
@@ -177,7 +186,7 @@ func (r *Repo) InsertConflictLoser(
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id`,
-		userID, pageID, cur.Type, cur.Subtype,
+		userID, pageID, typ, subtype,
 		title, description, textContent, textFormat, textLang, payload,
 		"device", sourceData).Scan(&id)
 	return id, err
@@ -394,6 +403,7 @@ func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput
 	if len(in.Payload) > 0 {
 		cur.Payload = in.Payload
 	}
+	applyFlatten(cur, in)
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE snippets SET
@@ -404,10 +414,15 @@ func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput
 			text_format = $5,
 			text_lang = $6,
 			payload = $7,
+			type = $8,
+			subtype = $9,
+			source_type = $10,
+			source_data = $11,
 			version = version + 1
-		WHERE id = $8 AND user_id = $9 AND version = $10`,
+		WHERE id = $12 AND user_id = $13 AND version = $14`,
 		cur.PageID, cur.Title, cur.Description, cur.TextContent,
 		cur.TextFormat, cur.TextLang, cur.Payload,
+		cur.Type, cur.Subtype, cur.SourceType, cur.SourceData,
 		id, userID, in.Version); err != nil {
 		return nil, err
 	}
