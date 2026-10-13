@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"time"
 )
 
@@ -97,7 +98,11 @@ func (p *GistProvider) Parse(ctx context.Context, uri, resourceID string) (*Pars
 			RawURL:   f.RawURL,
 		})
 	}
+	// files 来自 map，遍历顺序随机；按文件名排是 GitHub 自己展示 gist 的顺序，
+	// 也让无 description 时的标题、payload 里的文件列表每次解析都一致。
+	sort.Slice(files, func(i, j int) bool { return files[i].Filename < files[j].Filename })
 
+	// description 是 gist 的标题字段；没写时 GitHub 用首个文件名称呼这个 gist
 	title := raw.Description
 	if title == "" && len(files) > 0 {
 		title = files[0].Filename
