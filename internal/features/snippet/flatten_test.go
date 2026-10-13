@@ -12,15 +12,15 @@ import (
 )
 
 func specialSnippet() *Snippet {
-	sub := "telegram_message"
+	sub := "youtube"
 	return &Snippet{
 		Type:        "special",
 		Subtype:     &sub,
 		TextContent: []byte("obfuscated"),
 		TextFormat:  "markdown",
-		Payload:     json.RawMessage(`{"kind":"message","url":"https://t.me/c/1/2"}`),
+		Payload:     json.RawMessage(`{"url":"https://www.youtube.com/watch?v=abc","video_id":"abc"}`),
 		SourceType:  "upstream",
-		SourceData:  json.RawMessage(`{"provider":"telegram","tg_message_id":2}`),
+		SourceData:  json.RawMessage(`{"provider":"youtube","author_handle":"someone"}`),
 	}
 }
 
@@ -99,14 +99,14 @@ func TestRepoUpdateFlatten(t *testing.T) {
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 
 	repo := NewRepo(pool)
-	sub := "telegram_message"
+	sub := "youtube"
 	created, err := repo.Create(ctx, userID, &CreateInput{
 		Type:        "special",
 		Subtype:     &sub,
 		TextContent: []byte("old"),
-		Payload:     json.RawMessage(`{"url":"https://t.me/c/1/2"}`),
+		Payload:     json.RawMessage(`{"url":"https://www.youtube.com/watch?v=abc"}`),
 		SourceType:  "upstream",
-		SourceData:  json.RawMessage(`{"provider":"telegram"}`),
+		SourceData:  json.RawMessage(`{"provider":"youtube"}`),
 	})
 	if err != nil {
 		t.Fatalf("建碎片失败: %v", err)
