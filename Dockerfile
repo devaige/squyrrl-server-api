@@ -26,9 +26,16 @@ COPY . .
 # goose 版本钉死为与 go.mod 一致的 v3.27.1（原 @latest 每次都要向 proxy 拉 @v/list
 # 做版本解析——既不可复现，又正是本次 EOF 的触发点）。goose v3 本就是本项目库依赖，
 # 该版本已在 go mod download 时进缓存，install CLI 子包无需再联网解析。
+#
+# goose CLI 默认把所有驱动都编进来（clickhouse / ydb / mssql / sqlite / ...），
+# 编译期临时文件因此多出约 400 MB，曾在生产机上把 /tmp 写满导致构建失败。
+# 本项目只用 postgres，用 build tag 剔除其余驱动：编译缓存 558 MB → 153 MB，
+# 二进制 39 MB → 12 MB。新增驱动时记得从 GOOSE_TAGS 里删掉对应的 no_xxx。
+ARG GOOSE_TAGS="no_clickhouse no_libsql no_mssql no_mysql no_sqlite3 no_vertica no_ydb"
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/squyrrl-api ./cmd/api \
- && go install github.com/pressly/goose/v3/cmd/goose@v3.27.1 \
+ && go install -trimpath -ldflags="-s -w" -tags "${GOOSE_TAGS}" \
+    github.com/pressly/goose/v3/cmd/goose@v3.27.1 \
  && cp "$(go env GOPATH)/bin/goose" /out/goose
 
 # -------- 运行阶段 --------
