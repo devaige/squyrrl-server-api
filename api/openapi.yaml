@@ -1007,7 +1007,7 @@ paths:
                       enum: [uri, url, normal, special]
                     subtype:
                       type: string
-                      description: special 类型的子类，如 telegram_contact / telegram_profile
+                      description: special 类型的子类，如 telegram_message / telegram_contact / telegram_profile
                     title: { type: string }
                     description: { type: string }
                     text_content:
@@ -1017,7 +1017,7 @@ paths:
                     text_format: { type: string, default: plain }
                     payload:
                       type: object
-                      description: TG 富元数据，含 url（链接碎片与主页）/ forward_origin / contact / profile
+                      description: TG 富元数据，含 url（跳回原消息）/ forward_origin / contact / profile
                     file_ids:
                       type: array
                       items: { type: string, format: uuid }
