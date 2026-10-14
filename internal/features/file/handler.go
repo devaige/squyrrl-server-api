@@ -73,6 +73,8 @@ func (h *Handler) intent(c *gin.Context) {
 		Mime:            mime,
 		ThumbCipherHash: thumbHash,
 		ThumbSizeBytes:  in.ThumbSizeBytes,
+		Dims:            NormDims(in.Width, in.Height),
+		ThumbDims:       NormDims(in.ThumbWidth, in.ThumbHeight),
 	})
 	if err != nil {
 		switch {

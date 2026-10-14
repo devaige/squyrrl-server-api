@@ -47,12 +47,47 @@ const intentTTL = 2 * time.Hour
 
 // MaxThumbBytes 是客户端缩略图（**混淆后**）的字节上限。
 //
-// 256 px 长边、q80 的 JPEG 通常 8–25 KB；混淆只加 25 字节头加每块 16 字节 tag，
-// 一块就装得下，所以 64 KiB 留了两倍以上余量。
+// 客户端按「长边取原图 1/3、封顶 512 px」生成，超了就逐级降 JPEG 质量直到装下，
+// 实在装不下就不带缩略图；混淆只加 25 字节头加每块 16 字节 tag。
 //
 // 它必须存在，是因为缩略图字节**不计存储配额**（理由见 validateThumb）：没有天花板
 // 的话，一个 1 字节的本体就能拖着一份任意大的「缩略图」进 R2，而配额只看得见那 1 字节。
 const MaxThumbBytes int64 = 64 * 1024
+
+// MaxUpstreamThumbBytes 是上游（TG 等）自带缩略图的字节上限（**混淆后**）。
+//
+// 比 MaxThumbBytes 宽，是因为这份字节不是我们压的：TG 照片的中间档常见 800 px、
+// 60–150 KB，卡 64 KiB 就只能退到 320 px 甚至 90 px 那档（2026-10-14 用户决策）。
+// 放宽不会让未计费面积失控 —— 真正框住它的是「必须严格小于本体」那条，见 validateThumb。
+const MaxUpstreamThumbBytes int64 = 256 * 1024
+
+// MaxDimension 是声明尺寸的合理上限。尺寸只用于排版，越界的声明按「未知」处理而不是
+// 拒绝整次上传 —— 与缩略图同一个原则：排版信息出问题，不能拖垮一份本该成功的上传。
+const MaxDimension = 1 << 16
+
+// Dims 是一张图的像素尺寸。零值 = 未知（老数据、非图片、上传方没给）。
+type Dims struct {
+	Width  int
+	Height int
+}
+
+// NormDims 把声明的尺寸规整成 Dims：任一边不合法就整体视为未知，
+// 让「只知道宽不知道高」这种半状态不可表示（与 chk_files_dims 一致）。
+func NormDims(w, h int) Dims {
+	if w <= 0 || h <= 0 || w > MaxDimension || h > MaxDimension {
+		return Dims{}
+	}
+	return Dims{Width: w, Height: h}
+}
+
+// nullable 给 SQL 用：未知写 NULL，而不是 0 —— 0 会被 CHECK 拒掉。
+func (d Dims) nullable() (*int, *int) {
+	if d.Width <= 0 || d.Height <= 0 {
+		return nil, nil
+	}
+	w, h := d.Width, d.Height
+	return &w, &h
+}
 
 // PartCountFor 按 PartSize 切分；size <= PartSize 时返回 1（走单片模式，
 // 省掉 multipart 的 create/complete 两次额外 Class A 操作）。
@@ -82,6 +117,10 @@ type UploadIntent struct {
 	// 老客户端），下载侧从第一天起就支持 thumb_url 缺省。
 	ThumbCipherHash []byte
 	ThumbSizeBytes  int64
+
+	// 声明的原图与缩略图尺寸，收尾时原样落进 files。
+	Dims      Dims
+	ThumbDims Dims
 }
 
 // IntentResponse 是 POST /files/intent 的回包。
@@ -114,6 +153,12 @@ type IntentInput struct {
 	// 而且必须一直合法 —— 非图片、解码失败、老版本客户端都会走到这里。
 	ThumbCipherHash string `json:"thumb_cipher_hash" binding:"omitempty,hexadecimal,len=64"`
 	ThumbSizeBytes  int64  `json:"thumb_size_bytes"`
+
+	// 尺寸全部可选，越界按未知处理（见 NormDims）。thumb_* 只在声明了缩略图时才有意义。
+	Width       int `json:"width"`
+	Height      int `json:"height"`
+	ThumbWidth  int `json:"thumb_width"`
+	ThumbHeight int `json:"thumb_height"`
 }
 
 // IntentRequest 是 IssueIntent 的入参。
@@ -131,6 +176,9 @@ type IntentRequest struct {
 	// 两项同进同退：要么都给，要么都不给（与 upload_intents 的 CHECK 一致）。
 	ThumbCipherHash []byte
 	ThumbSizeBytes  int64
+
+	Dims      Dims
+	ThumbDims Dims
 }
 
 // CommitInput 收尾。单片模式 parts 为空；multipart 模式必须交齐每片的 ETag，
@@ -153,6 +201,12 @@ type File struct {
 	Mime         string    `json:"mime"`
 	HasThumbnail bool      `json:"has_thumbnail"`
 	CreatedAt    time.Time `json:"created_at"`
+
+	// 像素尺寸，0 = 未知（缺省不输出）。缩略图尺寸只在 HasThumbnail 时可能有值。
+	Width       int `json:"width,omitempty"`
+	Height      int `json:"height,omitempty"`
+	ThumbWidth  int `json:"thumb_width,omitempty"`
+	ThumbHeight int `json:"thumb_height,omitempty"`
 
 	// 不输出给客户端
 	StorageBucket string `json:"-"`

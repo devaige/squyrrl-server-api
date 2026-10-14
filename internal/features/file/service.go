@@ -92,11 +92,13 @@ func (s *Service) Check(ctx context.Context, plainHash []byte) (*File, bool, err
 // Upload 接收混淆字节并落库；若已存在直接返回，不重复上传
 //   - body 限制为 declaredSize 字节（避免吃光内存）
 //   - 校验上传字节的 SHA-256 与 declaredCipherHash 一致
+//   - dims 是上传方声明的原图尺寸，零值 = 未知；去重命中时忽略
 func (s *Service) Upload(
 	ctx context.Context,
 	plainHash, cipherHash []byte,
 	declaredSize int64,
 	mime string,
+	dims Dims,
 	body io.Reader,
 ) (*File, error) {
 	if existing, ok, err := s.Check(ctx, plainHash); err != nil {
@@ -125,7 +127,7 @@ func (s *Service) Upload(
 		return nil, err
 	}
 
-	f, err := s.repo.Insert(ctx, plainHash, cipherHash, declaredSize, mime, s.storage.Bucket(), storageKey)
+	f, err := s.repo.Insert(ctx, plainHash, cipherHash, declaredSize, mime, s.storage.Bucket(), storageKey, dims)
 	if err != nil {
 		return nil, err
 	}
@@ -161,10 +163,76 @@ func (s *Service) generateThumbnailAsync(fileID [16]byte, storageKey string, pla
 		return
 	}
 
-	if err := s.repo.SetThumbnailKey(ctx, fileID, key); err != nil {
+	if _, err := s.repo.SetThumbnail(ctx, fileID, key, Dims{}); err != nil {
 		slog.Warn("thumb 写库失败", "file_id", fileID, "err", err)
 		return
 	}
+}
+
+// AttachUpstreamThumbnail 给一份已入库的文件补挂上游自带的缩略图（TG 等）。
+//
+// 与直传收尾的缩略图分开走，因为这份字节不是我们生成的：上限放宽到
+// MaxUpstreamThumbBytes，也不限 mime —— TG 给视频、动图、文件、音频都带缩略图，
+// 视频封面正好补上「客户端不做首帧」的空缺。
+//
+// 文件已经有缩略图时直接返回、什么都不做：这条路同时承担「去重命中的老文件顺手补图」，
+// 而一行 files 只有一个槽位，已有的那份不该被覆盖。检查与写库之间理论上有一个
+// 并发窗口（同一行被直传收尾同时补上），代价是对象被同一张图的另一份编码覆盖，
+// 库里尺寸与之相差几个像素 —— 只影响排版，不值得为它加锁。
+func (s *Service) AttachUpstreamThumbnail(
+	ctx context.Context,
+	fileID uuid.UUID,
+	cipherHash []byte,
+	declaredSize int64,
+	dims Dims,
+	body io.Reader,
+) (*File, error) {
+	f, err := s.repo.Get(ctx, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if f.HasThumbnail {
+		return f, nil
+	}
+	if err := validateUpstreamThumb(f.SizeBytes, declaredSize); err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(body, declaredSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != declaredSize {
+		return nil, ErrSizeMismatch
+	}
+	actual := sha256.Sum256(data)
+	if !bytes.Equal(actual[:], cipherHash) {
+		return nil, ErrCipherMismatch
+	}
+
+	key := ThumbnailKeyFor(f.StorageKey)
+	if err := s.storage.Put(ctx, key, bytes.NewReader(data), declaredSize, "image/jpeg"); err != nil {
+		return nil, err
+	}
+	ok, err := s.repo.SetThumbnail(ctx, f.ID, key, dims)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		f.ThumbnailKey = key
+		f.HasThumbnail = true
+		f.ThumbWidth, f.ThumbHeight = dims.Width, dims.Height
+	}
+	return f, nil
+}
+
+// validateUpstreamThumb 只有两条：上限 MaxUpstreamThumbBytes，且严格小于本体。
+// 后一条与 validateThumb 里的是同一条不变式，未计费面积因此仍被框死在本体以内。
+func validateUpstreamThumb(blobSize, thumbSize int64) error {
+	if thumbSize <= 0 || thumbSize > MaxUpstreamThumbBytes || thumbSize >= blobSize {
+		return ErrThumbTooLarge
+	}
+	return nil
 }
 
 // GetMetadata 只返 file 元数据（JSON），不读字节
@@ -277,6 +345,12 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 		r2UploadID = id
 	}
 
+	// 没声明缩略图时它的尺寸毫无意义，别让一组孤立的数字落进 files。
+	thumbDims := in.ThumbDims
+	if len(in.ThumbCipherHash) == 0 {
+		thumbDims = Dims{}
+	}
+
 	expiresAt := time.Now().Add(intentTTL)
 	it, err := s.repo.InsertIntent(ctx, &UploadIntent{
 		UserID: in.UserID, PlainHash: in.PlainHash, CipherHash: in.CipherHash,
@@ -284,6 +358,7 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 		R2UploadID: r2UploadID, PartSize: PartSize, PartCount: partCount,
 		ExpiresAt:       expiresAt,
 		ThumbCipherHash: in.ThumbCipherHash, ThumbSizeBytes: in.ThumbSizeBytes,
+		Dims: in.Dims, ThumbDims: thumbDims,
 	})
 	if err != nil {
 		// 意图落库失败而 multipart 已开：立刻 abort，否则那些分片没人认领也没人计费提醒
@@ -419,7 +494,7 @@ func (s *Service) Commit(
 	}
 
 	f, err := s.repo.Insert(ctx, it.PlainHash, it.CipherHash, it.SizeBytes,
-		it.Mime, s.storage.Bucket(), it.StorageKey)
+		it.Mime, s.storage.Bucket(), it.StorageKey, it.Dims)
 	if err != nil {
 		return nil, err
 	}
@@ -461,8 +536,12 @@ func (s *Service) attachThumbnail(ctx context.Context, f *File, it *UploadIntent
 		return
 	}
 
-	if err := s.repo.SetThumbnailKey(ctx, f.ID, key); err != nil {
+	ok, err := s.repo.SetThumbnail(ctx, f.ID, key, it.ThumbDims)
+	if err != nil {
 		slog.Warn("缩略图写库失败", "file_id", f.ID, "err", err)
+		return
+	}
+	if !ok {
 		return
 	}
 
@@ -470,6 +549,7 @@ func (s *Service) attachThumbnail(ctx context.Context, f *File, it *UploadIntent
 	// 刚生成的缩略图也落进本地缓存；这里返回 false，它下次预览就会白下一次原图。
 	f.ThumbnailKey = key
 	f.HasThumbnail = true
+	f.ThumbWidth, f.ThumbHeight = it.ThumbDims.Width, it.ThumbDims.Height
 }
 
 // abortIntentObject 丢弃意图对应的 R2 半成品：multipart 走 abort，单片走 delete。

@@ -28,9 +28,17 @@ const snippetCols = `
 			'file_id', e.file_id,
 			'order_idx', e.order_idx,
 			'alt_text', e.alt_text,
-			'created_at', e.created_at
+			'created_at', e.created_at,
+			'mime', f.mime,
+			'size_bytes', f.size_bytes,
+			'has_thumbnail', f.thumbnail_key IS NOT NULL,
+			'width', f.width,
+			'height', f.height,
+			'thumb_width', f.thumb_width,
+			'thumb_height', f.thumb_height
 		) ORDER BY e.order_idx, e.created_at)
-		FROM elements e WHERE e.snippet_id = s.id),
+		FROM elements e LEFT JOIN files f ON f.id = e.file_id
+		WHERE e.snippet_id = s.id),
 		'[]'::json
 	) AS elements`
 

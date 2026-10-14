@@ -1099,6 +1099,16 @@ paths:
             查这个账户的存储配额 —— 这条路径上账户此前要到建碎片那步才解析得出来，
             于是字节先落 R2、配额不足事后才暴露，留下一批已经开始计费的孤儿对象。
             缺省时跳过配额校验（兼容尚未升级的 Bot）。
+        - name: X-Width
+          in: header
+          required: false
+          schema: { type: integer }
+          description: 原图像素宽。与 `X-Height` 同进同退，缺省、非法或越界都按未知处理，不会拒绝上传。
+        - name: X-Height
+          in: header
+          required: false
+          schema: { type: integer }
+          description: 原图像素高，规则同 `X-Width`。
       requestBody:
         required: true
         content:
@@ -1126,6 +1136,65 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '413':
           description: 超过单文件 100MiB 上限
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/tg/files/{id}/thumbnail:
+    post:
+      operationId: attachTelegramFileThumbnail
+      tags: [Telegram]
+      summary: Bot 端：给已入库的文件补挂上游自带的缩略图
+      description: |
+        TG 照片取中间一档（`n / 2`，偶数档取靠上那档），视频 / 动图 / 文件 / 音频取
+        `thumbnail`。字节由 Bot 按与本体相同的格式混淆（ADR-003）。
+
+        上限 **256 KiB**（混淆后），比客户端缩略图的 64 KiB 宽：这份字节是上游压的，
+        TG 中间档常见 60–150 KB。不限 mime。仍必须**严格小于本体** —— 未计费面积
+        靠这条框死，放宽上限不放宽它。不查配额，缩略图字节不计存储。
+
+        文件已经有缩略图时直接返回、不覆盖：一行 files 只有一个缩略图槽位。
+        这也让去重命中的老文件可以走同一条路补图。
+      security:
+        - internalToken: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Cipher-Hash, in: header, required: true, schema: { type: string }, description: 缩略图混淆后的 SHA-256 hex }
+        - { name: X-Size-Bytes,  in: header, required: true, schema: { type: integer }, description: 缩略图混淆后的字节数 }
+        - { name: X-Width,  in: header, required: false, schema: { type: integer }, description: 缩略图像素宽 }
+        - { name: X-Height, in: header, required: false, schema: { type: integer }, description: 缩略图像素高 }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: 已挂上，或文件原本就有缩略图（未改动）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/File' }
+        '400':
+          description: 头缺失，或收到的字节与声明的哈希/大小不符
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: 超过 256 KiB，或不小于本体
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2011,6 +2080,17 @@ components:
         alt_text:
           type: [string, 'null']
         created_at: { type: string, format: date-time }
+        mime: { type: string, description: 只读，取自 files }
+        size_bytes: { type: integer, format: int64, description: 只读，混淆后字节数 }
+        has_thumbnail: { type: boolean, description: 只读，是否存有缩略图对象 }
+        width: { type: integer, description: 只读，原图像素宽；缺省 = 未知 }
+        height: { type: integer, description: 只读，原图像素高；缺省 = 未知 }
+        thumb_width: { type: integer, description: 只读，缩略图像素宽；缺省 = 未知 }
+        thumb_height: { type: integer, description: 只读，缩略图像素高；缺省 = 未知 }
+      description: |
+        `mime` 及之后的字段取自 `files`，只读。列表卡片靠它们在拿到任何字节之前定下
+        版式与格子内容：单图带文本时，预览图（有缩略图用缩略图，否则原图）的宽度大于
+        卡片内容区就走大图。没有这些字段，每个附件都得先取一次票才知道是不是图。
 
     ElementInput:
       type: object
@@ -2126,12 +2206,17 @@ components:
         has_thumbnail:
           type: boolean
           description: |
-            是否存有这份文件的缩略图对象（256 px 长边、JPEG q80）。
-            直传路径由**客户端**在混淆之前生成并随本体一起传给边缘；api 全程不碰字节，
-            只在 commit 时核对 R2 里的实际大小再填 `thumbnail_key`。
-            TG 摄取那条服务端还持有 body 的路径仍走 ADR-050 的服务端生成。
+            是否存有这份文件的缩略图对象（JPEG）。
+            直传路径由**客户端**在混淆之前生成（长边取原图 1/3、封顶 512 px，混淆后
+            ≤ 64 KiB）并随本体一起传给边缘；api 全程不碰字节，只在 commit 时核对 R2
+            里的实际大小再填 `thumbnail_key`。
+            TG 摄取用上游自带的缩略图，经 `/internal/tg/files/{id}/thumbnail` 补挂。
             两者产出同一个 key，区别只在字节是否混淆 —— 见 `thumb_url` 的说明。
         created_at: { type: string, format: date-time }
+        width: { type: integer, description: 原图像素宽；缺省 = 未知（老数据、非图片） }
+        height: { type: integer, description: 原图像素高；缺省 = 未知 }
+        thumb_width: { type: integer, description: 缩略图像素宽；缺省 = 未知（含历史缩略图） }
+        thumb_height: { type: integer, description: 缩略图像素高；缺省 = 未知 }
 
     FileTicket:
       type: object
@@ -2188,6 +2273,14 @@ components:
             后一条是把「不计配额的字节」框死的不变式：未计费字节因此恒不超过已计费
             字节，最坏情况下 R2 实际占用是配额的 2 倍，现实中是 1.005 倍。
             两个 thumb_* 字段同进同退，只给一个视为非法。
+        width:
+          type: integer
+          description: |
+            可选，原图像素宽（客户端解码时顺手拿到）。与 `height` 同进同退；
+            缺省、非法或越界都按未知处理，**不会**因此拒绝上传 —— 尺寸只管排版。
+        height: { type: integer, description: 可选，原图像素高，规则同 `width` }
+        thumb_width: { type: integer, description: 可选，缩略图像素宽；没声明缩略图时忽略 }
+        thumb_height: { type: integer, description: 可选，缩略图像素高；没声明缩略图时忽略 }
 
     UploadIntentResponse:
       type: object

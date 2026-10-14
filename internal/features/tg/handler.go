@@ -155,6 +155,10 @@ func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 	// 所以这里只是换一道守卫复用同一个 file.Service，没有第二套存储逻辑。
 	g.POST("/files/check", h.checkFile)
 	g.POST("/files", h.uploadFile)
+	// 上游自带的缩略图单独补挂：本体那条请求体是裸字节，塞第二份进去就得改成
+	// multipart，新旧 Bot 之间就没法独立部署了（ADR-063）。分开之后去重命中的
+	// 老文件也能走同一条路补图。
+	g.POST("/files/:id/thumbnail", h.attachThumbnail)
 }
 
 func (h *Handler) consumeToken(c *gin.Context) {
@@ -328,7 +332,8 @@ func (h *Handler) uploadFile(c *gin.Context) {
 		return
 	}
 
-	f, err := h.fileSvc.Upload(c.Request.Context(), plain, cipher, size, mime, c.Request.Body)
+	f, err := h.fileSvc.Upload(c.Request.Context(), plain, cipher, size, mime,
+		headerDims(c), c.Request.Body)
 	if err != nil {
 		switch {
 		case errors.Is(err, file.ErrCipherMismatch):
@@ -341,6 +346,55 @@ func (h *Handler) uploadFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, file.UploadResponse{File: f})
+}
+
+// attachThumbnail 给已入库的文件补挂上游缩略图。字节是 Bot 混淆过的，
+// 头部约定与 uploadFile 一致；X-Width / X-Height 是**缩略图**的尺寸。
+//
+// 不查配额：缩略图字节不计存储（见 file.validateThumb），框住它的是「必须严格小于本体」。
+func (h *Handler) attachThumbnail(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的文件 id"})
+		return
+	}
+	cipher, err := hex.DecodeString(c.GetHeader("X-Cipher-Hash"))
+	if err != nil || len(cipher) != 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Cipher-Hash 缺失或非法"})
+		return
+	}
+	size, err := strconv.ParseInt(c.GetHeader("X-Size-Bytes"), 10, 64)
+	if err != nil || size <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Size-Bytes 缺失或非法"})
+		return
+	}
+
+	f, err := h.fileSvc.AttachUpstreamThumbnail(c.Request.Context(), id, cipher, size,
+		headerDims(c), c.Request.Body)
+	if err != nil {
+		switch {
+		case errors.Is(err, file.ErrNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "文件不存在"})
+		case errors.Is(err, file.ErrThumbTooLarge):
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "缩略图超过上限或不小于本体"})
+		case errors.Is(err, file.ErrCipherMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "上传字节哈希与 X-Cipher-Hash 不匹配"})
+		case errors.Is(err, file.ErrSizeMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "上传字节大小与 X-Size-Bytes 不匹配"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, file.UploadResponse{File: f})
+}
+
+// headerDims 读可选的 X-Width / X-Height。缺省、不是数字、越界都按未知处理 ——
+// 尺寸只管排版，不该让一份本来合法的上传失败。
+func headerDims(c *gin.Context) file.Dims {
+	w, _ := strconv.Atoi(c.GetHeader("X-Width"))
+	h, _ := strconv.Atoi(c.GetHeader("X-Height"))
+	return file.NormDims(w, h)
 }
 
 // =============================================================================

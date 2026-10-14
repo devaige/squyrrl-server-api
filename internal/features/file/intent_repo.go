@@ -15,13 +15,15 @@ import (
 // 数据库那边由 chk_upload_intents_thumb 保证两者同进同退。
 const intentCols = `id, user_id, plain_hash, cipher_hash, size_bytes, mime,
 	storage_key, coalesce(r2_upload_id, ''), part_size, part_count, status, expires_at,
-	thumb_cipher_hash, coalesce(thumb_size_bytes, 0)`
+	thumb_cipher_hash, coalesce(thumb_size_bytes, 0),
+	coalesce(width, 0), coalesce(height, 0), coalesce(thumb_width, 0), coalesce(thumb_height, 0)`
 
 func scanIntent(row pgx.Row) (*UploadIntent, error) {
 	var it UploadIntent
 	if err := row.Scan(&it.ID, &it.UserID, &it.PlainHash, &it.CipherHash, &it.SizeBytes,
 		&it.Mime, &it.StorageKey, &it.R2UploadID, &it.PartSize, &it.PartCount,
-		&it.Status, &it.ExpiresAt, &it.ThumbCipherHash, &it.ThumbSizeBytes); err != nil {
+		&it.Status, &it.ExpiresAt, &it.ThumbCipherHash, &it.ThumbSizeBytes,
+		&it.Dims.Width, &it.Dims.Height, &it.ThumbDims.Width, &it.ThumbDims.Height); err != nil {
 		return nil, err
 	}
 	return &it, nil
@@ -41,15 +43,19 @@ func (r *Repo) InsertIntent(ctx context.Context, it *UploadIntent) (*UploadInten
 		size := it.ThumbSizeBytes
 		thumbSize = &size
 	}
+	w, h := it.Dims.nullable()
+	tw, th := it.ThumbDims.nullable()
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO upload_intents
 			(user_id, plain_hash, cipher_hash, size_bytes, mime, storage_key,
 			 r2_upload_id, part_size, part_count, expires_at,
-			 thumb_cipher_hash, thumb_size_bytes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			 thumb_cipher_hash, thumb_size_bytes,
+			 width, height, thumb_width, thumb_height)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		RETURNING `+intentCols,
 		it.UserID, it.PlainHash, it.CipherHash, it.SizeBytes, it.Mime, it.StorageKey,
-		r2, it.PartSize, it.PartCount, it.ExpiresAt, thumbHash, thumbSize)
+		r2, it.PartSize, it.PartCount, it.ExpiresAt, thumbHash, thumbSize,
+		w, h, tw, th)
 	return scanIntent(row)
 }
 

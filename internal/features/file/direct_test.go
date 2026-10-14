@@ -291,3 +291,56 @@ func TestThumbTokenIsSinglePartAndTargetsThumbKey(t *testing.T) {
 		t.Fatal("缩略图票必须带整体哈希，单片模式靠它做完整性校验")
 	}
 }
+
+func TestValidateUpstreamThumb(t *testing.T) {
+	const blob = 4 * 1024 * 1024
+	cases := []struct {
+		name      string
+		blob      int64
+		thumbSize int64
+		want      error
+	}{
+		// TG 照片中间档常见 60–150 KB：客户端那道 64 KiB 的线在这里必须放过它
+		{"超过客户端上限也可以", blob, MaxThumbBytes + 1, nil},
+		{"恰好 256 KiB 可以", blob, MaxUpstreamThumbBytes, nil},
+		{"超过 256 KiB", blob, MaxUpstreamThumbBytes + 1, ErrThumbTooLarge},
+		// 与 validateThumb 同一条不变式：放宽上限不能放宽这一条
+		{"不得大于等于本体", 1024, 1024, ErrThumbTooLarge},
+		{"比本体小一个字节也行", 1024, 1023, nil},
+		{"零大小", blob, 0, ErrThumbTooLarge},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := validateUpstreamThumb(c.blob, c.thumbSize); !errors.Is(got, c.want) {
+				t.Fatalf("validateUpstreamThumb = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestNormDims(t *testing.T) {
+	cases := []struct {
+		name string
+		w, h int
+		want Dims
+	}{
+		{"正常", 1280, 720, Dims{1280, 720}},
+		{"未声明", 0, 0, Dims{}},
+		// 半个尺寸没法排版，也会被 chk_files_dims 拒掉，整体按未知处理
+		{"只有宽", 1280, 0, Dims{}},
+		{"负数", -1, 720, Dims{}},
+		{"恰好上限", MaxDimension, 1, Dims{MaxDimension, 1}},
+		{"越界", MaxDimension + 1, 720, Dims{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NormDims(c.w, c.h); got != c.want {
+				t.Fatalf("NormDims(%d, %d) = %+v, want %+v", c.w, c.h, got, c.want)
+			}
+			w, h := c.want.nullable()
+			if (w == nil) != (c.want == Dims{}) || (w == nil) != (h == nil) {
+				t.Fatalf("nullable() 与未知态不一致：%v %v", w, h)
+			}
+		})
+	}
+}

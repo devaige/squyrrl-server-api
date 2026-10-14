@@ -34,6 +34,16 @@ type Element struct {
 	OrderIdx  int       `json:"order_idx"`
 	AltText   *string   `json:"alt_text,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+
+	// 以下取自 files，只读。列表卡片靠它们在拿到任何字节之前定下版式与格子内容，
+	// 否则每个附件都得先取一次票才知道是不是图、有没有缩略图。尺寸 0 = 未知。
+	Mime         string `json:"mime,omitempty"`
+	SizeBytes    int64  `json:"size_bytes,omitempty"`
+	HasThumbnail bool   `json:"has_thumbnail"`
+	Width        int    `json:"width,omitempty"`
+	Height       int    `json:"height,omitempty"`
+	ThumbWidth   int    `json:"thumb_width,omitempty"`
+	ThumbHeight  int    `json:"thumb_height,omitempty"`
 }
 
 type ElementInput struct {
