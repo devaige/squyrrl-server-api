@@ -1613,6 +1613,103 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /internal/admin/users/{id}/snippets:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: adminListUserSnippets
+      tags: [Snippets]
+      summary: 内部：只读列出某个用户的云端碎片
+      description: |
+        受 X-Internal-Token 头保护，供管理后台查看用户碎片。按 `updated_at` 倒序、offset 分页。
+
+        `text_content` 原样返回混淆字节：api 不持有混淆密钥（ADR-003），解混淆在后台服务端做。
+        附件字节用 `GET /internal/admin/files/{id}/ticket` 去边缘取。
+      security:
+        - internalToken: []
+      parameters:
+        - name: include_deleted
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: 连回收站里的一起列
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: 超出范围时收进 [1, 100]，不报错
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: 一页碎片
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total, pages, tags]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Snippet' }
+                  total:
+                    type: integer
+                    description: 符合条件的总条数，items 只是当前这一页
+                  pages:
+                    type: object
+                    additionalProperties: { type: string }
+                    description: 该用户全部页面（含已删）的 id → 名称
+                  tags:
+                    type: object
+                    additionalProperties: { type: string }
+                    description: 该用户全部标签的 id → 名称
+        '400':
+          description: id 不是 UUID，或分页参数不是整数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/admin/files/{id}/ticket:
+    parameters:
+      - $ref: '#/components/parameters/UUIDPath'
+    get:
+      operationId: adminIssueFileTicket
+      tags: [Files]
+      summary: 内部：为后台查看附件签发下载票
+      description: |
+        与 `GET /files/{id}/ticket` 同一个实现，挂在 X-Internal-Token 之后供管理后台用。
+        后台服务端凭票去边缘取混淆字节、解混淆后再给浏览器，票据与密钥都不下发到浏览器。
+      security:
+        - internalToken: []
+      responses:
+        '200':
+          description: 票据
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileTicket' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: 未配置边缘
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   # ---------------------------------------------------------------- Passkey (WebAuthn)
   /auth/passkey/register/begin:
     post:

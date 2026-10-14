@@ -27,6 +27,12 @@ func (h *Handler) Register(g *gin.RouterGroup) {
 	g.GET("/:id/ticket", h.ticket)
 }
 
+// RegisterInternal 挂在 /internal/admin 下，受 X-Internal-Token 头保护：后台查看用户
+// 附件时用同一张票去边缘取字节，再在后台服务端解混淆。
+func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
+	g.GET("/files/:id/ticket", h.ticket)
+}
+
 // intent 签发直传令牌。命中全局去重时回包只有 exists+file，客户端一个字节都不用传。
 func (h *Handler) intent(c *gin.Context) {
 	id := auth.MustIdentity(c)

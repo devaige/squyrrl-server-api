@@ -213,6 +213,8 @@ func (s *Server) routes() {
 	extapi.NewHandler(s.extapiSvc).RegisterInternal(adminInternal)
 	users.NewHandler(users.NewService(users.NewRepo(s.pool), s.walletSvc, s.quotaSvc, s.subSvc)).RegisterInternal(adminInternal)
 	subscriptions.NewAdminHandler(s.subSvc).RegisterInternal(adminInternal)
+	snippet.NewAdminHandler(snippet.NewAdminRepo(s.pool)).RegisterInternal(adminInternal)
+	file.NewHandler(s.fileSvc).RegisterInternal(adminInternal)
 
 	// 订阅 webhook：必须放在 Bearer 中间件之外（外部支付平台无法持有用户 token）。
 	// 购买入口则相反 —— 它要知道是谁在买，挂在 /me 上。
