@@ -240,6 +240,11 @@ func (s *Service) GetMetadata(ctx context.Context, id [16]byte) (*File, error) {
 	return s.repo.Get(ctx, id)
 }
 
+// AdminList 供后台全局列文件，见 admin.go。
+func (s *Service) AdminList(ctx context.Context, in AdminListInput) (*AdminListOutput, error) {
+	return s.repo.AdminList(ctx, in)
+}
+
 // IssueTicket 签发一组短期边缘直读 URL（ADR-070）。
 //
 // api 在这里只做「查库 + 签名」两件事，**不碰字节**。旧的 /download、/thumb 是

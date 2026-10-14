@@ -29,8 +29,26 @@ func (h *Handler) Register(g *gin.RouterGroup) {
 
 // RegisterInternal 挂在 /internal/admin 下，受 X-Internal-Token 头保护：后台查看用户
 // 附件时用同一张票去边缘取字节，再在后台服务端解混淆。
+//
+//	GET /files?q=&sort=created|refs|size&limit=50&offset=0
+//	GET /files/:id/ticket
 func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
+	g.GET("/files", h.adminList)
 	g.GET("/files/:id/ticket", h.ticket)
+}
+
+func (h *Handler) adminList(c *gin.Context) {
+	var in AdminListInput
+	if err := c.ShouldBindQuery(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := h.svc.AdminList(c.Request.Context(), in)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 // intent 签发直传令牌。命中全局去重时回包只有 exists+file，客户端一个字节都不用传。

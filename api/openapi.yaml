@@ -1676,6 +1676,75 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /internal/admin/files:
+    get:
+      operationId: adminListFiles
+      tags: [Files]
+      summary: 内部：全局列出文件及其引用次数
+      description: |
+        受 X-Internal-Token 头保护，供管理后台查看 `files` 表。offset 分页。
+
+        `ref_count` 是指向这份字节的附件（elements）条数，由触发器维护，跨用户累计（全局去重，
+        ADR-004）。软删进回收站的碎片已释放附件，不计入。0 = 当前无引用，过了 1 小时豁免期
+        会被 file GC 回收。这个字段只在内部端输出，客户端的 `File` 不带它。
+      security:
+        - internalToken: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: |
+            空 = 不过滤；完整 UUID = 按文件 id；64 位 hex = 按 `plain_hash` 或 `cipher_hash`；
+            其余 = `mime` 前缀，不区分大小写（如 `image/`）。
+        - name: sort
+          in: query
+          required: false
+          schema: { type: string, enum: [created, refs, size], default: created }
+          description: created = 最新的在前；refs = 引用次数多的在前；size = 大的在前
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: 超出范围时收进 [1, 100]，不报错
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: 一页文件
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/File'
+                        - type: object
+                          required: [ref_count]
+                          properties:
+                            ref_count:
+                              type: integer
+                              description: 指向这份字节的附件条数（跨用户）
+                  total:
+                    type: integer
+                    description: 符合条件的总条数，items 只是当前这一页
+        '400':
+          description: sort 不在枚举内，或分页参数不是整数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: 内部 token 缺失
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /internal/admin/files/{id}/ticket:
     parameters:
       - $ref: '#/components/parameters/UUIDPath'
