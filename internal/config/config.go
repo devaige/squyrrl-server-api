@@ -57,6 +57,11 @@ type Config struct {
 	UploadEdgeBase    string `env:"SQUYRRL_UPLOAD_EDGE_BASE"`
 	UploadTokenSecret string `env:"SQUYRRL_UPLOAD_TOKEN_SECRET"`
 
+	// 同一个 Worker 的大陆中继地址（https://files.squyrrl.cn，ADR-079），**可选**。
+	// 只回给经大陆入口（api.squyrrl.cn）进来的请求；留空时大陆用户也拿 UploadEdgeBase ——
+	// 能用但跨境慢。不进 Validate：漏配不会让任何功能失效，与上面两项性质不同。
+	UploadEdgeBaseCN string `env:"SQUYRRL_UPLOAD_EDGE_BASE_CN"`
+
 	// OTP 发信防滥用三层（ADR-074）。全部走 envDefault、不进 .env 模板 ——
 	// 与 SQUYRRL_PARSE_COST 同例：跨环境统一，要调时显式覆盖即可。任一项 <=0 即关闭该层。
 	//   Cooldown    同一邮箱的冷却窗口

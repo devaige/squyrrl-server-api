@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/squyrrl/api/internal/infra/entry"
 )
 
 func TestPartCountFor(t *testing.T) {
@@ -131,8 +133,31 @@ func TestEdgeEnabledRequiresBoth(t *testing.T) {
 		{"https://files.squyrrl.com", "secret", true},
 	}
 	for _, c := range cases {
-		if got := NewService(nil, nil, nil, c.base, c.secret).EdgeEnabled(); got != c.want {
+		if got := NewService(nil, nil, nil, c.base, "", c.secret).EdgeEnabled(); got != c.want {
 			t.Errorf("base=%q secret=%q ⇒ %v, want %v", c.base, c.secret, got, c.want)
+		}
+	}
+}
+
+// 边缘地址跟着入口走，但只有一个方向（ADR-079）：大陆入口在配了大陆地址时拿它，
+// 没配退回海外地址；Cloudflare 入口无论如何都不能拿到大陆地址，那会让海外用户绕道大陆。
+func TestEdgeBaseFollowsEntry(t *testing.T) {
+	const global, cn = "https://files.squyrrl.com", "https://files.squyrrl.cn"
+	cases := []struct {
+		name   string
+		baseCN string
+		e      entry.Entry
+		want   string
+	}{
+		{"海外入口", cn, entry.Global, global},
+		{"大陆入口", cn, entry.CN, cn},
+		{"大陆入口但未配大陆地址", "", entry.CN, global},
+		{"海外入口且未配大陆地址", "", entry.Global, global},
+	}
+	for _, c := range cases {
+		s := NewService(nil, nil, nil, global, c.baseCN, "secret")
+		if got := s.edgeBaseFor(c.e); got != c.want {
+			t.Errorf("%s：edgeBaseFor = %q，want %q", c.name, got, c.want)
 		}
 	}
 }
