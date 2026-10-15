@@ -5,8 +5,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/squyrrl/api/internal/infra/entry"
 )
 
 var (
@@ -181,9 +179,6 @@ type IntentRequest struct {
 
 	Dims      Dims
 	ThumbDims Dims
-
-	// Entry 决定 upload_url 指向哪个边缘地址，见 Service.edgeBaseFor。
-	Entry entry.Entry
 }
 
 // CommitInput 收尾。单片模式 parts 为空；multipart 模式必须交齐每片的 ETag，

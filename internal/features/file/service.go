@@ -16,7 +16,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/file/thumb"
-	"github.com/squyrrl/api/internal/infra/entry"
 	"github.com/squyrrl/api/internal/infra/storage"
 )
 
@@ -39,24 +38,10 @@ type Service struct {
 	// 那种回退档位一旦存在，漏配就等于持续付出网带宽费用，且毫无报错。
 	edgeBase    string
 	tokenSecret string
-
-	// edgeBaseCN 是同一个 Worker 的大陆中继地址（ADR-079），可选。只决定回给经大陆入口
-	// 进来的客户端哪个地址；令牌、Worker、桶都是同一套，所以它不参与 EdgeEnabled。
-	edgeBaseCN string
 }
 
-func NewService(repo *Repo, st *storage.Client, q UploadQuota, edgeBase, edgeBaseCN, tokenSecret string) *Service {
-	return &Service{repo: repo, storage: st, quota: q, edgeBase: edgeBase, edgeBaseCN: edgeBaseCN, tokenSecret: tokenSecret}
-}
-
-// edgeBaseFor 选回给本次请求的边缘地址。大陆入口在配了 edgeBaseCN 时拿它；没配就退回
-// 海外地址 —— 能用只是慢，不能因为少配一项就让大陆用户传不了文件。
-// 反方向不成立：Cloudflare 入口永远不拿大陆地址，那会让海外用户绕道大陆。
-func (s *Service) edgeBaseFor(e entry.Entry) string {
-	if e == entry.CN && s.edgeBaseCN != "" {
-		return s.edgeBaseCN
-	}
-	return s.edgeBase
+func NewService(repo *Repo, st *storage.Client, q UploadQuota, edgeBase, tokenSecret string) *Service {
+	return &Service{repo: repo, storage: st, quota: q, edgeBase: edgeBase, tokenSecret: tokenSecret}
 }
 
 // EdgeEnabled 报告边缘是否可用：边缘地址与令牌密钥缺一不可。上传与下载共用这一个
@@ -267,7 +252,7 @@ func (s *Service) AdminList(ctx context.Context, in AdminListInput) (*AdminListO
 // 都要把整个对象从 R2 拉进 api 再推给客户端，同一份流量付两次钱（R2 出网 + 服务器出网），
 // 而读的次数天然远多于写。改成签票据后，字节只走 R2 → Worker → 客户端，
 // 这段路径在 Cloudflare 内部且 Worker 出网不计费。
-func (s *Service) IssueTicket(ctx context.Context, id [16]byte, e entry.Entry) (*TicketResponse, error) {
+func (s *Service) IssueTicket(ctx context.Context, id [16]byte) (*TicketResponse, error) {
 	if !s.EdgeEnabled() {
 		return nil, ErrEdgeDisabled
 	}
@@ -278,8 +263,7 @@ func (s *Service) IssueTicket(ctx context.Context, id [16]byte, e entry.Entry) (
 
 	// 两个 URL 共用同一个到期时刻，客户端只需要记一个数就能判断整张票是否还新鲜
 	expiresAt := time.Now().Add(downloadTTL)
-	base := s.edgeBaseFor(e)
-	blob, err := s.signBlobURL(base, f.StorageKey, f.Mime, expiresAt)
+	blob, err := s.signBlobURL(f.StorageKey, f.Mime, expiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +271,7 @@ func (s *Service) IssueTicket(ctx context.Context, id [16]byte, e entry.Entry) (
 
 	if f.ThumbnailKey != "" {
 		// 缩略图是服务端生成的真 JPEG（没混淆），mime 恒定，不跟随原文件
-		thumb, err := s.signBlobURL(base, f.ThumbnailKey, "image/jpeg", expiresAt)
+		thumb, err := s.signBlobURL(f.ThumbnailKey, "image/jpeg", expiresAt)
 		if err != nil {
 			return nil, err
 		}
@@ -300,14 +284,14 @@ func (s *Service) IssueTicket(ctx context.Context, id [16]byte, e entry.Entry) (
 // 这样 URL 自包含，能直接喂给 Image.network / <img src> / 浏览器下载，
 // 不必每个消费点都改成「先构造带头的请求」。代价是令牌会进访问日志，
 // 由 downloadTTL 的短窗口兜住 —— 边缘两种取法都认（见 edge_handler.go）。
-func (s *Service) signBlobURL(base, key, mime string, expiresAt time.Time) (string, error) {
+func (s *Service) signBlobURL(key, mime string, expiresAt time.Time) (string, error) {
 	tok, err := SignDownloadToken(s.tokenSecret, DownloadClaims{
 		Key: key, Mime: mime, ExpiresAt: expiresAt.Unix(),
 	})
 	if err != nil {
 		return "", err
 	}
-	return base + "/v1/blob?t=" + url.QueryEscape(tok), nil
+	return s.edgeBase + "/v1/blob?t=" + url.QueryEscape(tok), nil
 }
 
 // =============================================================================
@@ -409,8 +393,8 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 	resp := &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
-		// 恒为非空（EdgeEnabled 已挡住空值），指向 Worker 自定义域或它的大陆中继。
-		UploadURL: s.edgeBaseFor(in.Entry),
+		// 恒为非空（EdgeEnabled 已挡住空值），指向 Worker 自定义域。
+		UploadURL: s.edgeBase,
 		Token:     token,
 		PartSize:  PartSize,
 		PartCount: partCount,

@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/auth"
-	"github.com/squyrrl/api/internal/infra/entry"
 )
 
 type Handler struct {
@@ -100,7 +99,6 @@ func (h *Handler) intent(c *gin.Context) {
 		ThumbSizeBytes:  in.ThumbSizeBytes,
 		Dims:            NormDims(in.Width, in.Height),
 		ThumbDims:       NormDims(in.ThumbWidth, in.ThumbHeight),
-		Entry:           entry.Of(c.Request),
 	})
 	if err != nil {
 		switch {
@@ -209,7 +207,7 @@ func (h *Handler) ticket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 id"})
 		return
 	}
-	t, err := h.svc.IssueTicket(c.Request.Context(), id, entry.Of(c.Request))
+	t, err := h.svc.IssueTicket(c.Request.Context(), id)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrNotFound):
