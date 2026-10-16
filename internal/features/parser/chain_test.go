@@ -472,7 +472,7 @@ func TestShortLinkResolvesBeforeParsing(t *testing.T) {
 		short:     res(`(?:^|//)s\.notes\.test/[a-z]+`)}
 
 	video := testAdapter(plat.id, srv.URL+"/ok")
-	video.Accept = xhsIsVideo
+	video.Accept = xhsMaybeVideo
 	adapters := AdapterSet{"t_short_video": video, "t_short_image": testAdapter(plat.id, srv.URL+"/ok")}
 	env := newChainEnv(t, plat, adapters, 1_000_000)
 	env.addEndpoint(t, "t_short_video", 10_000)
@@ -512,25 +512,53 @@ func TestShortLinkResolvesBeforeParsing(t *testing.T) {
 	}
 }
 
-// 上游确认作品已删除：兜底链就此停下，不再花钱问下一个接口；用户不扣费。
-func TestChainStopsWhenGone(t *testing.T) {
-	srv, hits := fakeTikHub(t)
-	cp := &chainParser{provider: uniqueProvider("gone")}
-	gone := testAdapter(cp.provider, srv.URL+"/ok")
-	gone.Decode = func([]byte, Target) (*ParseResult, error) { return nil, errGone }
-	env := newChainEnv(t, cp, AdapterSet{"t_gone": gone, "t_next": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
-	env.addEndpoint(t, "t_gone", 1_000)
-	env.addEndpoint(t, "t_next", 2_000)
-	uid := env.user(t, 100)
+// 结果能用但缺东西（视频没有文件）：链继续往后试；后面成功用后面的，都失败就用这份兜底。
+func TestChainPartialFallback(t *testing.T) {
+	partial := func(provider, url string) Adapter {
+		a := testAdapter(provider, url)
+		decode := a.Decode
+		a.Decode = func(data []byte, tg Target) (*ParseResult, error) {
+			res, err := decode(data, tg)
+			if err != nil {
+				return nil, err
+			}
+			return res, &incompleteError{"视频作品没有视频文件"}
+		}
+		return a
+	}
 
-	if _, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"}); !errors.Is(err, ErrParseFailed) {
-		t.Fatalf("应返回通用失败，得到 %v", err)
-	}
-	if hits.Load() != 1 {
-		t.Errorf("确认已删除后不应再调下一个接口，实调 %d 次", hits.Load())
-	}
-	log := env.lastLog(t)
-	if len(log.Attempts) != 1 || log.Attempts[0].ErrorKind != extapi.KindGone || env.balance(t, uid) != 100 {
-		t.Errorf("应只有一次 gone 尝试且不扣费: %+v", log)
-	}
+	t.Run("后面的来源成功就用后面的", func(t *testing.T) {
+		srv, hits := fakeTikHub(t)
+		cp := &chainParser{provider: uniqueProvider("partial_ok")}
+		env := newChainEnv(t, cp, AdapterSet{"t_partial": partial(cp.provider, srv.URL+"/ok"), "t_full": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
+		env.addEndpoint(t, "t_partial", 1_000)
+		env.addEndpoint(t, "t_full", 2_000)
+		uid := env.user(t, 100)
+		if _, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"}); err != nil {
+			t.Fatal(err)
+		}
+		log := env.lastLog(t)
+		if hits.Load() != 2 || log.Source != "t_full" || log.CostMicros != 3_000 {
+			t.Errorf("应试到完整的那个并记两次成本: hits=%d source=%s cost=%d", hits.Load(), log.Source, log.CostMicros)
+		}
+		if log.Attempts[0].Outcome != AttemptPartial || log.Attempts[0].ErrorKind != extapi.KindIncomplete {
+			t.Errorf("第一次应记为不完整: %+v", log.Attempts[0])
+		}
+	})
+
+	t.Run("都失败就用不完整的那份兜底", func(t *testing.T) {
+		srv, _ := fakeTikHub(t)
+		cp := &chainParser{provider: uniqueProvider("partial_fb")}
+		env := newChainEnv(t, cp, AdapterSet{"t_partial": partial(cp.provider, srv.URL+"/ok"), "t_down": testAdapter(cp.provider, srv.URL+"/down")}, 1_000_000)
+		env.addEndpoint(t, "t_partial", 1_000)
+		env.addEndpoint(t, "t_down", 2_000)
+		uid := env.user(t, 100)
+		res, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"})
+		if err != nil {
+			t.Fatalf("应用不完整的结果兜底，得到 %v", err)
+		}
+		if res.CreditsCharged != 40 || env.lastLog(t).Source != "t_partial" {
+			t.Errorf("兜底结果照常收费、来源记为不完整的那个: %+v", res)
+		}
+	})
 }

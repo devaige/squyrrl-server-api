@@ -25,6 +25,7 @@ const (
 	AttemptOK      = "ok"
 	AttemptFailed  = "failed"
 	AttemptSkipped = "skipped"
+	AttemptPartial = "partial" // 能用但缺东西（如视频没有文件），链继续，都失败时用它兜底
 )
 
 // LogEntry 是一次解析请求的记录。
@@ -207,6 +208,7 @@ type SourceSummary struct {
 	OK          int64  `json:"ok"`
 	Failed      int64  `json:"failed"`
 	Skipped     int64  `json:"skipped"`
+	Partial     int64  `json:"partial"`
 	CostMicros  int64  `json:"cost_micros"`
 }
 
@@ -250,6 +252,7 @@ func (r *LogRepo) Summary(ctx context.Context, days int) ([]ProviderSummary, []S
 		       COUNT(*) FILTER (WHERE a.outcome = 'ok'),
 		       COUNT(*) FILTER (WHERE a.outcome = 'failed'),
 		       COUNT(*) FILTER (WHERE a.outcome = 'skipped'),
+		       COUNT(*) FILTER (WHERE a.outcome = 'partial'),
 		       COALESCE(SUM(a.cost_micros), 0)
 		FROM parse_attempts a
 		JOIN parse_logs l ON l.id = a.log_id
@@ -265,7 +268,7 @@ func (r *LogRepo) Summary(ctx context.Context, days int) ([]ProviderSummary, []S
 	for srows.Next() {
 		var s SourceSummary
 		if err := srows.Scan(&s.Source, &s.AccountName, &s.Attempts, &s.OK, &s.Failed, &s.Skipped,
-			&s.CostMicros); err != nil {
+			&s.Partial, &s.CostMicros); err != nil {
 			return nil, nil, err
 		}
 		sources = append(sources, s)

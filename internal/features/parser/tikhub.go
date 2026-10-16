@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,10 +24,20 @@ const tikhubBase = "https://api.tikhub.io/api/v1/"
 
 var errWrongItem = errors.New("上游返回的不是请求的作品")
 
-// errGone 表示上游确认作品已不存在（删除、下架、私密）。兜底链见到它就停：
-// 换个接口问同一个上游，答案不会变，只会再花一次钱。
-// 只在能确定时才用 —— Instagram v1 会对存在的帖子误报「不存在」，那种不算。
-var errGone = errors.New("作品不存在或已删除")
+// incompleteError 表示结果能用、但缺了该有的东西（典型：视频作品拿不到视频文件）。
+// 兜底链会继续试后面的来源；都不行时就用这份 —— 有标题、正文和封面，总好过解析失败。
+type incompleteError struct{ reason string }
+
+func (e *incompleteError) Error() string { return "结果不完整：" + e.reason }
+
+// videoNotDownloadable 是视频本来就拿不到文件的平台，缺视频不算不完整：
+// YouTube 接口不给流；B 站给的是 DASH 音视频分离流，且地址绑定上游的出口 IP，
+// 用户设备带不带 Referer 都是 403（实测 2026-10-16）。
+var videoNotDownloadable = map[string]bool{PlatformYouTube: true, PlatformBilibili: true}
+
+// maxVideoAssetBytes 与客户端 parse_assembler 的 _kMaxAssetBytes 一致：超过的文件客户端不下载，
+// 所以有多档码率时挑放得下的最高一档，而不是最高的那档。
+const maxVideoAssetBytes = 25 << 20
 
 func tikhubGet(path string, query map[string]string) extapi.Request {
 	return extapi.Request{URL: tikhubBase + path, Query: query}
@@ -45,7 +56,11 @@ func tikhub(provider, note string, req func(Target) extapi.Request,
 			if err != nil {
 				return nil, err
 			}
-			return p.result(provider), nil
+			res := p.result(provider)
+			if p.Kind == "video" && (p.Video == nil || p.Video.URL == "") && !videoNotDownloadable[provider] {
+				return res, &incompleteError{"视频作品没有视频文件"}
+			}
+			return res, nil
 		},
 	}
 }
@@ -85,12 +100,15 @@ func TikHubAdapters() AdapterSet {
 		"tikhub_douyin_web_fetch_one_video_v2": tikhub(PlatformDouyin, "单个作品（网页 V2）",
 			byID("douyin/web/fetch_one_video_v2", "aweme_id"), decodeAwemeDouyin),
 
-		// ---- 小红书：视频接口只接标明 type=video 的链接（拿图文笔记 ID 会返回别人的笔记）；
-		// 图文接口什么都接，视频笔记走它只能拿到封面 ----
-		"tikhub_xiaohongshu_app_v2_get_video_note_detail": withAccept(tikhub(PlatformXiaohongshu, "视频笔记（只接分享链接标明是视频的）",
-			byID("xiaohongshu/app_v2/get_video_note_detail", "note_id"), decodeXHSVideoFeed), xhsIsVideo),
-		"tikhub_xiaohongshu_app_v2_get_image_note_detail": tikhub(PlatformXiaohongshu, "图文笔记（视频笔记只有封面）",
-			byID("xiaohongshu/app_v2/get_image_note_detail", "note_id"), decodeXHSImage),
+		// ---- 小红书：图文接口在前（priority 100）、视频接口在后（110），按链接里的 type 分流：
+		//   type=normal → 只走图文；type=video → 只走视频；
+		//   没有 type（网页端复制的链接）→ 先图文，是视频笔记时图文接口只有封面，记为不完整，
+		//   接着走视频接口拿视频文件，视频接口也失败就用图文那份兜底。
+		// 视频接口拿图文笔记 ID 会返回别人的视频笔记，所以 type=normal 时绝不交给它。 ----
+		"tikhub_xiaohongshu_app_v2_get_image_note_detail": withAccept(tikhub(PlatformXiaohongshu, "图文笔记（视频笔记只有封面）",
+			byID("xiaohongshu/app_v2/get_image_note_detail", "note_id"), decodeXHSImage), xhsMaybeImage),
+		"tikhub_xiaohongshu_app_v2_get_video_note_detail": withAccept(tikhub(PlatformXiaohongshu, "视频笔记（链接标明是图文的不走）",
+			byID("xiaohongshu/app_v2/get_video_note_detail", "note_id"), decodeXHSVideoFeed), xhsMaybeVideo),
 
 		// ---- B 站：不带视频流，只有封面 ----
 		"tikhub_bilibili_web_fetch_one_video": withAccept(tikhub(PlatformBilibili, "单个视频（网页，只认 BV 号）",
@@ -165,8 +183,9 @@ func withAccept(a Adapter, accept func(Target) bool) Adapter {
 	return a
 }
 
-func xhsIsVideo(t Target) bool { return queryParam(t.Resolved, "type") == "video" }
-func isBV(t Target) bool       { return strings.HasPrefix(t.ResourceID, "BV") }
+func xhsMaybeImage(t Target) bool { return queryParam(t.Resolved, "type") != "video" }
+func xhsMaybeVideo(t Target) bool { return queryParam(t.Resolved, "type") != "normal" }
+func isBV(t Target) bool          { return strings.HasPrefix(t.ResourceID, "BV") }
 
 // ======================== X ========================
 
@@ -189,7 +208,51 @@ type tweet struct {
 }
 
 type tweetMedia struct {
-	MediaURLHTTPS string `json:"media_url_https"`
+	MediaURLHTTPS string `json:"media_url_https"` // 图片本身；视频与动图时是封面
+	Duration      int64  `json:"duration"`        // 毫秒
+	OriginalInfo  struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	} `json:"original_info"`
+	Variants []struct {
+		Bitrate     int64  `json:"bitrate"`
+		ContentType string `json:"content_type"`
+		URL         string `json:"url"`
+	} `json:"variants"`
+}
+
+var tweetVariantSize = regexp.MustCompile(`/(\d+)x(\d+)/`)
+
+// pickVariant 在多档码率的 mp4 里挑放得进客户端附件上限的最高一档（按码率 × 时长估算），
+// 一档都放不下就取最低的；动图只有一档、码率为 0，直接用。m3u8 是流媒体清单，不要。
+func (m tweetMedia) pickVariant() (url string, w, h int) {
+	type v struct {
+		bitrate int64
+		url     string
+	}
+	var mp4 []v
+	for _, x := range m.Variants {
+		if x.ContentType == "video/mp4" && x.URL != "" {
+			mp4 = append(mp4, v{x.Bitrate, x.URL})
+		}
+	}
+	if len(mp4) == 0 {
+		return "", 0, 0
+	}
+	sort.Slice(mp4, func(i, j int) bool { return mp4[i].bitrate > mp4[j].bitrate })
+	chosen := mp4[len(mp4)-1].url
+	for _, x := range mp4 {
+		if x.bitrate == 0 || m.Duration == 0 || x.bitrate*m.Duration/8000 <= maxVideoAssetBytes {
+			chosen = x.url
+			break
+		}
+	}
+	w, h = m.OriginalInfo.Width, m.OriginalInfo.Height
+	if sz := tweetVariantSize.FindStringSubmatch(chosen); sz != nil {
+		w, _ = strconv.Atoi(sz[1])
+		h, _ = strconv.Atoi(sz[2])
+	}
+	return chosen, w, h
 }
 
 func decodeTweet(data []byte, t Target) (*post, error) {
@@ -210,10 +273,19 @@ func decodeTweet(data []byte, t Target) (*post, error) {
 		Stats: &postStats{Likes: i64(int64(tw.Likes)), Comments: i64(int64(tw.Replies)),
 			Shares: i64(int64(tw.Retweets)), Views: i64(int64(tw.Views)), Collects: i64(int64(tw.Bookmarks))},
 	}
-	// 图片 media.photo；视频与动图只取封面图（媒体文件地址的格式还没有实测样本）
-	for _, kind := range []string{"photo", "video", "animated_gif"} {
+	for _, m := range tw.Media["photo"] {
+		if m.MediaURLHTTPS != "" {
+			p.Images = append(p.Images, postImage{URL: m.MediaURLHTTPS})
+		}
+	}
+	// 视频与动图都是 mp4（media.video[].variants，实测 2026-10-16）。一条推文最多带 4 个媒体，
+	// 作品只有一个 Video 位：第一个视频进 Video，其余的收封面图。
+	for _, kind := range []string{"video", "animated_gif"} {
 		for _, m := range tw.Media[kind] {
-			if m.MediaURLHTTPS != "" {
+			if u, w, h := m.pickVariant(); u != "" && p.Video == nil {
+				p.Video = &postVideo{URL: u, DurationMs: m.Duration, Width: w, Height: h}
+				p.Cover = m.MediaURLHTTPS
+			} else if m.MediaURLHTTPS != "" {
 				p.Images = append(p.Images, postImage{URL: m.MediaURLHTTPS})
 			}
 		}
@@ -492,15 +564,11 @@ func decodeXHSVideoFeed(data []byte, t Target) (*post, error) {
 	return nil, fmt.Errorf("%w：返回的 %d 条笔记里没有 %s", errWrongItem, len(env.Data), t.ResourceID)
 }
 
-// xhsGone：笔记已删除或不可见时，两个接口都只回一个带 ID 的空壳 ——
-// 没有类型、没有作者、没有标题正文图片（实测 2026-10-16，两次都计费）。
-func xhsGone(n xhsNote) bool {
-	return n.Type == "" && n.User.UserID == "" && n.Title == "" && n.Desc == "" && len(n.ImagesList) == 0
-}
-
 func xhsPost(n xhsNote, t Target) (*post, error) {
-	if xhsGone(n) {
-		return nil, errGone
+	// 只有 ID 的空壳：没有类型、作者、标题正文图片（实测 2026-10-16，照样计费）。
+	// 用户看得到才会去分享，所以多半是上游这次没取到，交给下一个接口再试。
+	if n.Type == "" && n.User.UserID == "" && n.Title == "" && n.Desc == "" && len(n.ImagesList) == 0 {
+		return nil, errors.New("上游返回空壳：没有类型、作者与内容")
 	}
 	p := &post{
 		ID:        t.ResourceID,

@@ -38,7 +38,8 @@ func decodeWith(t *testing.T, slug, fixtureName string, tg Target) (*ParseResult
 		t.Fatalf("没有适配器 %s", slug)
 	}
 	res, err := ad.Decode(fixture(t, fixtureName), tg)
-	if err != nil {
+	var inc *incompleteError
+	if err != nil && !errors.As(err, &inc) {
 		t.Fatalf("%s 解码失败: %v", slug, err)
 	}
 	var p decodedPost
@@ -77,6 +78,7 @@ func TestTikHubAdaptersDecodeRealSamples(t *testing.T) {
 		{"tikhub_xiaohongshu_app_v2_get_video_note_detail",
 			target("697c0eee000000000a03c308", "https://www.xiaohongshu.com/discovery/item/697c0eee000000000a03c308?type=video&xsec_token=abc"),
 			"video", "https://www.xiaohongshu.com/explore/697c0eee000000000a03c308?xsec_token=abc", true, 0},
+		// 视频笔记走图文接口：只有封面，记为不完整，交给视频接口（TestIncompleteResults）
 		{"tikhub_xiaohongshu_app_v2_get_image_note_detail", target("697c0eee000000000a03c308", ""), "video", "https://www.xiaohongshu.com/explore/", false, 0},
 		{"tikhub_bilibili_web_fetch_one_video", target("BV1M1421t7hT", ""), "video", "https://www.bilibili.com/video/BV1M1421t7hT", false, 0},
 		{"tikhub_bilibili_app_fetch_one_video", target("BV1M1421t7hT", ""), "video", "https://www.bilibili.com/video/BV1M1421t7hT", false, 0},
@@ -147,6 +149,44 @@ func TestTikHubAdaptersDecodeRealSamples(t *testing.T) {
 	}
 }
 
+// 视频作品没拿到视频文件 → 不完整（兜底链继续）；YouTube、B 站本来就没有视频文件，不算。
+func TestIncompleteResults(t *testing.T) {
+	a := TikHubAdapters()
+	cases := []struct {
+		slug, fixture string
+		target        Target
+		incomplete    bool
+	}{
+		{"tikhub_xiaohongshu_app_v2_get_image_note_detail", "xiaohongshu_app_v2_get_image_note_detail", target("697c0eee000000000a03c308", ""), true},
+		{"tikhub_tiktok_web_fetch_post_detail_v2", "tiktok_web_fetch_post_detail_v2", target("7350810998023949599", ""), true},
+		{"tikhub_youtube_web_v2_get_video_info", "youtube_web_v2_get_video_info", target("dQw4w9WgXcQ", ""), false},
+		{"tikhub_bilibili_web_fetch_one_video", "bilibili_web_fetch_one_video", target("BV1M1421t7hT", ""), false},
+		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_fetch_one_video", target("7448118827402972455", ""), false},
+	}
+	for _, c := range cases {
+		res, err := a[c.slug].Decode(fixture(t, c.fixture), c.target)
+		var inc *incompleteError
+		if got := errors.As(err, &inc); got != c.incomplete || res == nil || !usable(res) {
+			t.Errorf("%s：不完整=%v（期望 %v），err=%v", c.slug, got, c.incomplete, err)
+		}
+	}
+}
+
+// 带视频的推文（用户提供的 ID，实测）：挑放得进 25 MiB 的最高码率 —— 45.6 秒的视频，
+// 1080p（10.4 Mbps）约 59 MB 放不下，720p（2.2 Mbps）约 12 MB 正好。
+func TestTweetVideoPicksVariantThatFits(t *testing.T) {
+	_, p := decodeWith(t, "tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""))
+	if p.Kind != "video" || p.Video == nil {
+		t.Fatalf("应是视频作品: %+v", p)
+	}
+	if !strings.Contains(p.Video.URL, "/1280x720/") || p.Video.Width != 1280 || p.Video.Height != 720 || p.Video.DurationMs != 45630 {
+		t.Errorf("挑的码率不对: %+v", p.Video)
+	}
+	if !strings.Contains(p.Cover, "amplify_video_thumb") || len(p.Images) != 0 {
+		t.Errorf("封面应是视频缩略图，且不该当成图片: cover=%s images=%d", p.Cover, len(p.Images))
+	}
+}
+
 // 小红书图文笔记：图文接口拿到全部图片。
 func TestXHSImageNote(t *testing.T) {
 	_, p := decodeWith(t, "tikhub_xiaohongshu_app_v2_get_image_note_detail", "xhs_image_on_normal", target("6a3e33b2000000001603e982", ""))
@@ -183,10 +223,10 @@ func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 			}
 		})
 	}
-	// 笔记已删除：只剩带 ID 的空壳，必须报 errGone 让兜底链停下
+	// 只有 ID 的空壳（实测）：当失败交给下一个接口，不能当成内容
 	if _, err := adapters["tikhub_xiaohongshu_app_v2_get_video_note_detail"].Decode(fixture(t, "xhs_gone_video_feed"),
-		target("69690331000000001a02266a", "")); !errors.Is(err, errGone) {
-		t.Errorf("已删除的笔记应报 errGone，得到 %v", err)
+		target("69690331000000001a02266a", "")); err == nil || errors.Is(err, errWrongItem) {
+		t.Errorf("空壳应是普通解码失败，得到 %v", err)
 	}
 	// Instagram v1 按链接的成功形态也认得
 	if _, err := adapters["tikhub_instagram_v1_fetch_post_by_url"].Decode(fixture(t, "instagram_v1_by_url_demo"), target("DPwhVB-jo9k", "")); err != nil {
@@ -197,11 +237,15 @@ func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 // 小红书视频接口只接分享链接里标明 type=video 的；B 站网页接口只认 BV 号。
 func TestAdapterAccept(t *testing.T) {
 	a := TikHubAdapters()
+	image := a["tikhub_xiaohongshu_app_v2_get_image_note_detail"].Accept
 	video := a["tikhub_xiaohongshu_app_v2_get_video_note_detail"].Accept
-	if !video(target("x", "https://www.xiaohongshu.com/discovery/item/x?type=video")) ||
-		video(target("x", "https://www.xiaohongshu.com/discovery/item/x?type=normal")) ||
-		video(target("x", "https://www.xiaohongshu.com/explore/x")) {
-		t.Error("小红书视频接口的 Accept 不对")
+	typed := func(ty string) Target {
+		return target("x", "https://www.xiaohongshu.com/discovery/item/x"+map[string]string{"": "", "video": "?type=video", "normal": "?type=normal"}[ty])
+	}
+	// type=video 只走视频；type=normal 只走图文（视频接口拿图文 ID 会返回别人的笔记）；没有 type 两个都可以
+	if image(typed("video")) || !video(typed("video")) || !image(typed("normal")) || video(typed("normal")) ||
+		!image(typed("")) || !video(typed("")) {
+		t.Error("小红书两个接口的分流不对")
 	}
 	if a["tikhub_bilibili_web_fetch_one_video"].Accept(target("av170001", "")) {
 		t.Error("B 站网页接口不该接 av 号")
@@ -396,7 +440,7 @@ func TestTikHubSeedMatchesAdapters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int64{PlatformXiaohongshu: 200, PlatformWechatMP: 200, PlatformInstagram: 20, PlatformKuaishou: 20,
+	want := map[string]int64{PlatformXiaohongshu: 200, PlatformWechatMP: 200, PlatformInstagram: 40, PlatformKuaishou: 20,
 		PlatformTwitter: 20, PlatformTikTok: 20, PlatformDouyin: 20, PlatformBilibili: 20, PlatformWeibo: 20, PlatformYouTube: 20}
 	for _, p := range prices {
 		if w, ok := want[p.Provider]; ok && p.AutoCredits != w {

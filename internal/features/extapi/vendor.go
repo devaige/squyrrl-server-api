@@ -31,7 +31,7 @@ const (
 	KindBadResponse   = "bad_response" // 2xx 但不是 JSON、外壳不对或超长；已计费
 	KindEmpty         = "empty"        // 2xx 但没有数据；已计费
 	KindDecode        = "decode"       // 适配器转换失败或结果不可用；已计费
-	KindGone          = "gone"         // 上游确认作品不存在或已删除；兜底链就此停止，不再花钱试别的
+	KindIncomplete    = "incomplete"   // 结果能用但缺东西（如视频作品没有视频文件）；兜底链继续，都失败时用它
 	KindBuiltin       = "builtin"      // 内置免费来源报错
 )
 
