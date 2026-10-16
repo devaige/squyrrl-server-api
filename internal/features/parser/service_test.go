@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 )
 
+var _ BuiltinParser = (*countingParser)(nil)
+
 // countingParser 记下上游被真正调用了几次。整组测试问的都是同一个问题：
 // 「这次请求有没有花掉一次上游调用」—— 而那正是这批改动要控制的成本。
 type countingParser struct {
@@ -45,15 +47,15 @@ func (p *countingParser) Parse(ctx context.Context, uri, resourceID string) (*Pa
 	}, nil
 }
 
-// newTestService 装配一个只有内置 parser、不计费、不接 extapi 的 Service。
-// baseCost=0 让 quote 恒返回 0，于是 wallet 整条路径都不会被触碰（可以传 nil）。
+// newTestService 装配一个只有内置来源、不计费、不接 extapi 的 Service。
+// DefaultPrice=0 让售价恒为 0，于是 wallet 整条路径都不会被触碰（可以传 nil）。
 func newTestService(t *testing.T, p Parser, cooldown time.Duration) *Service {
 	t.Helper()
 	pool := testPool(t)
 	cache := newTestCache(t, pool, p.Provider())
 	reg := NewRegistry()
 	reg.Register(p)
-	return NewService(reg, cache, nil, nil, 0, cooldown)
+	return NewService(Deps{Registry: reg, Cache: cache, RefreshCooldown: cooldown})
 }
 
 // force 跳过缓存重取一次；冷却期内的第二次 force 退回读缓存，不再打上游。

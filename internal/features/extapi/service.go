@@ -1,201 +1,250 @@
 package extapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/squyrrl/api/internal/features/pricing"
 )
+
+// maxRespBytes 限制读取的响应体大小。抖音/TikTok 一类 App 接口的单条作品响应
+// 动辄几百 KB，1 MiB 会被截断成「不是 JSON」；4 MiB 留足余量，又不至于让个别
+// 异常响应拖垮内存。超出视为坏响应（已计费）。
+const maxRespBytes = 4 << 20
+
+// defaultTimeout 是单次上游调用的默认超时。第三方数据接口普遍比官方 API 慢，
+// 8 秒在 TikHub 这类上游上会误杀正常请求；config.timeout_ms 可按接口覆盖。
+const defaultTimeout = 15 * time.Second
 
 type Service struct {
-	repo   *Repo
-	client *http.Client
+	repo    *Repo
+	client  *http.Client
+	creds   Credentials
+	catalog Catalog
 }
 
-func NewService(repo *Repo) *Service {
-	// 不设全局 timeout：每次调用按 config.timeout_ms 走 context 单独控制，
-	// 不同 endpoint 的耗时特征差异很大，全局超时会误伤慢但正常的服务。
-	return &Service{repo: repo, client: &http.Client{}}
+func NewService(repo *Repo, creds Credentials, catalog Catalog) *Service {
+	// 不设全局 timeout：每次调用按接口的 timeout_ms 走 context 单独控制。
+	return &Service{repo: repo, client: &http.Client{}, creds: creds, catalog: catalog}
 }
 
-// Fetch 按 provider 的兜底链依次尝试 endpoint：
-//
-//	跳过：见 usable —— 与 Quote 共用同一个判据
-//	失败：网络错 / 非 2xx / 响应非 JSON —— 记录并尝试下一个
-//	成功：记一笔平台成本（= 单价）+ 可选采样存档，立即返回
-//
-// 返回 ErrNoEndpoint 表示「没有任何可尝试的 endpoint」，上层据此回退到内置免费实现。
-// 全链尝试后仍失败则返回聚合错误（上层同样可回退）。
-func (s *Service) Fetch(ctx context.Context, provider, uri, resourceID string) (*FetchResult, error) {
-	eps, err := s.repo.ListForProvider(ctx, provider)
-	if err != nil {
-		return nil, err
-	}
-
-	var lastErr error
-	tried := 0
-	for _, ep := range eps {
-		cfg, _, skip := usable(ep)
-		if skip != skipNone {
-			// 未配驱动是常态（种子行就是这样落库的），不值得每次解析都刷一条日志；
-			// 其余三种都是「配好了却用不了」，要看得见。
-			if skip != skipNoDriver {
-				slog.Warn("extapi endpoint 跳过", "slug", ep.Slug, "reason", string(skip))
-			}
-			continue
-		}
-
-		tried++
-		res, trace, callErr := s.callEndpoint(ctx, ep, cfg, uri, resourceID)
-		if callErr != nil {
-			lastErr = callErr
-			slog.Warn("extapi endpoint 调用失败，尝试下一个", "slug", ep.Slug, "err", callErr)
-			if cfg.ArchiveLive {
-				s.archiveLive(ctx, ep.ID, resourceID, trace)
-			}
-			continue
-		}
-
-		// 成功：只在此刻扣费，杜绝「失败也计费」；余额是软预算，允许并发下的轻微超支
-		if ep.UnitPriceMicros > 0 {
-			if err := s.repo.RecordCost(ctx, ep.ID, -ep.UnitPriceMicros, "call", resourceID); err != nil {
-				slog.Warn("extapi 成本记账失败", "slug", ep.Slug, "err", err)
-			}
-		}
-		if cfg.ArchiveLive {
-			s.archiveLive(ctx, ep.ID, resourceID, trace)
-		}
-		res.EndpointID = ep.ID
-		res.EndpointSlug = ep.Slug
-		return res, nil
-	}
-
-	if tried == 0 {
-		return nil, ErrNoEndpoint
-	}
-	return nil, fmt.Errorf("provider %s 所有 endpoint 均失败: %w", provider, lastErr)
+// ListForProvider 取某平台的付费兜底链（单价升序）。
+func (s *Service) ListForProvider(ctx context.Context, provider string) ([]Endpoint, error) {
+	return s.repo.ListForProvider(ctx, provider)
 }
 
-// skipReason 说明一个 endpoint 为什么不参与本次兜底链。
-type skipReason string
+// ListEnabled 取全部启用的接口。
+func (s *Service) ListEnabled(ctx context.Context) ([]Endpoint, error) {
+	return s.repo.ListEnabled(ctx)
+}
 
-const (
-	skipNone      skipReason = ""
-	skipBadConfig skipReason = "config 解析失败"
-	skipNoDriver  skipReason = "未配置 url_template"
-	skipNoBalance skipReason = "余额不足"
-	skipNoPricing skipReason = "加价倍率非法，无法定价"
-)
+// Call 向上游发起一次调用：鉴权 → 请求 → 剥外壳 → 计费则记账 → 可选采样。
+//
+// 不做兜底、不判断内容能不能用 —— 那是 parser 的兜底链和适配器的事。
+// 返回值永不为 nil 错误：失败信息在 CallResult.Err 里，与计费信息并存。
+func (s *Service) Call(ctx context.Context, ep Endpoint, req Request, resourceID string) CallResult {
+	res := CallResult{BalanceAfter: ep.BalanceMicros}
 
-// usable 判定一个 endpoint 此刻能不能被调用，并顺带算出它对应的用户侧售价。
-//
-// Fetch 与 Quote 共用这一个判据，而且判据里**包含「能不能定价」** ——
-// 不变式是：一个 endpoint 可调用 ⟺ 它可报价。
-//
-// 把定价塞进可用性判断看着别扭，但两者分开写的失败模式都是静默的：
-// 报了价却没有 endpoint 可调，用户白花一次钱；调得到却报不出价，
-// 一次真实的上游支出对应零收费。后者正是 migration 000015 写下、
-// 而代码直到今天才真正堵上的那个洞，所以它不该再有第二次分叉的机会。
-//
-// margin_bp 库里有 CHECK 兜着，但那拦不住直接改表或者迁移之前的历史行；
-// 拿不出价格时宁可整条链退回内置免费实现，也不要调一个收不上钱的上游。
-func usable(ep Endpoint) (EndpointConfig, int64, skipReason) {
+	v, ok := vendors[ep.Vendor]
+	if !ok {
+		res.Err = &CallError{Kind: KindConfig, Msg: "未登记的上游 " + ep.Vendor}
+		return res
+	}
+	key := s.creds.key(ep.Vendor)
+	if key == "" {
+		res.Err = &CallError{Kind: KindNoCredential, Msg: "未配置 " + ep.Vendor + " 的 API 密钥"}
+		return res
+	}
 	var cfg EndpointConfig
-	if err := json.Unmarshal(ep.Config, &cfg); err != nil {
-		return cfg, 0, skipBadConfig
-	}
-	if cfg.URLTemplate == "" {
-		return cfg, 0, skipNoDriver
-	}
-	if ep.UnitPriceMicros > 0 && ep.BalanceMicros <= 0 {
-		return cfg, 0, skipNoBalance
-	}
-	cost, err := pricing.CreditCost(ep.UnitPriceMicros, ep.MarginBP)
-	if err != nil {
-		return cfg, 0, skipNoPricing
-	}
-	return cfg, cost, skipNone
-}
-
-// Quote 报出解析一次该 provider 应向用户收取的 credits。
-//
-// 取候选链上的**最高价**，而不是「会被第一个试到的那个」。两个理由：
-//
-//  1. 兜底链的实际落点由运行时失败决定，报价时无从预知。按第一个报价却回退到
-//     更贵的那个，就是一次真实上游支出对应一笔偏低的收费 —— 亏损随用量线性
-//     放大，且两本账（api_cost_ledger 与 credits_ledger）从不对账，看不出来。
-//  2. 计费发生在查缓存之前（ADR-046 的 2026-07-05 反转），价格因此必须是
-//     provider 的函数而不是某一次调用的函数；否则同一个链接两次解析可能不同价，
-//     而「按请求计价、可预期」正是那次反转要换来的东西。
-//
-// 代价是链路降级到便宜 endpoint 时会多收 —— 与 pricing.CreditCost 的向上取整
-// 同一个取向：宁可多收一个代币，也不要在每次调用上少收。
-//
-// 返回 ErrNoEndpoint 表示没有可用的付费 endpoint，调用方据此按内置免费实现计价。
-func (s *Service) Quote(ctx context.Context, provider string) (int64, error) {
-	eps, err := s.repo.ListForProvider(ctx, provider)
-	if err != nil {
-		return 0, err
-	}
-	return quoteOf(eps)
-}
-
-// quoteOf 是 Quote 的纯函数内核，抽出来是为了能不带数据库地覆盖定价边界。
-func quoteOf(eps []Endpoint) (int64, error) {
-	var top int64
-	found := false
-	for _, ep := range eps {
-		_, cost, skip := usable(ep)
-		if skip != skipNone {
-			continue
+	if len(ep.Config) > 0 {
+		if err := json.Unmarshal(ep.Config, &cfg); err != nil {
+			res.Err = &CallError{Kind: KindConfig, Msg: "config 解析失败: " + err.Error()}
+			return res
 		}
-		if cost > top {
-			top = cost
+	}
+	timeout := defaultTimeout
+	if cfg.TimeoutMs > 0 {
+		timeout = time.Duration(cfg.TimeoutMs) * time.Millisecond
+	}
+
+	method := req.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		res.Err = &CallError{Kind: KindConfig, Msg: "适配器给出的 URL 无效: " + err.Error()}
+		return res
+	}
+	q := u.Query()
+	for k, val := range req.Query {
+		q.Set(k, val)
+	}
+	u.RawQuery = q.Encode()
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var body io.Reader
+	if len(req.Body) > 0 {
+		body = bytes.NewReader(req.Body)
+	}
+	hreq, err := http.NewRequestWithContext(cctx, method, u.String(), body)
+	if err != nil {
+		res.Err = &CallError{Kind: KindConfig, Msg: err.Error()}
+		return res
+	}
+	if len(req.Body) > 0 {
+		hreq.Header.Set("Content-Type", "application/json")
+	}
+	hreq.Header.Set("Accept", "application/json")
+	v.authorize(hreq, key)
+
+	start := time.Now()
+	resp, err := s.client.Do(hreq)
+	if err != nil {
+		res.LatencyMs = int(time.Since(start).Milliseconds())
+		if errors.Is(err, context.DeadlineExceeded) {
+			res.Err = &CallError{Kind: KindTimeout, Msg: fmt.Sprintf("超过 %s 未响应", timeout)}
+		} else {
+			res.Err = &CallError{Kind: KindNetwork, Msg: err.Error()}
 		}
-		found = true
+		return res
 	}
-	if !found {
-		return 0, ErrNoEndpoint
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes+1))
+	resp.Body.Close()
+	res.LatencyMs = int(time.Since(start).Milliseconds())
+	res.HTTPStatus = resp.StatusCode
+
+	switch {
+	case readErr != nil:
+		// 状态码已经到手，2xx 的话上游多半已经计费，按它算
+		res.Billed = resp.StatusCode >= 200 && resp.StatusCode < 300
+		res.Err = &CallError{Kind: KindNetwork, Msg: "读取响应失败: " + readErr.Error()}
+	case len(raw) > maxRespBytes:
+		res.Billed = resp.StatusCode >= 200 && resp.StatusCode < 300
+		res.Err = &CallError{Kind: KindBadResponse, Msg: "响应超过 4 MiB"}
+	default:
+		res.Data, res.Billed, res.Err = v.unwrap(resp.StatusCode, raw)
 	}
-	return top, nil
+
+	if res.Billed && ep.UnitPriceMicros > 0 {
+		res.CostMicros = ep.UnitPriceMicros
+		res.BalanceAfter = ep.BalanceMicros - ep.UnitPriceMicros
+		epID := ep.ID
+		// 记账失败不影响本次结果，但要看得见：账对不上就是从这里开始的
+		if err := s.repo.RecordCost(context.WithoutCancel(ctx), ep.AccountID, &epID,
+			-ep.UnitPriceMicros, "call", "", resourceID); err != nil {
+			slog.Warn("extapi 成本记账失败", "slug", ep.Slug, "err", err)
+		}
+	}
+
+	if cfg.ArchiveLive {
+		s.archiveLive(context.WithoutCancel(ctx), ep.ID, resourceID, method, u, req, resp.StatusCode, raw, res.LatencyMs)
+	}
+	return res
 }
 
-func (s *Service) archiveLive(ctx context.Context, endpointID uuid.UUID, resourceID string, tr *callTrace) {
-	if tr == nil {
-		return
+// archiveLive 存一条线上调用采样。请求快照里没有鉴权头 —— 密钥只在 vendor.authorize
+// 里加到 http.Request 上，从不经过这里。
+func (s *Service) archiveLive(ctx context.Context, endpointID uuid.UUID, resourceID, method string,
+	u *url.URL, req Request, status int, raw []byte, latencyMs int) {
+	snapReq := map[string]any{"method": method, "url": u.Scheme + "://" + u.Host + u.Path, "query": req.Query}
+	if len(req.Body) > 0 {
+		snapReq["body"] = jsonOrString(req.Body)
 	}
-	req, _ := json.Marshal(tr.request)
-	resp, _ := json.Marshal(tr.response)
-	if err := s.repo.InsertSample(ctx, endpointID, "live", resourceID, req, resp, tr.status, tr.latencyMs, ""); err != nil {
+	reqJSON, _ := json.Marshal(snapReq)
+	respJSON, _ := json.Marshal(map[string]any{"status": status, "body": jsonOrString(raw)})
+	if err := s.repo.InsertSample(ctx, endpointID, "live", resourceID, reqJSON, respJSON, status, latencyMs, ""); err != nil {
 		slog.Warn("extapi 存档失败", "err", err)
 	}
 }
 
-// ---- 管理后台用 ----
+// jsonOrString 尽量把内容存成结构化 JSON（便于 JSONB 检索），非 JSON 则退化为字符串。
+func jsonOrString(b []byte) any {
+	var v any
+	if json.Unmarshal(b, &v) == nil {
+		return v
+	}
+	return string(b)
+}
+
+// ---- 管理后台：账户 ----
+
+func (s *Service) ListAccounts(ctx context.Context) ([]Account, error) {
+	return s.repo.ListAccounts(ctx)
+}
+
+func (s *Service) CreateAccount(ctx context.Context, in CreateAccountInput) (*Account, error) {
+	if _, ok := vendors[in.Vendor]; !ok {
+		return nil, ErrUnknownVendor
+	}
+	id, err := s.repo.CreateAccount(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.GetAccount(ctx, id)
+}
+
+func (s *Service) UpdateAccount(ctx context.Context, id uuid.UUID, in UpdateAccountInput) error {
+	return s.repo.UpdateAccount(ctx, id, in)
+}
+
+// Topup 录入一笔充值（正数，reason=topup）或手工核减（负数，reason=adjust）。
+func (s *Service) Topup(ctx context.Context, accountID uuid.UUID, amountMicros int64, note string) error {
+	reason := "topup"
+	if amountMicros < 0 {
+		reason = "adjust"
+	}
+	return s.repo.RecordCost(ctx, accountID, nil, amountMicros, reason, note, "")
+}
+
+func (s *Service) ListLedger(ctx context.Context, accountID uuid.UUID, includeCalls bool) ([]LedgerEntry, error) {
+	return s.repo.ListLedger(ctx, accountID, includeCalls, 200)
+}
+
+// ---- 管理后台：接口 ----
 
 func (s *Service) ListEndpoints(ctx context.Context) ([]Endpoint, error) { return s.repo.List(ctx) }
 
+// CreateEndpoint 建一个接口。slug 必须对应已注册的适配器，平台取自适配器，
+// 账户必须与适配器是同一个上游 —— 否则建出来也调不通，不如当场拒绝。
 func (s *Service) CreateEndpoint(ctx context.Context, in CreateEndpointInput) (*Endpoint, error) {
-	return s.repo.Create(ctx, in)
+	info, ok := s.catalog.Adapter(in.Slug)
+	if !ok {
+		return nil, ErrUnknownAdapter
+	}
+	acc, err := s.repo.GetAccount(ctx, in.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	if acc.Vendor != info.Vendor {
+		return nil, ErrVendorMismatch
+	}
+	id, err := s.repo.Create(ctx, info.Provider, in)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.Get(ctx, id)
 }
 
 func (s *Service) UpdateEndpoint(ctx context.Context, id uuid.UUID, in UpdateEndpointInput) error {
 	return s.repo.Update(ctx, id, in)
 }
 
-// Topup 录入一笔额度（正数）或手工核减（负数），进 api_cost_ledger。
-func (s *Service) Topup(ctx context.Context, id uuid.UUID, amountMicros int64, reason string) error {
-	if reason == "" {
-		reason = "topup"
-	}
-	return s.repo.RecordCost(ctx, id, amountMicros, reason, "")
+func (s *Service) GetEndpoint(ctx context.Context, id uuid.UUID) (*Endpoint, error) {
+	return s.repo.Get(ctx, id)
 }
+
+// Adapters 返回代码里注册的全部适配器。
+func (s *Service) Adapters() []AdapterInfo { return s.catalog.Adapters() }
 
 // AddSample 录入一条管理员提供的请求/响应示例（kind='sample'）。
 func (s *Service) AddSample(ctx context.Context, id uuid.UUID, in CreateSampleInput) error {
@@ -218,7 +267,7 @@ func nilIfEmpty(b json.RawMessage) []byte {
 // LiveSamplesPerEndpoint 是每个 endpoint 保留的线上采样条数上限。
 //
 // 写成常量而不是环境变量：它不随部署环境变化，取值只由「要看几条才够判断
-// response_map 对不对」决定，而那个答案是 20 左右，不是需要调的旋钮。
+// 适配器对不对」决定，而那个答案是 20 左右，不是需要调的旋钮。
 const LiveSamplesPerEndpoint = 20
 
 // RunSampleSweeper 阻塞执行线上采样的限量循环；调用方放在独立 goroutine。

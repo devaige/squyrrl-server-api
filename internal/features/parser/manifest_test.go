@@ -1,40 +1,42 @@
 package parser
 
 import (
+	"context"
 	"encoding/base64"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-// 构造与 server.go 相同的注册顺序，验证导出清单的两个核心不变量。
+// 构造与 server.go 相同的注册顺序，验证导出清单的核心不变量。
 func testRegistry() *Registry {
 	r := NewRegistry()
 	r.Register(NewYouTubeProvider())
 	r.Register(NewGistProvider())
 	r.Register(NewRedditProvider())
-	r.Register(NewGenericOGProvider())
 	return r
 }
 
-// 通用 OG 兜底匹配任意 http(s)，属「暂存/enrich」而非「支持解析」，绝不能进清单。
-func TestManifestExcludesGenericFallback(t *testing.T) {
-	m := testRegistry().Manifest()
+// 清单只列此刻真有来源的平台。没接付费接口时 YouTube 没有任何来源（oEmbed 不算解析），
+// 它的链接应当被客户端当普通链接暂存，而不是给一个注定失败的「解析」按钮。
+func TestManifestOnlyListsPlatformsWithSources(t *testing.T) {
+	svc := NewService(Deps{Registry: testRegistry()})
+	m, err := svc.Manifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	got := map[string]bool{}
 	for _, e := range m.Providers {
 		got[e.ID] = true
 	}
-	for _, want := range []string{"youtube", "gist", "reddit"} {
+	for _, want := range []string{"gist", "reddit"} {
 		if !got[want] {
-			t.Errorf("清单缺少专用 provider %q", want)
+			t.Errorf("有内置免费来源的 %q 应在清单里", want)
 		}
 	}
-	if got["url"] {
-		t.Error("清单不应包含通用 OG 兜底（id=url）")
-	}
-	if len(m.Providers) != 3 {
-		t.Errorf("期望 3 个专用 provider，实得 %d", len(m.Providers))
+	if got["youtube"] {
+		t.Error("没有任何来源的 youtube 不应进清单")
 	}
 }
 
@@ -46,7 +48,7 @@ func TestManifestPatternsMatchProviderBehavior(t *testing.T) {
 		"gist":    "https://gist.github.com/octocat/6cff45a4a3b1a3b1c0ff",
 		"reddit":  "https://www.reddit.com/r/golang/comments/abc123/title",
 	}
-	m := testRegistry().Manifest()
+	m := testRegistry().Manifest(nil)
 	for _, e := range m.Providers {
 		uri, ok := cases[e.ID]
 		if !ok {
@@ -90,8 +92,8 @@ func TestManifestObfuscationRoundTrip(t *testing.T) {
 
 // 版本号是内容哈希：同内容稳定、非空。
 func TestManifestVersionStable(t *testing.T) {
-	v1 := testRegistry().Manifest().Version
-	v2 := testRegistry().Manifest().Version
+	v1 := testRegistry().Manifest(nil).Version
+	v2 := testRegistry().Manifest(nil).Version
 	if v1 == "" {
 		t.Fatal("version 不应为空")
 	}

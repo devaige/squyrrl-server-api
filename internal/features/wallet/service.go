@@ -47,6 +47,12 @@ func (s *Service) Grant(ctx context.Context, userID uuid.UUID, delta int64, reas
 	return s.repo.Grant(ctx, userID, delta, reason, idemKey)
 }
 
+// Balance 只读当前代币余额。用于「先确认付得起再干活」的预检（解析），
+// 真正的扣减仍由 Consume 在锁内重新校验。
+func (s *Service) Balance(ctx context.Context, userID uuid.UUID) (int64, error) {
+	return s.repo.CreditsBalance(ctx, userID)
+}
+
 // Consume 试扣 cost 个 credits；余额不足返 ErrInsufficientCredits。
 func (s *Service) Consume(ctx context.Context, userID uuid.UUID, cost int64, reason string) (*GrantResponse, error) {
 	return s.repo.Consume(ctx, userID, cost, reason)

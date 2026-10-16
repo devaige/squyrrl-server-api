@@ -2,8 +2,8 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -11,24 +11,39 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/squyrrl/api/internal/features/extapi"
+	"github.com/squyrrl/api/internal/features/pricing"
 	"github.com/squyrrl/api/internal/features/wallet"
 	"github.com/squyrrl/api/internal/infra/ratelimit"
 )
 
-type Service struct {
-	registry *Registry
-	cache    *Cache
-	wallet   *wallet.Service
-	extapi   *extapi.Service // 第三方付费 API 供应层；nil 时全部走内置免费实现
+// Deps 是 Service 的依赖。Extapi / Prices / Logs 可为 nil（测试里只跑内置来源）。
+type Deps struct {
+	Registry *Registry
+	Cache    *Cache
+	Wallet   *wallet.Service
+	Extapi   *extapi.Service // nil → 只走内置免费来源
+	Adapters AdapterSet
+	Prices   *PriceRepo // nil → 不读覆盖值，全部用自动价
+	Logs     *LogRepo   // nil → 不记解析记录
 
-	// baseCost 是**内置免费 provider**（YouTube oEmbed / Gist / Reddit / GenericOG）
-	// 的解析单价。付费 endpoint 的价格不走这里，由 extapi.Quote 从上游单价 × 加价
-	// 倍率算出（pricing.CreditCost）。<=0 表示整体关闭解析计费（dev 用）。
-	baseCost int64
+	// DefaultPrice 是只有免费来源的平台的售价（SQUYRRL_PARSE_COST）；<=0 = 解析整体不扣费。
+	DefaultPrice    int64
+	RefreshCooldown time.Duration
+}
+
+type Service struct {
+	registry     *Registry
+	cache        *Cache
+	wallet       *wallet.Service
+	extapi       *extapi.Service
+	adapters     AdapterSet
+	prices       *PriceRepo
+	logs         *LogRepo
+	defaultPrice int64
 
 	// flight 让并发解析**同一资源**的请求共用一次上游调用。
 	//
-	// 这不是锦上添花的优化：付费 endpoint 的余额是 soft budget，没有 advisory lock，
+	// 这不是锦上添花的优化：付费接口的余额是 soft budget，没有 advisory lock，
 	// 并发的缓存未命中本来就会小幅超支；而强制刷新是一个用户可以反复按的按钮，
 	// 它把「小幅超支」放大成「可被主动触发的循环」。合并同一资源的在途请求，
 	// 是在不引入分布式锁的前提下能做的最直接的一层。
@@ -42,117 +57,161 @@ type Service struct {
 	refresh *ratelimit.Limiter
 }
 
-func NewService(
-	registry *Registry, cache *Cache, walletSvc *wallet.Service,
-	extapiSvc *extapi.Service, baseCost int64, refreshCooldown time.Duration,
-) *Service {
+func NewService(d Deps) *Service {
 	// 每个资源每个冷却窗口放行一次真正的重取。冷却期为 0 时走 ratelimit 自己的
 	// 「limit<=0 即 Allow 恒真」而不是依赖 period=0 的时间比较 ——
 	// 后者要靠两次调用落在不同纳秒上才成立，是个能跑通但说不清楚的关闭方式。
 	limit := 1
-	if refreshCooldown <= 0 {
+	if d.RefreshCooldown <= 0 {
 		limit = 0
 	}
+	adapters := d.Adapters
+	if adapters == nil {
+		adapters = AdapterSet{}
+	}
 	return &Service{
-		registry: registry, cache: cache, wallet: walletSvc,
-		extapi: extapiSvc, baseCost: baseCost,
-		refresh: ratelimit.New(limit, refreshCooldown),
+		registry: d.Registry, cache: d.Cache, wallet: d.Wallet,
+		extapi: d.Extapi, adapters: adapters, prices: d.Prices, logs: d.Logs,
+		defaultPrice: d.DefaultPrice,
+		refresh:      ratelimit.New(limit, d.RefreshCooldown),
 	}
 }
 
-// Manifest 透传 registry 的受支持解析清单，供 handler 的公开 /uris/manifest 端点导出。
-func (s *Service) Manifest() Manifest { return s.registry.Manifest() }
-
-// Parse 是 Service 主入口：先按 URI 选 provider → 询价 → 扣费 → 命中缓存即返回 → 否则抓取 → 写缓存
+// Parse 是主入口：选平台 → 定价 → 确认付得起 → 命中缓存或跑兜底链 → 成功才扣费 → 记一笔解析记录。
 //
-// in.Force 跳过缓存读、直接重取一次（用户侧的「强制刷新」）。它**不改变计价** ——
-// 扣费点在缓存查询之前，强制与否付一样的钱，区别只是拿到的是不是新鲜数据。
+// 计费（ADR-080，取代 ADR-046 的「先扣后取」）：
+//   - 价格是平台的固定售价，与实际由哪个来源产出无关，命中缓存也一样；
+//   - 先看余额够不够，够才干活；拿到内容（含命中缓存）才扣；整条链失败分文不取。
 //
-// 计费策略（2026-07-05 起）：**每次解析请求都扣 credits，命中/未命中一致**。
-// 故扣费点前移到缓存查询之前——改为「按请求计价」，用户侧价格模型更简单、更可预期。
-// （原「命中免费」设计已废止，见 ADR-046 更新。）
-//
-// 价格从 2026-09-12 起由 quote 算出，不再是一个全局常量：走付费 endpoint 的
-// provider 按「上游单价 × 加价倍率」收（pricing.CreditCost），走内置免费实现的
-// 按 baseCost 收。baseCost<=0 时整体不扣。
-// 余额不足返 wallet.ErrInsufficientCredits（handler 映射到 402）。
+// in.Force 跳过缓存读、直接重取一次（用户侧的「强制刷新」），不改变价格。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*ParseResponse, error) {
+	start := time.Now()
 	p, resourceID, ok := s.registry.Find(in.URI)
 	if !ok {
 		return nil, ErrNoParser // 无法解析的 URI 不产生费用
 	}
 
-	// 先扣费再查缓存：命中也计费。放在 registry.Find 之后，保证只有「可解析」的请求才扣。
-	cost := s.quote(ctx, p.Provider())
-	if cost > 0 {
-		reason := "parse_uri:" + p.Provider()
-		if _, err := s.wallet.Consume(ctx, userID, cost, reason); err != nil {
-			// 原样往上抛，**不要**替换成裸的 wallet.ErrInsufficientCredits。
-			// Consume 返回的是带 Balance/Required 的 *InsufficientCreditsError，
-			// 换成哨兵会让 handler 的 errors.As 永远落空，402 里的「还差多少」恒为 0。
-			// 价格还是常量时这只是不好看，现在价格随 provider 变，客户端再也猜不出来。
-			// errors.Is 不受影响 —— 那个类型 Unwrap 到同一个哨兵。
-			if !errors.Is(err, wallet.ErrInsufficientCredits) {
-				slog.Warn("parse credits 扣费失败", "err", err)
-			}
+	eps, err := s.endpointsFor(ctx, p.Provider())
+	if err != nil {
+		return nil, err
+	}
+	price, err := s.price(ctx, p.Provider(), eps)
+	if err != nil {
+		return nil, err
+	}
+	if price > 0 {
+		bal, err := s.wallet.Balance(ctx, userID)
+		if err != nil {
 			return nil, err
+		}
+		if bal < price {
+			return nil, &wallet.InsufficientCreditsError{Balance: bal, Required: price}
 		}
 	}
 
+	entry := &LogEntry{Provider: p.Provider(), ResourceID: resourceID, Forced: in.Force}
+	resp := &ParseResponse{Provider: p.Provider(), ResourceID: resourceID}
+
 	// 强制刷新在冷却期内被降级为一次普通读，而不是被拒绝：见 Service.refresh 的说明。
 	bypassCache := in.Force && s.refresh.Allow(p.Provider()+"\x00"+resourceID)
-
 	if !bypassCache {
 		if cached, version, hit, err := s.cache.Get(ctx, p.Provider(), resourceID); err != nil {
 			slog.Warn("parse_cache 读取失败", "err", err)
 		} else if hit {
-			return &ParseResponse{
-				Provider:       p.Provider(),
-				ResourceID:     resourceID,
-				Snippet:        cached,
-				Version:        version,
-				Cached:         true,
-				CreditsCharged: cost,
-			}, nil
+			entry.Cached = true
+			resp.Snippet, resp.Version, resp.Cached = cached, version, true
+			return s.settle(ctx, userID, price, start, entry, resp)
 		}
 	}
 
-	snip, version, err := s.fetchShared(ctx, p, in.URI, resourceID)
-	if err != nil {
-		return nil, err
+	out := s.fetchShared(ctx, p, eps, in.URI, resourceID)
+	entry.Source = out.source
+	entry.Shared = !out.leader
+	if out.leader {
+		// 并发合并时只有真正发起调用的那个请求承担成本，否则同一笔钱会被记 N 次
+		entry.Attempts = out.attempts
+		for _, a := range out.attempts {
+			entry.CostMicros += a.CostMicros
+		}
 	}
-
-	return &ParseResponse{
-		Provider:       p.Provider(),
-		ResourceID:     resourceID,
-		Snippet:        snip,
-		Version:        version,
-		Cached:         false,
-		CreditsCharged: cost,
-	}, nil
+	if out.err != nil {
+		entry.Status = LogFailed
+		entry.Error = out.err.Error()
+		s.writeLog(ctx, entry, start)
+		return nil, ErrParseFailed
+	}
+	resp.Snippet, resp.Version = out.snip, out.version
+	return s.settle(ctx, userID, price, start, entry, resp)
 }
 
-// fetchShared 抓取并写缓存，同一资源的并发调用合并为一次。
+// settle 扣费并记一笔解析记录。
+//
+// 开头已经确认过余额，这里仍可能扣不动：同一用户的并发请求在这期间把钱花掉了。
+// 内容不给（不付钱就没有内容），但它已经进了缓存，成本没有白花；记录标为 unpaid，
+// 对账时看得见这笔「有成本、没收入」。
+func (s *Service) settle(ctx context.Context, userID uuid.UUID, price int64, start time.Time,
+	entry *LogEntry, resp *ParseResponse) (*ParseResponse, error) {
+	if price > 0 {
+		if _, err := s.wallet.Consume(ctx, userID, price, "parse_uri:"+entry.Provider); err != nil {
+			// 原样往上抛，**不要**替换成裸的 wallet.ErrInsufficientCredits：
+			// Consume 返回的 *InsufficientCreditsError 带着 Balance/Required，
+			// handler 靠 errors.As 拿它告诉客户端「还差多少」。
+			entry.Status = LogUnpaid
+			entry.Error = err.Error()
+			if !errors.Is(err, wallet.ErrInsufficientCredits) {
+				slog.Warn("parse credits 扣费失败", "err", err)
+			}
+			s.writeLog(ctx, entry, start)
+			return nil, err
+		}
+	}
+	entry.Status = LogOK
+	entry.CreditsCharged = price
+	resp.CreditsCharged = price
+	s.writeLog(ctx, entry, start)
+	return resp, nil
+}
+
+func (s *Service) writeLog(ctx context.Context, e *LogEntry, start time.Time) {
+	if s.logs == nil {
+		return
+	}
+	e.LatencyMs = int(time.Since(start).Milliseconds())
+	// 客户端断开也要记下来：成本可能已经发生
+	if err := s.logs.Write(context.WithoutCancel(ctx), e); err != nil {
+		slog.Warn("解析记录写入失败", "provider", e.Provider, "err", err)
+	}
+}
+
+// fetchOutcome 是一次兜底链执行的结果。leader 只对真正执行了链的那个请求为 true。
+type fetchOutcome struct {
+	snip     *ParsedSnippet
+	version  string
+	source   string
+	attempts []Attempt
+	err      error
+	leader   bool
+}
+
+// fetchShared 跑兜底链并写缓存，同一资源的并发调用合并为一次。
 //
 // 整个「抓取 → 组装 → 写缓存」都放进 singleflight 内部，而不是只包住抓取：
 // 否则 N 个等待者会各自再写一次缓存，把省下来的上游调用换成 N 次重复写。
 //
-// 内部用 context.WithoutCancel：首个调用者断开连接不应让其余等待者一起失败。
-// 更重要的是**钱已经扣了** —— 扣费发生在这之前，此刻放弃抓取等于用户付了钱却
-// 连缓存都没留下。上游侧有各自的超时（extapi 的 TimeoutMs、内置实现的 http.Client
-// Timeout）兜住时长，所以去掉取消不会留下一个永不返回的调用。
-func (s *Service) fetchShared(ctx context.Context, p Parser, uri, resourceID string) (*ParsedSnippet, string, error) {
-	type outcome struct {
-		snip    *ParsedSnippet
-		version string
-	}
-
-	v, err, _ := s.flight.Do(p.Provider()+"\x00"+resourceID, func() (any, error) {
+// 内部用 context.WithoutCancel：首个调用者断开连接不应让其余等待者一起失败；
+// 上游的钱一旦花出去，结果也该留进缓存。时长由各来源自己的超时兜住
+// （接口的 timeout_ms、内置实现的 http.Client Timeout），不会留下永不返回的调用。
+func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoint, uri, resourceID string) fetchOutcome {
+	// singleflight 只在发起者自己的 goroutine 里执行闭包，等待者的闭包从不运行，
+	// 所以这个局部变量只会被发起者置真，无需同步。
+	leader := false
+	v, _, _ := s.flight.Do(p.Provider()+"\x00"+resourceID, func() (any, error) {
+		leader = true
 		fctx := context.WithoutCancel(ctx)
 
-		res, err := s.fetch(fctx, p, uri, resourceID)
+		res, source, attempts, err := s.runChain(fctx, p, eps, uri, resourceID)
 		if err != nil {
-			return nil, err
+			return fetchOutcome{attempts: attempts, err: err}, nil
 		}
 
 		snippetType := p.SnippetType()
@@ -171,93 +230,243 @@ func (s *Service) fetchShared(ctx context.Context, p Parser, uri, resourceID str
 			SourceData:  res.SourceData,
 			Assets:      res.Assets,
 		}
-
 		if err := s.cache.Put(fctx, p.Provider(), resourceID, res.Version, snip); err != nil {
 			// 缓存失败不影响返回结果
 			slog.Warn("parse_cache 写入失败", "err", err)
 		}
-		return outcome{snip: snip, version: res.Version}, nil
+		return fetchOutcome{snip: snip, version: res.Version, source: source, attempts: attempts}, nil
 	})
-	if err != nil {
-		return nil, "", err
-	}
-	out := v.(outcome)
-	return out.snip, out.version, nil
+	out := v.(fetchOutcome)
+	out.leader = leader
+	return out
 }
 
-// quote 算出这次解析要扣多少 credits。
+var (
+	errNoSource       = errors.New("没有可用来源")
+	errChainExhausted = errors.New("所有来源均失败")
+)
+
+// runChain 按价格从低到高尝试各来源，直到拿到可用内容：内置免费来源在前，
+// 付费接口按单价升序（同价看 priority，见 extapi.Repo.ListForProvider）。
 //
-// 三条路径都落在「与 fetch 实际会走哪条一致」这一个要求上：
-//   - 有可用的付费 endpoint → 按 extapi 的报价收（已含上游成本 × 加价倍率）；
-//   - ErrNoEndpoint → fetch 也会回退到内置免费实现，按 baseCost 收；
-//   - 询价出错（多半是数据库） → fetch 里的 ListForProvider 同样会失败，
-//     它会 fall through 到内置实现，所以 baseCost 仍然是对的那一边。
-//
-// 换句话说：询价失败不阻断解析，也不会静默免单。
-func (s *Service) quote(ctx context.Context, provider string) int64 {
-	if s.baseCost <= 0 {
-		return 0 // 计费整体关闭
+// 每一步都记成一次 Attempt，包括被跳过的 —— 「为什么没走到那个接口」在排查时
+// 和「那个接口为什么失败」一样重要。
+func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint, uri, resourceID string) (*ParseResult, string, []Attempt, error) {
+	var attempts []Attempt
+	add := func(a Attempt) {
+		a.Seq = len(attempts) + 1
+		attempts = append(attempts, a)
 	}
+
+	if b, ok := p.(BuiltinParser); ok {
+		source := "builtin:" + p.Provider()
+		t0 := time.Now()
+		res, err := b.Parse(ctx, uri, resourceID)
+		a := Attempt{Source: source, LatencyMs: int(time.Since(t0).Milliseconds())}
+		switch {
+		case err != nil:
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindBuiltin, err.Error()
+		case !usable(res):
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindEmpty, "没有标题也没有正文"
+		default:
+			a.Outcome = AttemptOK
+			add(a)
+			return res, source, attempts, nil
+		}
+		add(a)
+	}
+
+	// 同一账户下的接口共用余额，而 eps 里的余额是链开始前读的：链内前面的调用
+	// 花掉的钱要自己扣回去，否则「余额耗尽就跳过」和余额快照都会慢一拍。
+	spent := map[uuid.UUID]int64{}
+	for _, ep := range eps {
+		ep.BalanceMicros -= spent[ep.AccountID]
+		epID, accID := ep.ID, ep.AccountID
+		a := Attempt{Source: ep.Slug, EndpointID: &epID, AccountID: &accID, AccountName: ep.AccountName}
+
+		ad, ok := s.adapters.callable(ep)
+		if !ok {
+			a.Outcome, a.ErrorKind = AttemptSkipped, extapi.KindNoAdapter
+			a.Error = fmt.Sprintf("代码里没有 %s/%s 的适配器 %q", ep.Vendor, ep.Provider, ep.Slug)
+			add(a)
+			continue
+		}
+		if ep.UnitPriceMicros > 0 && ep.BalanceMicros <= 0 {
+			a.Outcome, a.ErrorKind, a.Error = AttemptSkipped, extapi.KindNoBalance, "账户余额已用完"
+			add(a)
+			continue
+		}
+
+		call := s.extapi.Call(ctx, ep, ad.Request(uri, resourceID), resourceID)
+		spent[ep.AccountID] += call.CostMicros
+		a.HTTPStatus, a.LatencyMs, a.CostMicros = call.HTTPStatus, call.LatencyMs, call.CostMicros
+		if call.CostMicros > 0 {
+			bal := call.BalanceAfter
+			a.BalanceAfter = &bal
+		}
+		if call.Err != nil {
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, call.Err.Kind, call.Err.Msg
+			add(a)
+			continue
+		}
+		res, err := ad.Decode(call.Data, uri, resourceID)
+		switch {
+		case err != nil:
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
+		case !usable(res):
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, "转换后没有标题也没有正文"
+		default:
+			a.Outcome = AttemptOK
+			add(a)
+			return res, ep.Slug, attempts, nil
+		}
+		add(a)
+	}
+
+	if len(attempts) == 0 {
+		return nil, "", nil, errNoSource
+	}
+	return nil, "", attempts, errChainExhausted
+}
+
+// usable 判断一份结果能不能交给用户：至少要有标题或正文。
+// 上游降级（限流、部分字段缺失）时常见「200 但几乎是空的」，那不算成功。
+func usable(res *ParseResult) bool {
+	if res == nil {
+		return false
+	}
+	return (res.Title != nil && *res.Title != "") || (res.Description != nil && *res.Description != "")
+}
+
+// endpointsFor 取某平台的付费兜底链；没接 extapi 时为空。
+func (s *Service) endpointsFor(ctx context.Context, provider string) ([]extapi.Endpoint, error) {
 	if s.extapi == nil {
-		return s.baseCost
+		return nil, nil
 	}
-	cost, err := s.extapi.Quote(ctx, provider)
-	switch {
-	case err == nil:
-		return cost
-	case errors.Is(err, extapi.ErrNoEndpoint):
-		// 正常路径：这个 provider 还没接付费供应商。
-	default:
-		slog.Warn("extapi 询价失败，按内置实现计价", "provider", provider, "err", err)
-	}
-	return s.baseCost
+	return s.extapi.ListForProvider(ctx, provider)
 }
 
-// fetch 先走已配置的付费 endpoint 兜底链；若该 provider 没有可用 endpoint（ErrNoEndpoint）
-// 或整条链都失败，则回退到 Parser 的内置免费实现（如 YouTube oEmbed）。
-// 这样「有配置就用付费拿丰富数据、没配置/挂了仍能返回基础数据」自然成立，且对既有 provider 零影响。
-func (s *Service) fetch(ctx context.Context, p Parser, uri, resourceID string) (*ParseResult, error) {
+// price 给出某平台此刻的售价，规则见 price.go。
+func (s *Service) price(ctx context.Context, provider string, eps []extapi.Endpoint) (int64, error) {
+	if s.defaultPrice <= 0 {
+		return 0, nil // 计费整体关闭
+	}
+	if s.prices != nil {
+		credits, ok, err := s.prices.Get(ctx, provider)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return credits, nil
+		}
+	}
+	return autoPrice(s.adapters.maxUnitPrice(eps), s.defaultPrice)
+}
+
+// Manifest 导出此刻真有来源的平台的匹配规则，供 /uris/manifest 下发。
+func (s *Service) Manifest(ctx context.Context) (Manifest, error) {
+	paid := map[string]bool{}
 	if s.extapi != nil {
-		fr, err := s.extapi.Fetch(ctx, p.Provider(), uri, resourceID)
-		if err == nil {
-			return fetchToResult(p.Provider(), uri, resourceID, fr), nil
+		eps, err := s.extapi.ListEnabled(ctx)
+		if err != nil {
+			return Manifest{}, err
 		}
-		if !errors.Is(err, extapi.ErrNoEndpoint) {
-			// 全链失败（网络/额度/映射）不直接报错：降级到内置实现，保证可用性
-			slog.Warn("extapi 兜底链失败，回退内置解析", "provider", p.Provider(), "err", err)
+		for _, ep := range eps {
+			if _, ok := s.adapters.callable(ep); ok {
+				paid[ep.Provider] = true
+			}
 		}
 	}
-	return p.Parse(ctx, uri, resourceID)
+	return s.registry.Manifest(func(p Parser) bool {
+		_, builtin := p.(BuiltinParser)
+		return builtin || paid[p.Provider()]
+	}), nil
 }
 
-// fetchToResult 把供应层的中立结果组装成 provider-specific 的 ParseResult。
-// payload 用与内置实现兼容的通用键（url/resource_id/thumbnail_url），
-// source_data 记作者信息并附上实际命中的 endpoint（via）便于回溯。
-func fetchToResult(provider, uri, resourceID string, fr *extapi.FetchResult) *ParseResult {
-	payload, _ := json.Marshal(map[string]any{
-		"url":           uri,
-		"resource_id":   resourceID,
-		"thumbnail_url": fr.ThumbnailURL,
-	})
-	source, _ := json.Marshal(map[string]any{
-		"provider":    provider,
-		"author_name": fr.AuthorName,
-		"author_url":  fr.AuthorURL,
-		"via":         fr.EndpointSlug,
-	})
-	res := &ParseResult{
-		Payload:    payload,
-		SourceData: source,
-		Assets:     mediaAsset(fr.ThumbnailURL, "thumbnail", ""),
-		Version:    fr.Version,
+// ---- 管理后台 ----
+
+// Prices 列出每个平台的售价构成，按注册顺序。
+func (s *Service) Prices(ctx context.Context) ([]PriceInfo, error) {
+	var eps []extapi.Endpoint
+	if s.extapi != nil {
+		var err error
+		if eps, err = s.extapi.ListEnabled(ctx); err != nil {
+			return nil, err
+		}
 	}
-	if fr.Title != "" {
-		t := fr.Title
-		res.Title = &t
+	overrides := map[string]int64{}
+	if s.prices != nil {
+		var err error
+		if overrides, err = s.prices.All(ctx); err != nil {
+			return nil, err
+		}
 	}
-	if fr.Description != "" {
-		d := fr.Description
-		res.Description = &d
+
+	byProvider := map[string][]extapi.Endpoint{}
+	for _, ep := range eps {
+		byProvider[ep.Provider] = append(byProvider[ep.Provider], ep)
 	}
-	return res
+
+	out := make([]PriceInfo, 0, len(s.registry.Parsers()))
+	for _, p := range s.registry.Parsers() {
+		list := byProvider[p.Provider()]
+		info := PriceInfo{Provider: p.Provider(), MaxUnitPriceMicros: s.adapters.maxUnitPrice(list)}
+		_, info.HasBuiltin = p.(BuiltinParser)
+		for _, ep := range list {
+			if _, ok := s.adapters.callable(ep); ok {
+				info.Endpoints++
+			}
+		}
+		auto, err := autoPrice(info.MaxUnitPriceMicros, s.defaultPrice)
+		if err != nil {
+			return nil, err
+		}
+		info.AutoCredits, info.EffectiveCredits = auto, auto
+		if v, ok := overrides[p.Provider()]; ok {
+			info.OverrideCredits = &v
+			info.EffectiveCredits = v
+		}
+		if s.defaultPrice <= 0 {
+			info.EffectiveCredits = 0
+		}
+		info.Loss = info.EffectiveCredits*pricing.MicrosPerCredit < info.MaxUnitPriceMicros
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// SetPrice 设定某平台的售价覆盖值。
+func (s *Service) SetPrice(ctx context.Context, provider string, credits int64) error {
+	if !s.hasProvider(provider) {
+		return ErrNoParser
+	}
+	if credits <= 0 {
+		return ErrBadPrice
+	}
+	return s.prices.Set(ctx, provider, credits)
+}
+
+// ClearPrice 撤销覆盖值，回到自动价。
+func (s *Service) ClearPrice(ctx context.Context, provider string) error {
+	return s.prices.Delete(ctx, provider)
+}
+
+func (s *Service) hasProvider(provider string) bool {
+	for _, p := range s.registry.Parsers() {
+		if p.Provider() == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrBadPrice 表示售价不是正整数。
+var ErrBadPrice = errors.New("price must be a positive number of credits")
+
+func (s *Service) Logs(ctx context.Context, f LogFilter) ([]LogEntry, error) {
+	return s.logs.List(ctx, f)
+}
+
+func (s *Service) LogSummary(ctx context.Context, days int) ([]ProviderSummary, []SourceSummary, error) {
+	return s.logs.Summary(ctx, days)
 }

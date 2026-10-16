@@ -88,15 +88,28 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	snipSvc := snippet.NewService(snippet.NewRepo(pool), quotaSvc)
 	fileSvc := file.NewService(file.NewRepo(pool), st, quotaSvc, cfg.UploadEdgeBase, cfg.UploadTokenSecret)
 
-	// URI 解析：特殊 provider 顺序匹配；通用 OG 兜底放在最末
+	// URI 解析（ADR-080）：平台按注册顺序匹配链接；每个平台的来源按价格从低到高
+	// 排成兜底链 —— 内置免费来源在前，付费上游接口（api_endpoints + 代码适配器）按单价升序。
+	// oEmbed / OG 不算解析，没有「任意链接」的兜底平台。
 	registry := parser.NewRegistry()
 	registry.Register(parser.NewYouTubeProvider())
 	registry.Register(parser.NewGistProvider())
 	registry.Register(parser.NewRedditProvider())
-	registry.Register(parser.NewGenericOGProvider())
-	extapiSvc := extapi.NewService(extapi.NewRepo(pool))
+	adapters := parser.DefaultAdapters()
+	extapiSvc := extapi.NewService(extapi.NewRepo(pool),
+		extapi.Credentials{TikHub: cfg.TikHubAPIKey, RapidAPI: cfg.RapidAPIKey}, adapters)
 	parseCache := parser.NewCache(pool, cfg.ParseCacheTTL)
-	parsSvc := parser.NewService(registry, parseCache, walletSvc, extapiSvc, cfg.ParseCost, cfg.ParseRefreshCooldown)
+	parsSvc := parser.NewService(parser.Deps{
+		Registry:        registry,
+		Cache:           parseCache,
+		Wallet:          walletSvc,
+		Extapi:          extapiSvc,
+		Adapters:        adapters,
+		Prices:          parser.NewPriceRepo(pool),
+		Logs:            parser.NewLogRepo(pool),
+		DefaultPrice:    cfg.ParseCost,
+		RefreshCooldown: cfg.ParseRefreshCooldown,
+	})
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, quotaSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
@@ -211,6 +224,7 @@ func (s *Server) routes() {
 	adminInternal.Use(tg.InternalAuth(s.cfg.InternalToken))
 	walletHandler.RegisterInternal(adminInternal)
 	extapi.NewHandler(s.extapiSvc).RegisterInternal(adminInternal)
+	parser.NewHandler(s.parsSvc).RegisterInternal(adminInternal)
 	users.NewHandler(users.NewService(users.NewRepo(s.pool), s.walletSvc, s.quotaSvc, s.subSvc)).RegisterInternal(adminInternal)
 	subscriptions.NewAdminHandler(s.subSvc).RegisterInternal(adminInternal)
 	snippet.NewAdminHandler(snippet.NewAdminRepo(s.pool)).RegisterInternal(adminInternal)

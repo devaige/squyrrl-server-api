@@ -8,119 +8,132 @@ import (
 	"github.com/google/uuid"
 )
 
-// ErrNoEndpoint 表示该 provider 当前没有可用（enabled + 有余额 + 配置完整）的付费 endpoint。
-// 上层据此回退到内置免费实现（如 YouTube oEmbed）。
-var ErrNoEndpoint = errors.New("no external api endpoint available for provider")
+// extapi 是付费解析上游的供应层（ADR-056，ADR-080 重构）：
+//
+//	账户 Account  —— 钱实际存放、被扣减的地方。直连上游（TikHub）一个账户；
+//	                 聚合平台（RapidAPI）每个子提供商一个账户。
+//	接口 Endpoint —— 某个账户下、某个平台的某个功能，一行对应一个 Go 适配器（按 slug）。
+//
+// 本包只管目录、记账、鉴权与 HTTP 调用；「请求怎么拼、响应怎么转成我们自己的格式」
+// 在 parser 包的适配器里 —— 那需要 parser 的类型，而 parser 依赖本包。
 
-// Endpoint 是一个外部第三方解析 API 的接入点。同一 provider 下多个 endpoint 按 priority 构成兜底链。
+var (
+	ErrUnknownVendor  = errors.New("unknown upstream vendor")
+	ErrUnknownAdapter = errors.New("no adapter registered for this slug")
+	ErrVendorMismatch = errors.New("adapter vendor does not match account vendor")
+)
+
+// Account 是一个计费账户。余额 = 充值/调账 − 调用成本，全部来自 api_cost_ledger。
+type Account struct {
+	ID        uuid.UUID `json:"id"`
+	Vendor    string    `json:"vendor"`
+	Slug      string    `json:"slug"`
+	Name      string    `json:"name"`
+	Currency  string    `json:"currency"`
+	Note      string    `json:"note"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	BalanceMicros  int64 `json:"balance_micros"`
+	ToppedUpMicros int64 `json:"topped_up_micros"` // 充值与调账（delta>0）累计
+	SpentMicros    int64 `json:"spent_micros"`     // 调用成本与手工核减（delta<0）累计
+	CallCount      int64 `json:"call_count"`       // 计费调用次数
+}
+
+// Endpoint 是一个可调用的上游接口。同一平台下的多个接口按单价升序构成兜底链。
 type Endpoint struct {
-	ID              uuid.UUID `json:"id"`
-	Provider        string    `json:"provider"`
-	Vendor          string    `json:"vendor"`
-	Slug            string    `json:"slug"`
-	Priority        int       `json:"priority"`
-	Enabled         bool      `json:"enabled"`
-	UnitPriceMicros int64     `json:"unit_price_micros"`
+	ID              uuid.UUID       `json:"id"`
+	AccountID       uuid.UUID       `json:"account_id"`
+	Provider        string          `json:"provider"` // 平台，对应 parser.Parser.Provider()
+	Slug            string          `json:"slug"`     // 同时是适配器键（parser.Adapter）
+	Priority        int             `json:"priority"` // 同价时的先后，越小越先
+	Enabled         bool            `json:"enabled"`
+	UnitPriceMicros int64           `json:"unit_price_micros"` // 每次被上游计费的调用成本，币种百万分之一
+	Config          json.RawMessage `json:"config"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 
-	// MarginBP 是这个 endpoint 的加价倍率（万分比整数，20000 = 2.0 倍）。
-	// 它与 UnitPriceMicros 一起决定用户侧售价，见 pricing.CreditCost。
-	// migration 000015 加了这一列，但在 2026-09-12 之前**从没被读出来过** ——
-	// 售价一直是个与上游成本无关的全局常量，正是那条迁移注释预言的亏损形态。
-	MarginBP int32 `json:"margin_bp"`
+	// 以下来自所属账户
+	Vendor        string `json:"vendor"`
+	AccountSlug   string `json:"account_slug"`
+	AccountName   string `json:"account_name"`
+	Currency      string `json:"currency"`
+	BalanceMicros int64  `json:"balance_micros"` // 账户余额，同账户的接口共用
 
-	Currency  string          `json:"currency"`
-	Config    json.RawMessage `json:"config"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
-
-	// 以下为聚合字段，仅列表/详情查询填充（Fetch 路径只用到 BalanceMicros）
-	BalanceMicros int64 `json:"balance_micros"`
-	SpentMicros   int64 `json:"spent_micros"`
-	CallCount     int64 `json:"call_count"`
+	// 以下为接口自身的统计，仅后台列表填充
+	CallCount   int64 `json:"call_count"`
+	SpentMicros int64 `json:"spent_micros"`
 }
 
-// EndpointConfig 是 config JSONB 的强类型形态，驱动据此构造请求、映射响应。
-//
-// 占位符在 url_template / query / headers / body 中生效：
-//
-//	${resource_id}  被解析资源在 provider 命名空间内的 ID（视频 ID 等）
-//	${uri}          原始 URI
-//	${env:VARNAME}  运行时读环境变量（用于 API key —— 密钥永远只在 env，不落库）
+// EndpointConfig 是 config JSONB 的强类型形态。只剩运行参数 ——
+// 请求与响应映射在适配器代码里。
 type EndpointConfig struct {
-	Method      string            `json:"method"`       // 默认 GET
-	URLTemplate string            `json:"url_template"` // 必填；为空视为「无驱动配置」，Fetch 跳过
-	Headers     map[string]string `json:"headers"`
-	Query       map[string]string `json:"query"`
-	Body        string            `json:"body"`
-	ResponseMap ResponseMap       `json:"response_map"`
-	ArchiveLive bool              `json:"archive_live"` // 是否把线上真实调用采样进 api_samples
-	TimeoutMs   int               `json:"timeout_ms"`   // 默认 8000
+	TimeoutMs   int  `json:"timeout_ms"`   // 默认 15000
+	ArchiveLive bool `json:"archive_live"` // 把线上真实调用采样进 api_samples，用来核对适配器
 }
 
-// ResponseMap 用「点路径」把上游任意 JSON 响应映射到通用字段。
-// 路径支持对象键与数组下标，如 "items.0.snippet.title"。
-type ResponseMap struct {
-	Title        string `json:"title"`
-	Description  string `json:"description"`
-	ThumbnailURL string `json:"thumbnail_url"`
-	AuthorName   string `json:"author_name"`
-	AuthorURL    string `json:"author_url"`
-
-	// Version 指向上游响应里能区分「同一资源的不同内容」的那个字段，
-	// 成为 parse_cache 的第三段键（见 parser.ParseResult.Version）。
-	//
-	// 刻意取通用名而不是 edit_date：这张 map 所有 provider 共用，而各家对
-	// 「内容变了」的表达互不相同 —— TG 是编辑时间戳，别处可能是 revision 号、
-	// updated_at 或 ETag。此处只要求它「内容变则变」，不要求它是时间。
-	//
-	// 留空 = 该 endpoint 无法提供版本信息，缓存退化为每资源一行 + TTL。
-	// 接入一个新 endpoint 时，这一项能不能填上应当在 api_samples 里用一条真实
-	// 响应先验过 —— 对内容可变的 provider，它是准入条件而不是可选优化。
-	Version string `json:"version"`
+// LedgerEntry 是一笔账户流水。
+type LedgerEntry struct {
+	ID         uuid.UUID  `json:"id"`
+	AccountID  uuid.UUID  `json:"account_id"`
+	EndpointID *uuid.UUID `json:"endpoint_id,omitempty"`
+	Delta      int64      `json:"delta"`  // micros；正=充值，负=调用成本/核减
+	Reason     string     `json:"reason"` // topup / adjust / call
+	Note       string     `json:"note"`
+	ResourceID string     `json:"resource_id,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
-// FetchResult 是供应层对上层暴露的中立结果；由 parser 侧组装成 provider-specific 的 snippet。
-type FetchResult struct {
-	Title        string
-	Description  string
-	ThumbnailURL string
-	AuthorName   string
-	AuthorURL    string
-	Version      string          // 内容版本标记；空串表示该 endpoint 不提供，见 ResponseMap.Version
-	Raw          json.RawMessage // 原始响应体，parser 需要额外字段时可自取
-	EndpointID   uuid.UUID
-	EndpointSlug string
+// AdapterInfo 描述一个已在代码里注册的适配器，供后台建接口时选择。
+type AdapterInfo struct {
+	Slug     string `json:"slug"`
+	Provider string `json:"provider"`
+	Vendor   string `json:"vendor"`
+	Note     string `json:"note"`
+}
+
+// Catalog 是适配器目录。由 parser 实现、在装配时注入 ——
+// 本包据此校验「建的接口有没有对应代码」「挂的账户是不是同一上游」。
+type Catalog interface {
+	Adapter(slug string) (AdapterInfo, bool)
+	Adapters() []AdapterInfo
 }
 
 // ---- 管理后台入参 ----
 
+type CreateAccountInput struct {
+	Vendor   string `json:"vendor" binding:"required"`
+	Slug     string `json:"slug" binding:"required"`
+	Name     string `json:"name" binding:"required"`
+	Currency string `json:"currency"`
+	Note     string `json:"note"`
+}
+
+type UpdateAccountInput struct {
+	Name *string `json:"name"`
+	Note *string `json:"note"`
+}
+
+// TopupInput 录入一笔充值（正数）或手工核减（负数）。
+type TopupInput struct {
+	AmountMicros int64  `json:"amount_micros" binding:"required"`
+	Note         string `json:"note"`
+}
+
 type CreateEndpointInput struct {
-	Provider        string `json:"provider" binding:"required"`
-	Vendor          string `json:"vendor" binding:"required"`
-	Slug            string `json:"slug" binding:"required"`
-	Priority        int    `json:"priority"`
-	Enabled         *bool  `json:"enabled"`
-	UnitPriceMicros int64  `json:"unit_price_micros"`
-	// MarginBP 省略时走库里的 DEFAULT 20000（2.0 倍）。用指针而不是 0 值判定：
-	// 0 是非法值（CHECK margin_bp > 0），把它当「未填」会让一次真正的误填静默变成默认值。
-	MarginBP *int32          `json:"margin_bp"`
-	Currency string          `json:"currency"`
-	Config   json.RawMessage `json:"config"`
+	Slug            string          `json:"slug" binding:"required"` // 必须是已注册的适配器
+	AccountID       uuid.UUID       `json:"account_id" binding:"required"`
+	Priority        int             `json:"priority"`
+	Enabled         *bool           `json:"enabled"`
+	UnitPriceMicros int64           `json:"unit_price_micros"`
+	Config          json.RawMessage `json:"config"`
 }
 
 type UpdateEndpointInput struct {
-	Vendor          *string          `json:"vendor"`
 	Priority        *int             `json:"priority"`
 	Enabled         *bool            `json:"enabled"`
 	UnitPriceMicros *int64           `json:"unit_price_micros"`
-	MarginBP        *int32           `json:"margin_bp"`
-	Currency        *string          `json:"currency"`
 	Config          *json.RawMessage `json:"config"`
-}
-
-type TopupInput struct {
-	AmountMicros int64  `json:"amount_micros" binding:"required"` // 正=充值/额度录入，负=手工核减
-	Reason       string `json:"reason"`
 }
 
 type CreateSampleInput struct {

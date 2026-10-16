@@ -111,20 +111,23 @@ type Config struct {
 	// 设 0 关闭这一层。
 	ExportCooldown time.Duration `env:"SQUYRRL_EXPORT_COOLDOWN" envDefault:"1h"`
 
-	// 走**内置免费 provider**（YouTube oEmbed / Gist / Reddit / GenericOG）时，
-	// 每次 URI 解析请求扣减的 credits（命中/未命中一致，见 parser.Service.Parse）；<=0 = 不扣。
+	// ParseCost 是**只有内置免费来源**的平台（Gist / Reddit）的默认解析售价；<=0 = 解析整体不扣费。
 	// 使用默认值，故不在 .env.prod 模板出现。
 	//
-	// 接了付费第三方 endpoint 的 provider **不走这个值** —— 它们的价格由
-	// extapi.Quote 从上游单价 × 加价倍率算出（pricing.CreditCost）。
-	// 2026-09-12 之前这个常量是**唯一**的定价来源，与上游成本毫无关系，
-	// 正是 migration 000015 注释里写的那种「接一个比常量贵的供应商就一直亏」。
+	// 售价按平台固定（ADR-080）：后台在 parse_prices 里设了值就用那个值；没设时，
+	// 接了付费上游的平台取「已启用接口的最高单价 × 2」（pricing.CreditCost），
+	// 只有免费来源的平台取这里的值。不管实际由哪个来源产出、是否命中缓存，同一平台
+	// 收同一个价 —— 售价要公示，不能随上游变，也不能让人从价格反推出接的是谁。
 	//
-	// 默认值从 2 提到 10，与 pricing.MinCreditCost 同值（envDefault 只能写字面量，
-	// 靠 config_test 里的断言防漂移）。2 从来就低于设计值：那条下限存在的理由是
-	// 内置 provider 虽然上游免费，却仍要吃 CPU、走出网，并承担被目标站判成爬虫的
-	// 风险（ADR-048 就是因此把服务端归档整个删掉的）。
+	// 默认值与 pricing.MinCreditCost 同值（envDefault 只能写字面量，靠 config_test
+	// 里的断言防漂移）。免费来源上游不要钱，但仍要吃 CPU、走出网，并承担被目标站
+	// 判成爬虫的风险（ADR-048 就是因此把服务端归档整个删掉的），所以不是 0。
 	ParseCost int64 `env:"SQUYRRL_PARSE_COST" envDefault:"10"`
+
+	// 解析上游的 API 密钥（ADR-080）。留空 ⇒ 该上游下的接口调用直接失败并记入解析记录，
+	// 链路继续尝试下一个来源；不阻断启动 —— 一个没配的上游不该让整个 API 起不来。
+	TikHubAPIKey string `env:"SQUYRRL_TIKHUB_API_KEY"`
+	RapidAPIKey  string `env:"SQUYRRL_RAPIDAPI_KEY"`
 
 	// 订阅 webhook 签名密钥（任一为空表示该 provider 不启用）
 	StripeWebhookSecret string `env:"SQUYRRL_STRIPE_WEBHOOK_SECRET"`

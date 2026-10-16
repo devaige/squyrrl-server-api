@@ -1,8 +1,9 @@
 // Package pricing 承载用户可见价格的换算规则。
 //
 // ADR-013 定下的原则是「用户侧售价从上游成本 + 毛利算出，而不是写死」，
-// 这样供应商调价时不需要改客户端。ADR-075 把汇率从 1:1000 改成 1:10000，
-// 并把毛利从一个全局常量下放到每个 endpoint（api_endpoints.margin_bp）。
+// 这样供应商调价时不需要改客户端。ADR-075 把汇率从 1:1000 改成 1:10000。
+// ADR-080 把解析售价收拢为「每个平台一个固定价」：后台可直接设定，
+// 未设定时用 CreditCost(该平台已启用接口的最高单价, DefaultMarginBP) 作为默认值。
 //
 // 这个包只做换算，不碰数据库 —— 便于单测覆盖边界，也让 GET /pricing
 // 未来可以直接复用同一份公式，避免「客户端显示的价」和「实际扣的费」出现两套实现。
@@ -24,13 +25,13 @@ const CreditsPerUSD = 10_000
 // MicrosPerCredit：上游成本以「百万分之一美元」计价，1 credit = $0.0001 = 100 micros。
 const MicrosPerCredit = 1_000_000 / CreditsPerUSD // = 100
 
-// DefaultMarginBP 是 endpoint 未单独配置时的加价倍率：2.0 倍，即 50% 毛利。
-// 与 migration 000015 里 api_endpoints.margin_bp 的 DEFAULT 保持一致。
+// DefaultMarginBP 是平台自动售价的加价倍率：2.0 倍，即 50% 毛利（ADR-080）。
+// 没有在后台设定售价的平台，按「已启用接口的最高单价 × 该倍率」定价。
 const DefaultMarginBP = 20_000
 
 // MinCreditCost 是任何一次解析的最低收费。
 //
-// 内置 provider（YouTube oEmbed、GenericOG）上游成本为零，但它们仍然占用 CPU、
+// 内置免费来源（Gist / Reddit 的公开 JSON）上游成本为零，但它们仍然占用 CPU、
 // 走出网请求，并让服务器承担被目标站判定为爬虫的风险 —— ADR-048 就是因为
 // 服务端代抓网页被判爬虫才把整个归档功能删掉的。定价为零等于鼓励刷。
 const MinCreditCost = 10

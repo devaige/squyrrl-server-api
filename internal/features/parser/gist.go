@@ -16,7 +16,7 @@ import (
 //   - https://gist.github.com/<user>/<gist_id>   — 现行主流；ID 是任意 alphanumeric
 //
 // 单段 `gist.github.com/<id>` 形式不在此 provider 范围内：那种 URL
-// 既可能是 gist 又可能是 user profile，让 GenericOGProvider 兜底。
+// 既可能是 gist 又可能是 user profile，不认领，交给客户端当普通链接暂存。
 type GistProvider struct {
 	client *http.Client
 }
@@ -32,7 +32,10 @@ func (p *GistProvider) SnippetType() string { return "special" }
 
 func (p *GistProvider) MatchPatterns() []string { return []string{gistIDPattern.String()} }
 
-var _ ManifestProvider = (*GistProvider)(nil)
+var (
+	_ ManifestProvider = (*GistProvider)(nil)
+	_ BuiltinParser    = (*GistProvider)(nil)
+)
 
 func (p *GistProvider) Match(uri string) (string, bool) {
 	m := gistIDPattern.FindStringSubmatch(uri)

@@ -32,7 +32,10 @@ func (p *RedditProvider) SnippetType() string { return "special" }
 
 func (p *RedditProvider) MatchPatterns() []string { return []string{redditIDPattern.String()} }
 
-var _ ManifestProvider = (*RedditProvider)(nil)
+var (
+	_ ManifestProvider = (*RedditProvider)(nil)
+	_ BuiltinParser    = (*RedditProvider)(nil)
+)
 
 func (p *RedditProvider) Match(uri string) (string, bool) {
 	m := redditIDPattern.FindStringSubmatch(uri)

@@ -9,34 +9,46 @@ import (
 
 var (
 	ErrNoParser = errors.New("no parser available for this URI")
+
+	// ErrParseFailed 是回给用户的唯一失败原因。具体哪个来源、为什么失败只进解析记录：
+	// 报错原文里有上游的名字，而用户不该从任何地方看出解析是谁做的（ADR-080）。
+	ErrParseFailed = errors.New("parse failed")
 )
 
-// Parser 是 URI 解析适配器接口。每种来源（YouTube / Tweet / Gist / ...）实现一份。
+// Parser 是一个**平台**：它认得哪些链接归自己、资源 ID 是什么、产物是什么类型。
 //
-// Phase 1.5 已实现：YouTube oEmbed
-// Phase 2 计划：Twitter/X、GitHub Gist、通用 Open Graph 兜底
+// 怎么拿到内容不在这里 —— 来源有两类，按价格从低到高排成兜底链（ADR-080）：
+//   - 内置免费来源：平台自己实现 BuiltinParser（Gist / Reddit 的公开 JSON）；
+//   - 付费上游接口：api_endpoints 里的行，每行对应一个 Go 适配器（Adapter）。
+//
+// oEmbed / Open Graph 不算解析，是客户端的免费「暂存/补全」能力，不进这条链。
 type Parser interface {
-	// Provider 返回唯一标识，例如 "youtube"。同时作为 parse_cache 的 provider 列。
+	// Provider 返回唯一标识，例如 "youtube"。同时作为 parse_cache 的 provider 列、
+	// manifest 的 id、解析售价（parse_prices）的键。
 	Provider() string
 
-	// SnippetType 决定本 provider 解析得到的碎片类型：
+	// SnippetType 决定本平台解析得到的碎片类型：
 	//   "special" — 推文 / Gist / YouTube 等专用类型，subtype 用 Provider()
-	//   "url"     — 通用 OG 兜底解析得到的链接碎片，无 subtype
+	//   "url"     — 通用链接碎片，无 subtype
 	SnippetType() string
 
-	// Match 判断 URI 是否归属本 parser；若是，返回该资源在 provider 命名空间内的稳定 ID。
+	// Match 判断 URI 是否归属本平台；若是，返回该资源在平台命名空间内的稳定 ID。
 	// 实现应保证 ID 与该资源生命周期绑定（推文的 numeric ID、视频的 video ID 等）。
 	Match(uri string) (resourceID string, ok bool)
+}
 
-	// Parse 调用上游服务并返回结构化数据；不应自行处理缓存（由 Service 负责）。
+// BuiltinParser 是可选接口：平台自带一个**免费**来源，排在兜底链最前面。
+// 不应自行处理缓存与计费（由 Service 负责）。
+type BuiltinParser interface {
 	Parse(ctx context.Context, uri, resourceID string) (*ParseResult, error)
 }
 
 // ManifestProvider 是可选接口：实现它的 parser 会把匹配正则导出到 GET /uris/manifest，
 // 供客户端**本地**判断「这个 URI 服务端能不能解析」，无需每次联网询问。
 //
-// 关键：通用 OG 兜底（GenericOGProvider）**故意不实现**它——它匹配任意 http(s) URL，
-// 那是「暂存/enrich」路径而非「支持解析」。清单只声明专用 provider 的能力。
+// 清单只列**此刻真有来源**的平台：有内置免费来源，或至少一个启用且有适配器的付费接口
+// （见 Service.Manifest）。一个平台的付费接口全部下线后，客户端会把它的链接当普通链接
+// 「暂存」，而不是给出一个注定失败的「解析」按钮。
 //
 // 单一真源：MatchPatterns 直接从各 provider 已有的正则常量 .String() 派生，
 // 与 Match 用的是同一份正则，服务端改正则→导出自动跟着变，客户端判断永不与服务端脱节。
@@ -83,9 +95,9 @@ type ParseResult struct {
 
 	// Version 是上游给出的**内容版本标记**，作为 parse_cache 的第三段键。
 	//
-	// 只有在 provider 能真正区分「同一资源的不同内容」时才填（TG 的 edit_date、
-	// 带 revision 的 API、兜底可用内容哈希）。留空表示「本 provider 无版本信息」，
-	// 缓存退化为每资源一行 —— 内置的 YouTube/Gist/Reddit/GenericOG 全在这一档。
+	// 只有在来源能真正区分「同一资源的不同内容」时才填（TG 的 edit_date、
+	// 带 revision 的 API、兜底可用内容哈希）。留空表示「无版本信息」，
+	// 缓存退化为每资源一行 —— 内置的 Gist/Reddit 都在这一档。
 	//
 	// **不要用 "0" 之类的哨兵冒充「未编辑」**：那会让「上游说了它没被编辑」和
 	// 「上游根本没告诉我」挤进同一个值，于是一份新鲜度未知的内容会被当成已确认
@@ -135,11 +147,11 @@ type ParseResponse struct {
 	// 用户花了 credits 盯着一个看不出区别的界面猜。
 	Version string `json:"version,omitempty"`
 
-	// CreditsCharged 是本次实际扣掉的代币数。
+	// CreditsCharged 是本次实际扣掉的代币数，即该平台的固定售价（ADR-080）。
 	//
-	// 必须回传，因为价格自 2026-09-12 起随 provider 接的上游而变，客户端无从预知：
-	// 没有这个字段，钱包余额会在用户眼里「自己少了一点」，而唯一的解释路径是
-	// 去翻流水。0 表示未计费（计费关闭，或走的是余额不足以外的免单路径）。
+	// 售价按平台而异、可在后台调整，客户端无从预知：没有这个字段，钱包余额会在
+	// 用户眼里「自己少了一点」，而唯一的解释路径是去翻流水。0 表示未计费（计费关闭）。
+	// 解析失败不扣费，也就不会有响应体。
 	CreditsCharged int64 `json:"credits_charged"`
 }
 
@@ -152,7 +164,7 @@ type ParseInput struct {
 	// 内容的某一版 —— 猜错时用户会一直看到旧内容，且**没有任何自助手段**。
 	// 这是所有 provider 的通用逃生口，不是某个平台的补丁。
 	//
-	// 计费与普通解析完全一致（扣费发生在缓存查询之前，见 Service.Parse），
+	// 计费与普通解析完全一致（同一平台同一价，命中缓存也一样，见 Service.Parse），
 	// 所以这个参数不影响价格，只影响拿到的是不是新鲜数据。
 	Force bool `json:"force,omitempty"`
 }
