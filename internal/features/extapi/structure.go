@@ -34,6 +34,13 @@ type StructureDiff struct {
 	Added        []string `json:"added,omitempty"`
 }
 
+// diffable 判断一条存档要不要和示例比：只比线上采样里上游正常应答（2xx）的那些。
+// 上游明说失败的应答（TikHub 的 400「本次请求不会被扣费」）是一段错误说明，拿去比会报出
+// 一长串「缺失」，看起来像上游改了结构，其实只是这次没取到。
+func diffable(x Sample) bool {
+	return x.Kind == "live" && x.HTTPStatus >= 200 && x.HTTPStatus < 300
+}
+
 // payloadOf 从存档里取出要比的部分：存档是 {"status", "body"}，TikHub 的业务数据在 body.data，
 // 外壳（request_id、time、cache_url……）每次都一样，比它没有意义。
 func payloadOf(response json.RawMessage) any {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"sort"
@@ -14,7 +15,7 @@ import (
 )
 
 // TikHub 适配器（ADR-080）。第一批：X、TikTok、抖音、小红书、B 站、微博、Instagram、
-// YouTube、快手、公众号文章，只接「取单条作品」的接口。
+// YouTube、快手、公众号文章，只接「取单条作品」的接口；第二批在 tikhub2.go。
 //
 // 每个解码器都按实测响应写（2026-10-16，样本在 testdata/tikhub/），并且：
 //   - 核对返回的作品 ID —— 小红书视频接口拿图文笔记 ID 会返回别人的笔记；
@@ -160,6 +161,7 @@ func TikHubAdapters() AdapterSet {
 		a.Shape = tikhubShapes[slug]
 		set[slug] = a
 	}
+	maps.Copy(set, tikhubBatch2()) // 第二批的适配器自带 Shape
 	return set
 }
 

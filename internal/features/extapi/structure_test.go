@@ -45,3 +45,16 @@ func TestStructureDiff(t *testing.T) {
 		t.Errorf("代码读的字段缺了要报: %+v", d)
 	}
 }
+
+// 只比上游正常应答的线上采样：失败应答是一段错误说明，比出来的「缺失」不是改版。
+func TestDiffableOnlyLiveSuccess(t *testing.T) {
+	for _, c := range []struct {
+		kind   string
+		status int
+		want   bool
+	}{{"live", 200, true}, {"live", 400, false}, {"live", 0, false}, {"sample", 200, false}} {
+		if got := diffable(Sample{Kind: c.kind, HTTPStatus: c.status}); got != c.want {
+			t.Errorf("%s/%d → %v，期望 %v", c.kind, c.status, got, c.want)
+		}
+	}
+}

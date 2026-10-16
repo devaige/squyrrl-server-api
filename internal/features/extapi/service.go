@@ -277,7 +277,7 @@ func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, erro
 		}
 	}
 	for i := range all {
-		if all[i].Kind == "live" {
+		if diffable(all[i]) {
 			all[i].Diff = diffAgainst(all[i].Response, baselines, watched, false)
 		}
 		all[i].Request, all[i].Response = nil, nil
@@ -298,7 +298,7 @@ func (s *Service) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) 
 			watched = s.catalog.WatchedPaths(ep.Slug)
 		}
 	}
-	if x.Kind == "live" {
+	if diffable(*x) {
 		baselines, err := s.repo.SampleResponses(ctx, x.EndpointID)
 		if err != nil {
 			return nil, err

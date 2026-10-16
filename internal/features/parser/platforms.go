@@ -17,6 +17,7 @@ import (
 type platform struct {
 	id        string
 	canonical []*regexp.Regexp       // 第 1 个捕获组是作品 ID
+	prefix    []string               // 可选，与 canonical 一一对应：一个平台有几种 ID 空间时（知乎回答 / 文章 / 想法）给 ID 加类型前缀
 	short     []*regexp.Regexp       // 分享短链，需要先跟跳转
 	normalize func(id string) string // 可选：把链接里的 ID 规整成接口要的形式
 	extract   func(uri string) (string, bool)
@@ -49,13 +50,16 @@ func (p *platform) Match(uri string) (string, bool) {
 	if p.extract != nil {
 		return p.extract(uri)
 	}
-	for _, re := range p.canonical {
+	for i, re := range p.canonical {
 		if m := re.FindStringSubmatch(uri); m != nil {
 			id := m[1]
 			if p.normalize != nil {
 				id = p.normalize(id)
 			}
 			if id != "" {
+				if i < len(p.prefix) {
+					id = p.prefix[i] + id
+				}
 				return id, true
 			}
 		}
@@ -99,6 +103,17 @@ const (
 	PlatformInstagram   = "instagram"
 	PlatformKuaishou    = "kuaishou"
 	PlatformWechatMP    = "wechat_mp"
+
+	// 第二批（2026-10-16）。Reddit 另有内置免费来源（reddit.go），付费接口排在它后面兜底。
+	PlatformReddit         = "reddit"
+	PlatformZhihu          = "zhihu"
+	PlatformThreads        = "threads"
+	PlatformWechatChannels = "wechat_channels"
+	PlatformToutiao        = "toutiao" // 含西瓜视频：西瓜的作品就是头条的 group
+	PlatformLemon8         = "lemon8"
+	PlatformPipixia        = "pipixia"
+	PlatformLinkedIn       = "linkedin"
+	PlatformTelegram       = "telegram" // 公开频道消息；与 Bot 摄取的 telegram_message 碎片无关
 )
 
 // NewUpstreamPlatforms 返回只靠付费上游的平台，按注册顺序。
@@ -161,6 +176,49 @@ func NewUpstreamPlatforms() []Parser {
 		&platform{id: PlatformWechatMP, canonical: res(
 			`(?:^|//)mp\.weixin\.qq\.com/s(?:/[A-Za-z0-9_-]+|\?[^#]*__biz=)`,
 		), extract: wechatArticleID},
+
+		// ---- 第二批 ----
+		// 知乎四种内容各一个接口、ID 各自一套，ID 带类型前缀；回答链接里也有问题 ID，回答排在问题前面
+		&platform{id: PlatformZhihu, canonical: res(
+			`(?:^|[/.])zhihu\.com/(?:question/\d+/)?answer/(\d+)`,
+			`(?:^|//)zhuanlan\.zhihu\.com/p/(\d+)`,
+			`(?:^|[/.])zhihu\.com/pin/(\d+)`,
+			`(?:^|[/.])zhihu\.com/question/(\d+)`,
+		), prefix: []string{"answer/", "p/", "pin/", "question/"}},
+		&platform{id: PlatformThreads, canonical: res(
+			`(?:^|[/.])threads\.(?:net|com)/(?:@[^/?#]+/post|t)/([A-Za-z0-9_-]{5,})`,
+		)},
+		// 视频号分享短链 weixin.qq.com/sph/<id> 跳到 finder-preview 页，两种都认，ID 是同一个
+		&platform{id: PlatformWechatChannels, canonical: res(
+			`(?:^|//)weixin\.qq\.com/sph/([A-Za-z0-9]+)`,
+			`(?:^|//)channels\.weixin\.qq\.com/finder-preview/pages/sph\?(?:[^#]*&)?id=([A-Za-z0-9]+)`,
+		)},
+		// 头条文章 / 视频 / 微头条 + 西瓜视频；接口按链接类型分流（见 toutiaoKind）
+		&platform{id: PlatformToutiao, canonical: res(
+			`(?:^|[/.])toutiao\.com/(?:article|video|group|w|item)/(\d{10,})`,
+			`(?:^|[/.])toutiao\.com/[ai](\d{15,})`,
+			`(?:^|[/.])ixigua\.com/(?:video/)?(\d{15,})`,
+		), short: res(
+			`(?:^|//)m\.toutiao\.com/is/[A-Za-z0-9_-]+`,
+			`(?:^|//)v\.ixigua\.com/[A-Za-z0-9_-]+`,
+		)},
+		&platform{id: PlatformLemon8, canonical: res(
+			`(?:^|[/.])lemon8-app\.com/(?:[a-z]{2}/)?@[^/?#]+/(\d{15,})`,
+		)},
+		&platform{id: PlatformPipixia, canonical: res(
+			`(?:^|//)h5\.pipix\.com/(?:ppx/)?item/(\d+)`,
+		), short: res(
+			`(?:^|//)h5\.pipix\.com/s/[A-Za-z0-9_-]+`,
+		)},
+		// 帖子链接里的数字是 activity / share / ugcPost 三种 URN 之一，各是一套 ID；文章（pulse）只有 slug
+		&platform{id: PlatformLinkedIn, canonical: res(
+			`(?:^|[/.])linkedin\.com/posts/[^/?#]*-activity-(\d+)`,
+			`(?:^|[/.])linkedin\.com/posts/[^/?#]*-share-(\d+)`,
+			`(?:^|[/.])linkedin\.com/posts/[^/?#]*-ugcPost-(\d+)`,
+			`(?:^|[/.])linkedin\.com/feed/update/urn:li:activity:(\d+)`,
+			`(?:^|[/.])linkedin\.com/pulse/([A-Za-z0-9_%-]+)`,
+		), prefix: []string{"activity/", "share/", "ugcPost/", "activity/", "pulse/"}},
+		&platform{id: PlatformTelegram, canonical: res(telegramPostPattern), extract: telegramPostID},
 	}
 }
 
@@ -214,6 +272,21 @@ func instagramMediaID(code string) string {
 		n.Mul(n, big.NewInt(64)).Add(n, big.NewInt(int64(i)))
 	}
 	return n.String()
+}
+
+// telegramPostPattern 是公开频道的单条消息：t.me/<频道>/<消息号>，网页预览 t.me/s/<频道>/<消息号> 同理。
+// 频道用户名 5–32 位、字母开头，这也排除了 t.me/c/…（私有频道，只有成员能看）和 joinchat 这类路径。
+const telegramPostPattern = `(?:^|//)(?:www\.)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{4,31})/(\d+)`
+
+var telegramPostRe = regexp.MustCompile(telegramPostPattern)
+
+// telegramPostID 返回「频道/消息号」。频道用户名不分大小写，统一小写，同一条消息只占一个缓存键。
+func telegramPostID(uri string) (string, bool) {
+	m := telegramPostRe.FindStringSubmatch(uri)
+	if m == nil {
+		return "", false
+	}
+	return strings.ToLower(m[1]) + "/" + m[2], true
 }
 
 // wechatArticleID 取公众号文章的稳定 ID：短链形式 /s/<token> 用 token，

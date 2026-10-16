@@ -102,52 +102,72 @@ func TestTikHubAdaptersDecodeRealSamples(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.slug, func(t *testing.T) {
 			res, p := decodeWith(t, c.slug, strings.TrimPrefix(c.slug, "tikhub_"), c.target)
-			if !usable(res) {
-				t.Fatal("没有标题也没有正文")
-			}
-			if p.Kind != c.kind {
-				t.Errorf("kind=%s，期望 %s", p.Kind, c.kind)
-			}
-			if !strings.HasPrefix(p.URL, c.urlPrefix) {
-				t.Errorf("url=%s，期望以 %s 开头", p.URL, c.urlPrefix)
-			}
-			if p.Author == nil || p.Author.Name == "" {
-				t.Errorf("没有作者名: %+v", p.Author)
-			}
-			var src map[string]any
-			_ = json.Unmarshal(res.SourceData, &src)
-			if src["author_name"] == nil || src["provider"] == nil {
-				t.Errorf("source_data 缺作者或平台: %v", src)
-			}
-			var video, images int
-			for _, a := range res.Assets {
-				if !strings.HasPrefix(a.URL, "https://") {
-					t.Errorf("文件地址不是 https: %s", a.URL)
-				}
-				switch a.Role {
-				case "media":
-					video++
-				case "image":
-					images++
-				}
-			}
-			if c.wantVideo != (video == 1) {
-				t.Errorf("视频文件数 %d，期望有视频=%v", video, c.wantVideo)
-			}
-			if images < c.minImages {
-				t.Errorf("图片 %d 张，期望至少 %d", images, c.minImages)
-			}
-			if len(res.Assets) == 0 {
-				t.Error("一个可下载文件都没有")
-			}
-			// 产物里不能有上游的痕迹
-			blob := strings.ToLower(string(res.Payload) + string(res.SourceData))
-			for _, leak := range []string{"tikhub", "request_id", "cache_url"} {
-				if strings.Contains(blob, leak) {
-					t.Errorf("产物里出现了上游痕迹 %q", leak)
-				}
-			}
+			checkSample(t, res, p, sampleWant{kind: c.kind, urlPrefix: c.urlPrefix, video: c.wantVideo, minImages: c.minImages})
 		})
+	}
+}
+
+type sampleWant struct {
+	kind, urlPrefix string
+	video           bool // 期望有可下载的视频文件
+	minImages       int
+	noAuthor        bool // 上游不给作者（知乎问题）
+	noAssets        bool // 本来就没有可下载的文件（纯文字）
+}
+
+// checkSample 是每个适配器解码真实样本后都要满足的：拿到可用内容、作者、规整后的链接、
+// 期望的文件，并且产物里没有上游的痕迹。
+func checkSample(t *testing.T, res *ParseResult, p decodedPost, w sampleWant) {
+	t.Helper()
+	if !usable(res) {
+		t.Fatal("没有标题也没有正文")
+	}
+	if p.Kind != w.kind {
+		t.Errorf("kind=%s，期望 %s", p.Kind, w.kind)
+	}
+	if !strings.HasPrefix(p.URL, w.urlPrefix) {
+		t.Errorf("url=%s，期望以 %s 开头", p.URL, w.urlPrefix)
+	}
+	var src map[string]any
+	_ = json.Unmarshal(res.SourceData, &src)
+	if !w.noAuthor {
+		if p.Author == nil || p.Author.Name == "" {
+			t.Errorf("没有作者名: %+v", p.Author)
+		}
+		if src["author_name"] == nil {
+			t.Errorf("source_data 缺作者: %v", src)
+		}
+	}
+	if src["provider"] == nil {
+		t.Errorf("source_data 缺平台: %v", src)
+	}
+	var video, images int
+	for _, a := range res.Assets {
+		if !strings.HasPrefix(a.URL, "https://") {
+			t.Errorf("文件地址不是 https: %s", a.URL)
+		}
+		switch a.Role {
+		case "media":
+			video++
+		case "image":
+			images++
+		}
+	}
+	if w.video != (video == 1) {
+		t.Errorf("视频文件数 %d，期望有视频=%v", video, w.video)
+	}
+	if images < w.minImages {
+		t.Errorf("图片 %d 张，期望至少 %d", images, w.minImages)
+	}
+	if len(res.Assets) == 0 && !w.noAssets {
+		t.Error("一个可下载文件都没有")
+	}
+	// 产物里不能有上游的痕迹
+	blob := strings.ToLower(string(res.Payload) + string(res.SourceData))
+	for _, leak := range []string{"tikhub", "request_id", "cache_url"} {
+		if strings.Contains(blob, leak) {
+			t.Errorf("产物里出现了上游痕迹 %q", leak)
+		}
 	}
 }
 
@@ -305,7 +325,7 @@ func TestAdapterAccept(t *testing.T) {
 
 // 所有适配器的平台都已注册，并且每个都有实测样本撑着。
 func TestTikHubAdaptersAreRegisteredAndSampled(t *testing.T) {
-	platforms := map[string]bool{PlatformYouTube: true}
+	platforms := map[string]bool{PlatformYouTube: true, PlatformReddit: true} // 这两个平台不在 NewUpstreamPlatforms 里
 	for _, p := range NewUpstreamPlatforms() {
 		platforms[p.Provider()] = true
 	}
@@ -479,6 +499,7 @@ func TestTikHubSeedMatchesAdapters(t *testing.T) {
 
 	reg := NewRegistry()
 	reg.Register(NewYouTubeProvider())
+	reg.Register(NewRedditProvider())
 	for _, p := range NewUpstreamPlatforms() {
 		reg.Register(p)
 	}
@@ -489,11 +510,19 @@ func TestTikHubSeedMatchesAdapters(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]int64{PlatformXiaohongshu: 200, PlatformWechatMP: 200, PlatformInstagram: 40, PlatformKuaishou: 20,
-		PlatformTwitter: 20, PlatformTikTok: 20, PlatformDouyin: 20, PlatformBilibili: 20, PlatformWeibo: 20, PlatformYouTube: 20}
+		PlatformTwitter: 20, PlatformTikTok: 20, PlatformDouyin: 20, PlatformBilibili: 20, PlatformWeibo: 20, PlatformYouTube: 20,
+		// 第二批：视频号默认不启用，没有付费接口时用默认价
+		PlatformZhihu: 20, PlatformThreads: 40, PlatformReddit: 20, PlatformWechatChannels: 10, PlatformToutiao: 20,
+		PlatformLemon8: 20, PlatformPipixia: 20, PlatformLinkedIn: 20, PlatformTelegram: 20}
 	for _, p := range prices {
-		if w, ok := want[p.Provider]; ok && p.AutoCredits != w {
+		w, ok := want[p.Provider]
+		delete(want, p.Provider)
+		if ok && p.AutoCredits != w {
 			t.Errorf("%s 自动售价 %d，期望 %d", p.Provider, p.AutoCredits, w)
 		}
+	}
+	for provider := range want {
+		t.Errorf("定价页没有平台 %s", provider)
 	}
 }
 

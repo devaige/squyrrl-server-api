@@ -82,6 +82,10 @@ func (p *post) result(provider string) *ParseResult {
 		}
 	}
 
+	if p.Stats != nil && *p.Stats == (postStats{}) {
+		p.Stats = nil // 上游一个计数都没给（知乎回答），不写空对象
+	}
+
 	res := &ParseResult{Version: p.version}
 	if p.Title != "" {
 		t := p.Title
