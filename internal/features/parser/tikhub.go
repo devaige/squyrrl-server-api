@@ -24,21 +24,6 @@ const tikhubBase = "https://api.tikhub.io/api/v1/"
 
 var errWrongItem = errors.New("上游返回的不是请求的作品")
 
-// incompleteError 表示结果能用、但缺了该有的东西（典型：视频作品拿不到视频文件）。
-// 兜底链会继续试后面的来源；都不行时就用这份 —— 有标题、正文和封面，总好过解析失败。
-type incompleteError struct{ reason string }
-
-func (e *incompleteError) Error() string { return "结果不完整：" + e.reason }
-
-// videoNotDownloadable 是视频本来就拿不到文件的平台，缺视频不算不完整：
-// YouTube 接口不给流；B 站给的是 DASH 音视频分离流，且地址绑定上游的出口 IP，
-// 用户设备带不带 Referer 都是 403（实测 2026-10-16）。
-var videoNotDownloadable = map[string]bool{PlatformYouTube: true, PlatformBilibili: true}
-
-// maxVideoAssetBytes 与客户端 parse_assembler 的 _kMaxAssetBytes 一致：超过的文件客户端不下载，
-// 所以有多档码率时挑放得下的最高一档，而不是最高的那档。
-const maxVideoAssetBytes = 25 << 20
-
 func tikhubGet(path string, query map[string]string) extapi.Request {
 	return extapi.Request{URL: tikhubBase + path, Query: query}
 }
@@ -56,11 +41,7 @@ func tikhub(provider, note string, req func(Target) extapi.Request,
 			if err != nil {
 				return nil, err
 			}
-			res := p.result(provider)
-			if p.Kind == "video" && (p.Video == nil || p.Video.URL == "") && !videoNotDownloadable[provider] {
-				return res, &incompleteError{"视频作品没有视频文件"}
-			}
-			return res, nil
+			return p.result(provider), nil
 		},
 	}
 }
@@ -71,7 +52,7 @@ func byID(path, param string) func(Target) extapi.Request {
 
 // TikHubAdapters 返回全部 TikHub 适配器，按 slug 索引。slug 即后台建接口时选的那一项。
 func TikHubAdapters() AdapterSet {
-	return AdapterSet{
+	set := AdapterSet{
 		// ---- X ----
 		"tikhub_twitter_web_fetch_tweet_detail": tikhub(PlatformTwitter, "单条推文",
 			byID("twitter/web/fetch_tweet_detail", "tweet_id"), decodeTweet),
@@ -100,15 +81,14 @@ func TikHubAdapters() AdapterSet {
 		"tikhub_douyin_web_fetch_one_video_v2": tikhub(PlatformDouyin, "单个作品（网页 V2）",
 			byID("douyin/web/fetch_one_video_v2", "aweme_id"), decodeAwemeDouyin),
 
-		// ---- 小红书：图文接口在前（priority 100）、视频接口在后（110），按链接里的 type 分流：
-		//   type=normal → 只走图文；type=video → 只走视频；
-		//   没有 type（网页端复制的链接）→ 先图文，是视频笔记时图文接口只有封面，记为不完整，
-		//   接着走视频接口拿视频文件，视频接口也失败就用图文那份兜底。
-		// 视频接口拿图文笔记 ID 会返回别人的视频笔记，所以 type=normal 时绝不交给它。 ----
-		"tikhub_xiaohongshu_app_v2_get_image_note_detail": withAccept(tikhub(PlatformXiaohongshu, "图文笔记（视频笔记只有封面）",
-			byID("xiaohongshu/app_v2/get_image_note_detail", "note_id"), decodeXHSImage), xhsMaybeImage),
+		// ---- 小红书：视频接口在前（priority 100）、图文接口在后（110），按链接里的 type 分流：
+		//   type=video → 视频接口；type=normal → 只走图文（视频接口拿图文笔记 ID 会返回别人的视频笔记）；
+		//   没有 type（网页端复制的链接）→ 先试视频接口，是图文笔记时它返回的不是这条，再走图文接口 ——
+		//   最多两次调用，所以这种链接按两倍计费（见 platforms.go 的 priceFactor）。 ----
 		"tikhub_xiaohongshu_app_v2_get_video_note_detail": withAccept(tikhub(PlatformXiaohongshu, "视频笔记（链接标明是图文的不走）",
 			byID("xiaohongshu/app_v2/get_video_note_detail", "note_id"), decodeXHSVideoFeed), xhsMaybeVideo),
+		"tikhub_xiaohongshu_app_v2_get_image_note_detail": tikhub(PlatformXiaohongshu, "图文笔记（视频笔记只有封面）",
+			byID("xiaohongshu/app_v2/get_image_note_detail", "note_id"), decodeXHSImage),
 
 		// ---- B 站：不带视频流，只有封面 ----
 		"tikhub_bilibili_web_fetch_one_video": withAccept(tikhub(PlatformBilibili, "单个视频（网页，只认 BV 号）",
@@ -176,6 +156,44 @@ func TikHubAdapters() AdapterSet {
 				return extapi.Request{Method: "POST", URL: tikhubBase + "wechat_mp/v2/fetch_article_detail", Body: body}
 			}, decodeWechatArticle),
 	}
+	for slug, a := range set {
+		a.Shape = tikhubShapes[slug]
+		set[slug] = a
+	}
+	return set
+}
+
+// tikhubShapes 是各接口解码用的外壳类型，结构比对据此只看代码读取的字段。
+var tikhubShapes = map[string]any{
+	"tikhub_twitter_web_fetch_tweet_detail":           tweet{},
+	"tikhub_tiktok_app_v3_fetch_one_video":            awemeEnvelope{},
+	"tikhub_tiktok_app_v3_fetch_one_video_v2":         awemeEnvelope{},
+	"tikhub_tiktok_app_v3_fetch_one_video_v3":         awemeEnvelope{},
+	"tikhub_tiktok_web_fetch_post_detail":             tiktokWebEnvelope{},
+	"tikhub_tiktok_web_fetch_post_detail_v2":          tiktokWebEnvelope{},
+	"tikhub_douyin_app_v3_fetch_one_video":            awemeEnvelope{},
+	"tikhub_douyin_app_v3_fetch_one_video_v2":         awemeEnvelope{},
+	"tikhub_douyin_app_v3_fetch_one_video_v3":         awemeEnvelope{},
+	"tikhub_douyin_web_fetch_one_video":               awemeEnvelope{},
+	"tikhub_douyin_web_fetch_one_video_v2":            awemeEnvelope{},
+	"tikhub_xiaohongshu_app_v2_get_video_note_detail": xhsVideoEnvelope{},
+	"tikhub_xiaohongshu_app_v2_get_image_note_detail": xhsImageEnvelope{},
+	"tikhub_bilibili_web_fetch_one_video":             biliEnvelope{},
+	"tikhub_bilibili_app_fetch_one_video":             biliEnvelope{},
+	"tikhub_weibo_web_v2_fetch_post_detail":           weiboStatus{},
+	"tikhub_weibo_app_fetch_status_detail":            weiboAppEnvelope{},
+	"tikhub_instagram_v1_fetch_post_by_url":           igGraph{},
+	"tikhub_instagram_v1_fetch_post_by_id":            igGraph{},
+	"tikhub_instagram_v2_fetch_post_info":             igV2Envelope{},
+	"tikhub_instagram_v3_get_post_info":               igV3Envelope{},
+	"tikhub_instagram_v3_get_post_info_by_code":       igV3Envelope{},
+	"tikhub_youtube_web_v2_get_video_info":            ytVideo{},
+	"tikhub_youtube_web_v2_get_video_info_v2":         ytVideo{},
+	"tikhub_kuaishou_app_fetch_one_video_by_url":      ksAppEnvelope{},
+	"tikhub_kuaishou_web_fetch_one_video":             []ksWebPhoto{}, // 网页 V1 直接返回数组
+	"tikhub_kuaishou_web_fetch_one_video_by_url":      ksWebEnvelope{},
+	"tikhub_kuaishou_web_fetch_one_video_v2":          ksWebEnvelope{},
+	"tikhub_wechat_mp_v2_fetch_article_detail":        wechatEnvelope{},
 }
 
 func withAccept(a Adapter, accept func(Target) bool) Adapter {
@@ -183,7 +201,6 @@ func withAccept(a Adapter, accept func(Target) bool) Adapter {
 	return a
 }
 
-func xhsMaybeImage(t Target) bool { return queryParam(t.Resolved, "type") != "video" }
 func xhsMaybeVideo(t Target) bool { return queryParam(t.Resolved, "type") != "normal" }
 func isBV(t Target) bool          { return strings.HasPrefix(t.ResourceID, "BV") }
 
@@ -223,36 +240,35 @@ type tweetMedia struct {
 
 var tweetVariantSize = regexp.MustCompile(`/(\d+)x(\d+)/`)
 
-// pickVariant 在多档码率的 mp4 里挑放得进客户端附件上限的最高一档（按码率 × 时长估算），
-// 一档都放不下就取最低的；动图只有一档、码率为 0，直接用。m3u8 是流媒体清单，不要。
+// pickVariant 取码率最高的 mp4（m3u8 是流媒体清单，不要；动图只有一档、码率为 0）。
+//
+// 始终给最高档（用户决定 2026-10-16）：文件由客户端直接从 CDN 下载再上传，不经我方服务器，
+// 对用户而言要的就是最清晰的那一份。
 func (m tweetMedia) pickVariant() (url string, w, h int) {
-	type v struct {
-		bitrate int64
-		url     string
-	}
-	var mp4 []v
+	var best int64 = -1
 	for _, x := range m.Variants {
-		if x.ContentType == "video/mp4" && x.URL != "" {
-			mp4 = append(mp4, v{x.Bitrate, x.URL})
+		if x.ContentType == "video/mp4" && x.URL != "" && x.Bitrate > best {
+			best, url = x.Bitrate, x.URL
 		}
 	}
-	if len(mp4) == 0 {
+	if url == "" {
 		return "", 0, 0
 	}
-	sort.Slice(mp4, func(i, j int) bool { return mp4[i].bitrate > mp4[j].bitrate })
-	chosen := mp4[len(mp4)-1].url
-	for _, x := range mp4 {
-		if x.bitrate == 0 || m.Duration == 0 || x.bitrate*m.Duration/8000 <= maxVideoAssetBytes {
-			chosen = x.url
-			break
-		}
-	}
 	w, h = m.OriginalInfo.Width, m.OriginalInfo.Height
-	if sz := tweetVariantSize.FindStringSubmatch(chosen); sz != nil {
+	if sz := tweetVariantSize.FindStringSubmatch(url); sz != nil {
 		w, _ = strconv.Atoi(sz[1])
 		h, _ = strconv.Atoi(sz[2])
 	}
-	return chosen, w, h
+	return url, w, h
+}
+
+// tweetOrig 把 pbs.twimg.com 的图片换成原图：默认地址是压缩过的中等尺寸，
+// 加 name=orig 取原始分辨率（图片与视频封面都适用，实测 2026-10-16）。
+func tweetOrig(u string) string {
+	if !strings.HasPrefix(u, "https://pbs.twimg.com/") || strings.Contains(u, "?") {
+		return u
+	}
+	return u + "?name=orig"
 }
 
 func decodeTweet(data []byte, t Target) (*post, error) {
@@ -275,7 +291,7 @@ func decodeTweet(data []byte, t Target) (*post, error) {
 	}
 	for _, m := range tw.Media["photo"] {
 		if m.MediaURLHTTPS != "" {
-			p.Images = append(p.Images, postImage{URL: m.MediaURLHTTPS})
+			p.Images = append(p.Images, postImage{URL: tweetOrig(m.MediaURLHTTPS), Width: m.OriginalInfo.Width, Height: m.OriginalInfo.Height})
 		}
 	}
 	// 视频与动图都是 mp4（media.video[].variants，实测 2026-10-16）。一条推文最多带 4 个媒体，
@@ -284,9 +300,9 @@ func decodeTweet(data []byte, t Target) (*post, error) {
 		for _, m := range tw.Media[kind] {
 			if u, w, h := m.pickVariant(); u != "" && p.Video == nil {
 				p.Video = &postVideo{URL: u, DurationMs: m.Duration, Width: w, Height: h}
-				p.Cover = m.MediaURLHTTPS
+				p.Cover = tweetOrig(m.MediaURLHTTPS)
 			} else if m.MediaURLHTTPS != "" {
-				p.Images = append(p.Images, postImage{URL: m.MediaURLHTTPS})
+				p.Images = append(p.Images, postImage{URL: tweetOrig(m.MediaURLHTTPS)})
 			}
 		}
 	}
@@ -315,10 +331,14 @@ type aweme struct {
 	} `json:"author"`
 	Video struct {
 		Cover    urlList `json:"cover"`
-		PlayAddr urlList `json:"play_addr"`
-		Duration int64   `json:"duration"` // 毫秒
-		Width    int     `json:"width"`
-		Height   int     `json:"height"`
+		PlayAddr urlList `json:"play_addr"` // 默认档，常常不是最清晰的（App 给 720p，同一作品 bit_rate 里有 1080p / 4K）
+		BitRate  []struct {
+			BitRate  int64   `json:"bit_rate"`
+			PlayAddr urlList `json:"play_addr"`
+		} `json:"bit_rate"`
+		Duration int64 `json:"duration"` // 毫秒
+		Width    int   `json:"width"`
+		Height   int   `json:"height"`
 	} `json:"video"`
 	Images        []urlList `json:"images"` // 抖音图文
 	ImagePostInfo *struct {
@@ -336,9 +356,7 @@ type aweme struct {
 }
 
 func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
-	var env struct {
-		AwemeDetail *aweme `json:"aweme_detail"`
-	}
+	var env awemeEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, nil, err
 	}
@@ -374,10 +392,33 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		}
 	}
 	if len(p.Images) == 0 {
-		p.Video = &postVideo{URL: firstURL(a.Video.PlayAddr.URLList), DurationMs: a.Video.Duration,
-			Width: a.Video.Width, Height: a.Video.Height}
+		v := &postVideo{URL: firstURL(a.Video.PlayAddr.URLList), DurationMs: a.Video.Duration,
+			Width: a.Video.PlayAddr.Width, Height: a.Video.PlayAddr.Height}
+		if v.Width == 0 {
+			v.Width, v.Height = a.Video.Width, a.Video.Height
+		}
+		// 多档码率里取分辨率最高的，同分辨率取码率高的
+		var bestRate int64
+		for _, b := range a.Video.BitRate {
+			u := firstURL(b.PlayAddr.URLList)
+			if u == "" {
+				continue
+			}
+			if better(b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate, v.Width, v.Height, bestRate) {
+				v.URL, v.Width, v.Height, bestRate = u, b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate
+			}
+		}
+		p.Video = v
 	}
 	return a, p, nil
+}
+
+// better 判断一档清晰度是否胜过当前最佳：像素多的胜，像素一样看码率。
+func better(w, h int, rate int64, bestW, bestH int, bestRate int64) bool {
+	if px, bestPx := w*h, bestW*bestH; px != bestPx {
+		return px > bestPx
+	}
+	return rate > bestRate
 }
 
 func decodeAwemeTikTok(data []byte, t Target) (*post, error) {
@@ -419,11 +460,19 @@ type tiktokWebItem struct {
 		AvatarThumb string     `json:"avatarThumb"`
 	} `json:"author"`
 	Video struct {
-		Cover    string `json:"cover"`
-		PlayAddr string `json:"playAddr"`
-		Duration int64  `json:"duration"` // 秒
-		Width    int    `json:"width"`
-		Height   int    `json:"height"`
+		Cover       string `json:"cover"`
+		PlayAddr    string `json:"playAddr"`
+		Duration    int64  `json:"duration"` // 秒
+		Width       int    `json:"width"`
+		Height      int    `json:"height"`
+		BitrateInfo []struct {
+			Bitrate  int64 `json:"Bitrate"`
+			PlayAddr struct {
+				URLList []string `json:"UrlList"`
+				Width   int      `json:"Width"`
+				Height  int      `json:"Height"`
+			} `json:"PlayAddr"`
+		} `json:"bitrateInfo"`
 	} `json:"video"`
 	ImagePost *struct {
 		Images []struct {
@@ -445,11 +494,7 @@ type tiktokWebItem struct {
 
 func decodeTikTokWeb(withVideo bool) func([]byte, Target) (*post, error) {
 	return func(data []byte, t Target) (*post, error) {
-		var env struct {
-			ItemInfo struct {
-				ItemStruct *tiktokWebItem `json:"itemStruct"`
-			} `json:"itemInfo"`
-		}
+		var env tiktokWebEnvelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			return nil, err
 		}
@@ -480,10 +525,18 @@ func decodeTikTokWeb(withVideo bool) func([]byte, Target) (*post, error) {
 		}
 		if len(p.Images) == 0 {
 			p.Kind = "video"
-			p.Video = &postVideo{DurationMs: it.Video.Duration * 1000, Width: it.Video.Width, Height: it.Video.Height}
+			v := &postVideo{DurationMs: it.Video.Duration * 1000, Width: it.Video.Width, Height: it.Video.Height}
 			if withVideo {
-				p.Video.URL = it.Video.PlayAddr
+				v.URL = it.Video.PlayAddr
+				var bestRate int64
+				for _, b := range it.Video.BitrateInfo {
+					if u := firstURL(b.PlayAddr.URLList); u != "" &&
+						better(b.PlayAddr.Width, b.PlayAddr.Height, b.Bitrate, v.Width, v.Height, bestRate) {
+						v.URL, v.Width, v.Height, bestRate = u, b.PlayAddr.Width, b.PlayAddr.Height, b.Bitrate
+					}
+				}
 			}
+			p.Video = v
 		}
 		return p, nil
 	}
@@ -520,21 +573,18 @@ type xhsNote struct {
 				Duration int64 `json:"duration"` // 秒
 			} `json:"video"`
 			Stream map[string][]struct {
-				MasterURL string `json:"master_url"`
-				Width     int    `json:"width"`
-				Height    int    `json:"height"`
-				Duration  int64  `json:"duration"` // 毫秒
+				MasterURL  string `json:"master_url"`
+				Width      int    `json:"width"`
+				Height     int    `json:"height"`
+				AvgBitrate int64  `json:"avg_bitrate"`
+				Duration   int64  `json:"duration"` // 毫秒
 			} `json:"stream"`
 		} `json:"media"`
 	} `json:"video_info_v2"`
 }
 
 func decodeXHSImage(data []byte, t Target) (*post, error) {
-	var env struct {
-		Data []struct {
-			NoteList []xhsNote `json:"note_list"`
-		} `json:"data"`
-	}
+	var env xhsImageEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -550,9 +600,7 @@ func decodeXHSImage(data []byte, t Target) (*post, error) {
 
 // decodeXHSVideoFeed：视频接口返回的是一串笔记（请求的那条 + 推荐），必须按 ID 找。
 func decodeXHSVideoFeed(data []byte, t Target) (*post, error) {
-	var env struct {
-		Data []xhsNote `json:"data"`
-	}
+	var env xhsVideoEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -602,14 +650,16 @@ func xhsPost(n xhsNote, t Target) (*post, error) {
 		p.Video = &postVideo{}
 		if v := n.VideoInfoV2; v != nil {
 			p.Video.DurationMs = v.Media.Video.Duration * 1000
-			// h264 兼容性最好，没有再退到 h265
-			for _, codec := range []string{"h264", "h265"} {
-				if s, ok := first(v.Media.Stream[codec]); ok && s.MasterURL != "" {
-					p.Video.URL, p.Video.Width, p.Video.Height = httpsURL(s.MasterURL), s.Width, s.Height
-					if s.Duration > 0 {
-						p.Video.DurationMs = s.Duration
+			// 所有编码（h264 / h265 / av1……）里取分辨率最高的一路：同一笔记 h265 有 1080p 而 h264 只有 720p（实测）
+			var bestRate int64
+			for _, streams := range v.Media.Stream {
+				for _, st := range streams {
+					if st.MasterURL != "" && better(st.Width, st.Height, st.AvgBitrate, p.Video.Width, p.Video.Height, bestRate) {
+						p.Video.URL, p.Video.Width, p.Video.Height, bestRate = httpsURL(st.MasterURL), st.Width, st.Height, st.AvgBitrate
+						if st.Duration > 0 {
+							p.Video.DurationMs = st.Duration
+						}
 					}
-					break
 				}
 			}
 		}
@@ -648,11 +698,7 @@ type biliVideo struct {
 }
 
 func decodeBilibili(data []byte, t Target) (*post, error) {
-	var env struct {
-		Code    int        `json:"code"`
-		Message string     `json:"message"`
-		Data    *biliVideo `json:"data"`
-	}
+	var env biliEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -711,16 +757,38 @@ func (w *weiboImg) UnmarshalJSON(b []byte) error {
 type weiboMedia struct {
 	PagePic   weiboImg `json:"page_pic"`
 	MediaInfo struct {
-		StreamURLHD string  `json:"stream_url_hd"`
-		StreamURL   string  `json:"stream_url"`
-		MP4HDURL    string  `json:"mp4_hd_url"`
-		MP4SDURL    string  `json:"mp4_sd_url"`
-		Duration    float64 `json:"duration"` // 秒
+		StreamURLHD  string  `json:"stream_url_hd"`
+		StreamURL    string  `json:"stream_url"`
+		MP4720P      string  `json:"mp4_720p_mp4"`
+		MP4HDURL     string  `json:"mp4_hd_url"` // 名为 hd，实为 480p
+		MP4SDURL     string  `json:"mp4_sd_url"`
+		Duration     float64 `json:"duration"` // 秒
+		PlaybackList []struct {
+			PlayInfo struct {
+				Mime    string  `json:"mime"`
+				URL     string  `json:"url"`
+				Width   int     `json:"width"`
+				Height  int     `json:"height"`
+				Bitrate flexInt `json:"bitrate"`
+			} `json:"play_info"`
+		} `json:"playback_list"`
 	} `json:"media_info"`
 }
 
-func (m weiboMedia) videoURL() string {
-	return httpsURL(nonEmpty(m.MediaInfo.MP4HDURL, m.MediaInfo.StreamURLHD, m.MediaInfo.MP4SDURL, m.MediaInfo.StreamURL))
+// video 取最清晰的一档：playback_list 里分辨率最高的 mp4（列表里还混着预览图，按 mime 过滤）；
+// 没有列表时按 720p → hd(480p) → sd 的顺序退。
+func (m weiboMedia) video() (url string, w, h int) {
+	var bestRate int64
+	for _, pb := range m.MediaInfo.PlaybackList {
+		pi := pb.PlayInfo
+		if pi.Mime == "video/mp4" && pi.URL != "" && better(pi.Width, pi.Height, int64(pi.Bitrate), w, h, bestRate) {
+			url, w, h, bestRate = pi.URL, pi.Width, pi.Height, int64(pi.Bitrate)
+		}
+	}
+	if url == "" {
+		url = nonEmpty(m.MediaInfo.MP4720P, m.MediaInfo.MP4HDURL, m.MediaInfo.StreamURLHD, m.MediaInfo.MP4SDURL, m.MediaInfo.StreamURL)
+	}
+	return httpsURL(url), w, h
 }
 
 type weiboStatus struct {
@@ -767,11 +835,7 @@ func decodeWeiboWeb(data []byte, t Target) (*post, error) {
 }
 
 func decodeWeiboApp(data []byte, t Target) (*post, error) {
-	var env struct {
-		DetailInfo struct {
-			Status *weiboStatus `json:"status"`
-		} `json:"detailInfo"`
-	}
+	var env weiboAppEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -816,8 +880,8 @@ func weiboPost(s weiboStatus, t Target) (*post, error) {
 		}
 	}
 	addVideo := func(m weiboMedia) {
-		if p.Video == nil && m.videoURL() != "" {
-			p.Video = &postVideo{URL: m.videoURL(), DurationMs: int64(m.MediaInfo.Duration * 1000)}
+		if u, w, h := m.video(); p.Video == nil && u != "" {
+			p.Video = &postVideo{URL: u, Width: w, Height: h, DurationMs: int64(m.MediaInfo.Duration * 1000)}
 			p.Cover = httpsURL(m.PagePic.URL)
 		}
 	}
@@ -959,7 +1023,7 @@ func (m igMedia) image() igImage {
 }
 
 func (m igMedia) video() string {
-	if v, ok := first(m.VideoVersions); ok && v.URL != "" {
+	if v, ok := first(bestIGImages(m.VideoVersions)); ok && v.URL != "" {
 		return v.URL
 	}
 	return m.VideoURL
@@ -990,9 +1054,7 @@ type igPrivate struct {
 }
 
 func decodeInstagramV2(data []byte, t Target) (*post, error) {
-	var env struct {
-		Data *igPrivate `json:"data"`
-	}
+	var env igV2Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -1003,9 +1065,7 @@ func decodeInstagramV2(data []byte, t Target) (*post, error) {
 }
 
 func decodeInstagramV3(data []byte, t Target) (*post, error) {
-	var env struct {
-		Items []igPrivate `json:"items"`
-	}
+	var env igV3Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -1127,36 +1187,57 @@ type ksURL struct {
 	URL string `json:"url"`
 }
 
+// ksManifest 是快手的多档清晰度清单（App 的 streamManifest / 网页的 manifest），
+// 每一档都是完整的 mp4。main_mv_urls 只是其中默认的一档（实测 720p，清单里有 1080p）。
+type ksManifest struct {
+	AdaptationSet []struct {
+		Representation []struct {
+			URL        string `json:"url"`
+			Width      int    `json:"width"`
+			Height     int    `json:"height"`
+			AvgBitrate int64  `json:"avgBitrate"`
+			Mute       bool   `json:"mute"`   // 静音轨，不要
+			Hidden     bool   `json:"hidden"` // 客户端不展示的档
+		} `json:"representation"`
+	} `json:"adaptationSet"`
+}
+
+// UnmarshalJSON 同时认对象和被转成字符串的 JSON —— 快手不同接口两种都出现过。
+func (m *ksManifest) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var raw string
+		if err := json.Unmarshal(b, &raw); err != nil || raw == "" {
+			return nil
+		}
+		b = []byte(raw)
+	}
+	type plain ksManifest
+	_ = json.Unmarshal(b, (*plain)(m)) // 认不出就当没有清单，退回 main_mv_urls
+	return nil
+}
+
+func (m *ksManifest) best() (url string, w, h int) {
+	if m == nil {
+		return "", 0, 0
+	}
+	var bestRate int64
+	for _, a := range m.AdaptationSet {
+		for _, r := range a.Representation {
+			if r.URL != "" && !r.Mute && !r.Hidden && better(r.Width, r.Height, r.AvgBitrate, w, h, bestRate) {
+				url, w, h, bestRate = r.URL, r.Width, r.Height, r.AvgBitrate
+			}
+		}
+	}
+	return httpsURL(url), w, h
+}
+
 func ksFirst(xs []ksURL) string {
 	u, _ := first(xs)
 	return httpsURL(u.URL)
 }
 
 func decodeKuaishouApp(data []byte, t Target) (*post, error) {
-	var env struct {
-		Result int `json:"result"`
-		Photos []struct {
-			PhotoID    flexString `json:"photo_id"`
-			Caption    string     `json:"caption"`
-			Timestamp  int64      `json:"timestamp"`
-			UserName   string     `json:"user_name"`
-			UserID     flexString `json:"user_id"`
-			HeadURLs   []ksURL    `json:"headurls"`
-			Covers     []ksURL    `json:"cover_thumbnail_urls"`
-			MainMvURLs []ksURL    `json:"main_mv_urls"`
-			Duration   int64      `json:"duration"` // 毫秒
-			LikeCount  flexInt    `json:"like_count"`
-			Comment    flexInt    `json:"comment_count"`
-			ViewCount  flexInt    `json:"view_count"`
-			ShareCount flexInt    `json:"share_count"`
-			Collect    flexInt    `json:"collect_count"`
-			ShareInfo  string     `json:"share_info"` // userId=<eid>&photoId=<eid>
-			ExtParams  struct {
-				W int `json:"w"`
-				H int `json:"h"`
-			} `json:"ext_params"`
-		} `json:"photos"`
-	}
+	var env ksAppEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -1171,28 +1252,32 @@ func decodeKuaishouApp(data []byte, t Target) (*post, error) {
 	p := ksPost(t, ph.Caption, ph.Timestamp, ph.UserName, share.Get("userId"), ksFirst(ph.HeadURLs))
 	p.Cover = ksFirst(ph.Covers)
 	p.Video = &postVideo{URL: ksFirst(ph.MainMvURLs), DurationMs: ph.Duration, Width: ph.ExtParams.W, Height: ph.ExtParams.H}
+	if u, w, h := ph.Manifest.best(); u != "" {
+		p.Video.URL, p.Video.Width, p.Video.Height = u, w, h
+	}
 	p.Stats = &postStats{Likes: i64(int64(ph.LikeCount)), Comments: i64(int64(ph.Comment)), Views: i64(int64(ph.ViewCount)),
 		Shares: i64(int64(ph.ShareCount)), Collects: i64(int64(ph.Collect))}
 	return p, nil
 }
 
 type ksWebPhoto struct {
-	PhotoID      string  `json:"photoId"`
-	Caption      string  `json:"caption"`
-	Timestamp    int64   `json:"timestamp"`
-	UserName     string  `json:"userName"`
-	UserEid      string  `json:"userEid"`
-	HeadURL      string  `json:"headUrl"`
-	CoverURLs    []ksURL `json:"coverUrls"`
-	MainMvURLs   []ksURL `json:"mainMvUrls"`
-	Duration     int64   `json:"duration"` // 毫秒
-	Width        int     `json:"width"`
-	Height       int     `json:"height"`
-	LikeCount    flexInt `json:"likeCount"`
-	CommentCount flexInt `json:"commentCount"`
-	ViewCount    flexInt `json:"viewCount"`
-	ShareCount   flexInt `json:"shareCount"`
-	ShareInfo    string  `json:"share_info"` // userId=<eid>&photoId=<eid>
+	PhotoID      string      `json:"photoId"`
+	Caption      string      `json:"caption"`
+	Timestamp    int64       `json:"timestamp"`
+	UserName     string      `json:"userName"`
+	UserEid      string      `json:"userEid"`
+	HeadURL      string      `json:"headUrl"`
+	CoverURLs    []ksURL     `json:"coverUrls"`
+	MainMvURLs   []ksURL     `json:"mainMvUrls"`
+	Duration     int64       `json:"duration"` // 毫秒
+	Width        int         `json:"width"`
+	Height       int         `json:"height"`
+	LikeCount    flexInt     `json:"likeCount"`
+	CommentCount flexInt     `json:"commentCount"`
+	ViewCount    flexInt     `json:"viewCount"`
+	ShareCount   flexInt     `json:"shareCount"`
+	ShareInfo    string      `json:"share_info"` // userId=<eid>&photoId=<eid>
+	Manifest     *ksManifest `json:"manifest"`
 }
 
 // eid 是快手对外的作品 ID（链接里的那个）；photoId 字段是内部数字 ID（实测）。
@@ -1204,10 +1289,7 @@ func (ph ksWebPhoto) matches(id string) bool {
 // decodeKuaishouWeb 认三种外壳：{photo: {...}}、{photos: [...]}，以及网页 V1 直接给的数组。
 func decodeKuaishouWeb(data []byte, t Target) (*post, error) {
 	var candidates []ksWebPhoto
-	var env struct {
-		Result int         `json:"result"`
-		Photo  *ksWebPhoto `json:"photo"`
-	}
+	var env ksWebEnvelope
 	if strings.HasPrefix(strings.TrimSpace(string(data)), "[") {
 		if err := json.Unmarshal(data, &candidates); err != nil {
 			return nil, err
@@ -1227,6 +1309,9 @@ func decodeKuaishouWeb(data []byte, t Target) (*post, error) {
 		p := ksPost(t, ph.Caption, ph.Timestamp, ph.UserName, ph.UserEid, httpsURL(ph.HeadURL))
 		p.Cover = ksFirst(ph.CoverURLs)
 		p.Video = &postVideo{URL: ksFirst(ph.MainMvURLs), DurationMs: ph.Duration, Width: ph.Width, Height: ph.Height}
+		if u, w, h := ph.Manifest.best(); u != "" {
+			p.Video.URL, p.Video.Width, p.Video.Height = u, w, h
+		}
 		p.Stats = &postStats{Likes: i64(int64(ph.LikeCount)), Comments: i64(int64(ph.CommentCount)),
 			Views: i64(int64(ph.ViewCount)), Shares: i64(int64(ph.ShareCount))}
 		return p, nil
@@ -1252,25 +1337,7 @@ func ksPost(t Target, caption string, ts int64, userName, userEid, avatar string
 // ======================== 公众号文章 ========================
 
 func decodeWechatArticle(data []byte, t Target) (*post, error) {
-	var env struct {
-		Content *struct {
-			Title        string  `json:"title"`
-			Desc         string  `json:"desc"`
-			NickName     string  `json:"nick_name"`
-			Alias        string  `json:"alias"`
-			UserName     string  `json:"user_name"`
-			RoundHeadImg string  `json:"round_head_img"`
-			HDHeadImg    string  `json:"hd_head_img"`
-			CDNURL       string  `json:"cdn_url"`
-			OriCreate    flexInt `json:"ori_create_time"`
-			ContentText  string  `json:"content_text"`
-			Pictures     []struct {
-				CDNURL string     `json:"cdn_url"`
-				Width  flexString `json:"width"`
-				Height flexString `json:"height"`
-			} `json:"picture_page_info_list"`
-		} `json:"content"`
-	}
+	var env wechatEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
@@ -1325,4 +1392,97 @@ func profileURL(prefix, id string) string {
 		return ""
 	}
 	return prefix + id
+}
+
+// ---- 各接口响应的外壳类型：解码用它们，Adapter.Shape 也用它们反射出代码读取的字段 ----
+
+type awemeEnvelope struct {
+	AwemeDetail *aweme `json:"aweme_detail"`
+}
+
+type tiktokWebEnvelope struct {
+	ItemInfo struct {
+		ItemStruct *tiktokWebItem `json:"itemStruct"`
+	} `json:"itemInfo"`
+}
+
+type xhsImageEnvelope struct {
+	Data []struct {
+		NoteList []xhsNote `json:"note_list"`
+	} `json:"data"`
+}
+
+type xhsVideoEnvelope struct {
+	Data []xhsNote `json:"data"`
+}
+
+type biliEnvelope struct {
+	Code    int        `json:"code"`
+	Message string     `json:"message"`
+	Data    *biliVideo `json:"data"`
+}
+
+type weiboAppEnvelope struct {
+	DetailInfo struct {
+		Status *weiboStatus `json:"status"`
+	} `json:"detailInfo"`
+}
+
+type igV2Envelope struct {
+	Data *igPrivate `json:"data"`
+}
+
+type igV3Envelope struct {
+	Items []igPrivate `json:"items"`
+}
+
+type ksAppEnvelope struct {
+	Result int `json:"result"`
+	Photos []struct {
+		PhotoID    flexString  `json:"photo_id"`
+		Caption    string      `json:"caption"`
+		Timestamp  int64       `json:"timestamp"`
+		UserName   string      `json:"user_name"`
+		UserID     flexString  `json:"user_id"`
+		HeadURLs   []ksURL     `json:"headurls"`
+		Covers     []ksURL     `json:"cover_thumbnail_urls"`
+		MainMvURLs []ksURL     `json:"main_mv_urls"`
+		Duration   int64       `json:"duration"` // 毫秒
+		LikeCount  flexInt     `json:"like_count"`
+		Comment    flexInt     `json:"comment_count"`
+		ViewCount  flexInt     `json:"view_count"`
+		ShareCount flexInt     `json:"share_count"`
+		Collect    flexInt     `json:"collect_count"`
+		ShareInfo  string      `json:"share_info"` // userId=<eid>&photoId=<eid>
+		Manifest   *ksManifest `json:"streamManifest"`
+		ExtParams  struct {
+			W int `json:"w"`
+			H int `json:"h"`
+		} `json:"ext_params"`
+	} `json:"photos"`
+}
+
+type ksWebEnvelope struct {
+	Result int         `json:"result"`
+	Photo  *ksWebPhoto `json:"photo"`
+}
+
+type wechatEnvelope struct {
+	Content *struct {
+		Title        string  `json:"title"`
+		Desc         string  `json:"desc"`
+		NickName     string  `json:"nick_name"`
+		Alias        string  `json:"alias"`
+		UserName     string  `json:"user_name"`
+		RoundHeadImg string  `json:"round_head_img"`
+		HDHeadImg    string  `json:"hd_head_img"`
+		CDNURL       string  `json:"cdn_url"`
+		OriCreate    flexInt `json:"ori_create_time"`
+		ContentText  string  `json:"content_text"`
+		Pictures     []struct {
+			CDNURL string     `json:"cdn_url"`
+			Width  flexString `json:"width"`
+			Height flexString `json:"height"`
+		} `json:"picture_page_info_list"`
+	} `json:"content"`
 }

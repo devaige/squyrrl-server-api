@@ -20,7 +20,27 @@ type platform struct {
 	short     []*regexp.Regexp       // 分享短链，需要先跟跳转
 	normalize func(id string) string // 可选：把链接里的 ID 规整成接口要的形式
 	extract   func(uri string) (string, bool)
+
+	// priceFactor 可选：按链接给售价乘一个倍数，priceNote 是后台定价页上的说明。
+	priceFactor func(t Target) int64
+	priceNote   string
 }
+
+// PriceFactorer 是可选接口：某些链接注定要多调上游，售价按倍数收。
+// 倍数由链接本身决定（不看缓存是否命中、实际调了几次），同一条链接永远同价。
+type PriceFactorer interface {
+	PriceFactor(t Target) int64
+	PriceNote() string
+}
+
+func (p *platform) PriceFactor(t Target) int64 {
+	if p.priceFactor == nil {
+		return 1
+	}
+	return max(p.priceFactor(t), 1)
+}
+
+func (p *platform) PriceNote() string { return p.priceNote }
 
 func (p *platform) Provider() string    { return p.id }
 func (p *platform) SnippetType() string { return "special" }
@@ -104,7 +124,18 @@ func NewUpstreamPlatforms() []Parser {
 			`(?:^|[/.])xiaohongshu\.com/(?:explore|discovery/item|user/profile/[0-9a-f]{24})/([0-9a-f]{24})`,
 		), short: res(
 			`(?:^|//)xhslink\.com/[A-Za-z0-9/]+`,
-		)},
+		),
+			// App 分享的链接带 type（normal / video），一次调用就够；网页端复制的没有 type，
+			// 要先试视频接口、不是再走图文接口，最多两次调用 —— 按两倍收，保证这种链接也有毛利
+			// （用户决定 2026-10-16）。
+			priceFactor: func(t Target) int64 {
+				if queryParam(t.Resolved, "type") == "" {
+					return 2
+				}
+				return 1
+			},
+			priceNote: "网页端复制的链接（不带笔记类型）按 2 倍计费",
+		},
 		&platform{id: PlatformBilibili, canonical: res(
 			`(?:^|[/.])bilibili\.com/video/(BV[0-9A-Za-z]{10}|av\d+)`,
 		), short: res(

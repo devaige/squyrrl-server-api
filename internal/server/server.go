@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -44,6 +45,7 @@ type Server struct {
 	subSvc      *subscriptions.Service
 	claimSvc    *claim.Service
 	extapiSvc   *extapi.Service
+	adapters    parser.AdapterSet
 	parseCache  *parser.Cache
 	quotaSvc    *quota.Service
 }
@@ -137,6 +139,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		subSvc:      subSvc,
 		claimSvc:    claimSvc,
 		extapiSvc:   extapiSvc,
+		adapters:    adapters,
 		parseCache:  parseCache,
 		quotaSvc:    quotaSvc,
 	}
@@ -157,6 +160,11 @@ func (s *Server) WalletService() *wallet.Service { return s.walletSvc }
 func (s *Server) ParseCache() *parser.Cache { return s.parseCache }
 
 func (s *Server) ExtapiService() *extapi.Service { return s.extapiSvc }
+
+// SeedParseSamples 给还没有示例的解析接口写入内置示例（接入时核对过的实测响应）。
+func (s *Server) SeedParseSamples(ctx context.Context) {
+	parser.SeedSamples(ctx, s.extapiSvc, s.adapters)
+}
 
 func (s *Server) routes() {
 	// GET 与 HEAD 都要注册：**Gin 不会为 GET 路由自动响应 HEAD**（httprouter 的行为，

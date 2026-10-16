@@ -25,7 +25,6 @@ const (
 	AttemptOK      = "ok"
 	AttemptFailed  = "failed"
 	AttemptSkipped = "skipped"
-	AttemptPartial = "partial" // 能用但缺东西（如视频没有文件），链继续，都失败时用它兜底
 )
 
 // LogEntry 是一次解析请求的记录。
@@ -61,6 +60,7 @@ type Attempt struct {
 	LatencyMs    int        `json:"latency_ms"`
 	CostMicros   int64      `json:"cost_micros"`
 	BalanceAfter *int64     `json:"balance_after_micros,omitempty"`
+	SampleID     *uuid.UUID `json:"sample_id,omitempty"` // 当次调用的线上采样（请求与原始响应），已过保留期则为空
 }
 
 type LogRepo struct {
@@ -93,10 +93,10 @@ func (r *LogRepo) Write(ctx context.Context, e *LogEntry) error {
 		for _, a := range e.Attempts {
 			batch.Queue(`
 				INSERT INTO parse_attempts (log_id, seq, source, endpoint_id, account_id, outcome,
-				                            error_kind, error, http_status, latency_ms, cost_micros, balance_after_micros)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+				                            error_kind, error, http_status, latency_ms, cost_micros, balance_after_micros, sample_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 				id, a.Seq, a.Source, a.EndpointID, a.AccountID, a.Outcome,
-				a.ErrorKind, a.Error, a.HTTPStatus, a.LatencyMs, a.CostMicros, a.BalanceAfter)
+				a.ErrorKind, a.Error, a.HTTPStatus, a.LatencyMs, a.CostMicros, a.BalanceAfter, a.SampleID)
 		}
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return err
@@ -165,7 +165,7 @@ func (r *LogRepo) List(ctx context.Context, f LogFilter) ([]LogEntry, error) {
 
 	arows, err := r.pool.Query(ctx, `
 		SELECT a.log_id, a.seq, a.source, a.endpoint_id, a.account_id, COALESCE(acc.name, ''),
-		       a.outcome, a.error_kind, a.error, a.http_status, a.latency_ms, a.cost_micros, a.balance_after_micros
+		       a.outcome, a.error_kind, a.error, a.http_status, a.latency_ms, a.cost_micros, a.balance_after_micros, a.sample_id
 		FROM parse_attempts a
 		LEFT JOIN api_accounts acc ON acc.id = a.account_id
 		WHERE a.log_id = ANY($1)
@@ -178,7 +178,7 @@ func (r *LogRepo) List(ctx context.Context, f LogFilter) ([]LogEntry, error) {
 		var logID uuid.UUID
 		var a Attempt
 		if err := arows.Scan(&logID, &a.Seq, &a.Source, &a.EndpointID, &a.AccountID, &a.AccountName,
-			&a.Outcome, &a.ErrorKind, &a.Error, &a.HTTPStatus, &a.LatencyMs, &a.CostMicros, &a.BalanceAfter); err != nil {
+			&a.Outcome, &a.ErrorKind, &a.Error, &a.HTTPStatus, &a.LatencyMs, &a.CostMicros, &a.BalanceAfter, &a.SampleID); err != nil {
 			return nil, err
 		}
 		i := idx[logID]
@@ -208,7 +208,6 @@ type SourceSummary struct {
 	OK          int64  `json:"ok"`
 	Failed      int64  `json:"failed"`
 	Skipped     int64  `json:"skipped"`
-	Partial     int64  `json:"partial"`
 	CostMicros  int64  `json:"cost_micros"`
 }
 
@@ -252,7 +251,6 @@ func (r *LogRepo) Summary(ctx context.Context, days int) ([]ProviderSummary, []S
 		       COUNT(*) FILTER (WHERE a.outcome = 'ok'),
 		       COUNT(*) FILTER (WHERE a.outcome = 'failed'),
 		       COUNT(*) FILTER (WHERE a.outcome = 'skipped'),
-		       COUNT(*) FILTER (WHERE a.outcome = 'partial'),
 		       COALESCE(SUM(a.cost_micros), 0)
 		FROM parse_attempts a
 		JOIN parse_logs l ON l.id = a.log_id
@@ -268,7 +266,7 @@ func (r *LogRepo) Summary(ctx context.Context, days int) ([]ProviderSummary, []S
 	for srows.Next() {
 		var s SourceSummary
 		if err := srows.Scan(&s.Source, &s.AccountName, &s.Attempts, &s.OK, &s.Failed, &s.Skipped,
-			&s.Partial, &s.CostMicros); err != nil {
+			&s.CostMicros); err != nil {
 			return nil, nil, err
 		}
 		sources = append(sources, s)

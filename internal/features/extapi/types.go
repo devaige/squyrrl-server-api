@@ -97,6 +97,9 @@ type AdapterInfo struct {
 type Catalog interface {
 	Adapter(slug string) (AdapterInfo, bool)
 	Adapters() []AdapterInfo
+	// WatchedPaths 是该接口的适配器代码会读取的字段路径，结构比对只拿这些算缺失；
+	// 为空时退回比对全部字段。
+	WatchedPaths(slug string) []string
 }
 
 // ---- 管理后台入参 ----
@@ -145,15 +148,42 @@ type CreateSampleInput struct {
 }
 
 // Sample 是一条请求/响应存档记录。
+//
+//	sample —— 「示例」：核对过的一种响应结构，永久保留。每发现一种新结构存一份。
+//	live   —— 线上采样：archive_live 打开时每次调用自动存，保留最近 LiveSampleRetention、
+//	          每接口最多 LiveSamplesPerEndpoint 条；解析记录里每一步都能点回当次的这一条。
 type Sample struct {
 	ID         uuid.UUID       `json:"id"`
 	EndpointID uuid.UUID       `json:"endpoint_id"`
 	Kind       string          `json:"kind"` // 'sample' | 'live'
 	ResourceID string          `json:"resource_id"`
-	Request    json.RawMessage `json:"request"`
-	Response   json.RawMessage `json:"response"`
+	Request    json.RawMessage `json:"request,omitempty"`
+	Response   json.RawMessage `json:"response,omitempty"`
 	HTTPStatus int             `json:"http_status"`
 	LatencyMs  int             `json:"latency_ms"`
 	Note       string          `json:"note"`
 	CreatedAt  time.Time       `json:"created_at"`
+
+	// 仅线上采样：相对于该接口全部示例的结构差异（列表里只有计数，详情里带字段清单）
+	Diff *StructureDiff `json:"diff,omitempty"`
+	// 仅详情：所属接口
+	EndpointSlug string `json:"endpoint_slug,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+}
+
+// PromoteSampleInput 把一条线上采样存为示例，note 写清是哪种结构（如「视频推文」）。
+type PromoteSampleInput struct {
+	Note string `json:"note" binding:"required"`
+}
+
+type UpdateSampleInput struct {
+	Note string `json:"note"`
+}
+
+// SeedSample 是一份内置示例（接入时核对过的实测响应），首次部署时写进库里。
+type SeedSample struct {
+	ResourceID string
+	Request    json.RawMessage
+	Response   json.RawMessage
+	Note       string
 }

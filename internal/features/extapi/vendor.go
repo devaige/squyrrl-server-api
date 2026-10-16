@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Request 是适配器声明的一次上游调用。鉴权头与响应外壳由 vendor 处理 ——
@@ -31,7 +33,6 @@ const (
 	KindBadResponse   = "bad_response" // 2xx 但不是 JSON、外壳不对或超长；已计费
 	KindEmpty         = "empty"        // 2xx 但没有数据；已计费
 	KindDecode        = "decode"       // 适配器转换失败或结果不可用；已计费
-	KindIncomplete    = "incomplete"   // 结果能用但缺东西（如视频作品没有视频文件）；兜底链继续，都失败时用它
 	KindBuiltin       = "builtin"      // 内置免费来源报错
 )
 
@@ -56,6 +57,7 @@ type CallResult struct {
 	HTTPStatus   int
 	LatencyMs    int
 	Err          *CallError
+	SampleID     *uuid.UUID // archive_live 打开时这次调用存下的线上采样，解析记录据此点回原始响应
 }
 
 // Credentials 是各上游的 API 密钥，来自环境变量（config.go），永不落库。

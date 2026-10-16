@@ -102,4 +102,6 @@ type PriceInfo struct {
 	EffectiveCredits   int64  `json:"effective_credits"`
 	// Loss 为 true 表示售价低于最贵接口的单价：兜底落到它时每次都亏。
 	Loss bool `json:"loss"`
+	// Note 是平台按链接调整价格的说明（如小红书网页端链接 2 倍），没有为空。
+	Note string `json:"note,omitempty"`
 }

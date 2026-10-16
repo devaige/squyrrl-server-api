@@ -512,53 +512,58 @@ func TestShortLinkResolvesBeforeParsing(t *testing.T) {
 	}
 }
 
-// 结果能用但缺东西（视频没有文件）：链继续往后试；后面成功用后面的，都失败就用这份兜底。
-func TestChainPartialFallback(t *testing.T) {
-	partial := func(provider, url string) Adapter {
-		a := testAdapter(provider, url)
-		decode := a.Decode
-		a.Decode = func(data []byte, tg Target) (*ParseResult, error) {
-			res, err := decode(data, tg)
-			if err != nil {
-				return nil, err
+// 平台按链接给售价乘倍数（小红书网页端链接 2 倍）：余额预检与实际扣费都按乘过的价。
+func TestPriceFactorDoublesCharge(t *testing.T) {
+	srv, _ := fakeTikHub(t)
+	plat := &platform{id: uniqueProvider("factor"), canonical: res(`factor\.test/item/(\w+)`),
+		priceFactor: func(t Target) int64 {
+			if queryParam(t.Resolved, "type") == "" {
+				return 2
 			}
-			return res, &incompleteError{"视频作品没有视频文件"}
-		}
-		return a
+			return 1
+		}}
+	env := newChainEnv(t, plat, AdapterSet{"t_f": testAdapter(plat.id, srv.URL+"/ok")}, 1_000_000)
+	env.addEndpoint(t, "t_f", 1_000) // 自动价 20
+	svc := env.service(10)
+	ctx := context.Background()
+
+	uid := env.user(t, 100)
+	typed, err := svc.Parse(ctx, uid, ParseInput{URI: "https://factor.test/item/a?type=normal"})
+	if err != nil || typed.CreditsCharged != 20 {
+		t.Fatalf("带 type 的链接按原价 20：%+v %v", typed, err)
+	}
+	untyped, err := svc.Parse(ctx, uid, ParseInput{URI: "https://factor.test/item/b"})
+	if err != nil || untyped.CreditsCharged != 40 {
+		t.Fatalf("不带 type 的链接按 2 倍 40：%+v %v", untyped, err)
 	}
 
-	t.Run("后面的来源成功就用后面的", func(t *testing.T) {
-		srv, hits := fakeTikHub(t)
-		cp := &chainParser{provider: uniqueProvider("partial_ok")}
-		env := newChainEnv(t, cp, AdapterSet{"t_partial": partial(cp.provider, srv.URL+"/ok"), "t_full": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
-		env.addEndpoint(t, "t_partial", 1_000)
-		env.addEndpoint(t, "t_full", 2_000)
-		uid := env.user(t, 100)
-		if _, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"}); err != nil {
-			t.Fatal(err)
-		}
-		log := env.lastLog(t)
-		if hits.Load() != 2 || log.Source != "t_full" || log.CostMicros != 3_000 {
-			t.Errorf("应试到完整的那个并记两次成本: hits=%d source=%s cost=%d", hits.Load(), log.Source, log.CostMicros)
-		}
-		if log.Attempts[0].Outcome != AttemptPartial || log.Attempts[0].ErrorKind != extapi.KindIncomplete {
-			t.Errorf("第一次应记为不完整: %+v", log.Attempts[0])
-		}
-	})
+	poor := env.user(t, 30) // 够原价、不够 2 倍
+	_, err = svc.Parse(ctx, poor, ParseInput{URI: "https://factor.test/item/c"})
+	var ie *wallet.InsufficientCreditsError
+	if !errors.As(err, &ie) || ie.Required != 40 {
+		t.Errorf("余额预检应按 2 倍价：%v", err)
+	}
+}
 
-	t.Run("都失败就用不完整的那份兜底", func(t *testing.T) {
-		srv, _ := fakeTikHub(t)
-		cp := &chainParser{provider: uniqueProvider("partial_fb")}
-		env := newChainEnv(t, cp, AdapterSet{"t_partial": partial(cp.provider, srv.URL+"/ok"), "t_down": testAdapter(cp.provider, srv.URL+"/down")}, 1_000_000)
-		env.addEndpoint(t, "t_partial", 1_000)
-		env.addEndpoint(t, "t_down", 2_000)
-		uid := env.user(t, 100)
-		res, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"})
-		if err != nil {
-			t.Fatalf("应用不完整的结果兜底，得到 %v", err)
-		}
-		if res.CreditsCharged != 40 || env.lastLog(t).Source != "t_partial" {
-			t.Errorf("兜底结果照常收费、来源记为不完整的那个: %+v", res)
-		}
-	})
+// 解析记录的每一步带上当次调用的线上采样，排查时能点回原始响应。
+func TestAttemptLinksLiveSample(t *testing.T) {
+	srv, _ := fakeTikHub(t)
+	cp := &chainParser{provider: uniqueProvider("sample")}
+	env := newChainEnv(t, cp, AdapterSet{"t_s": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
+	id := env.addEndpoint(t, "t_s", 1_000)
+	if _, err := env.pool.Exec(context.Background(), `UPDATE api_endpoints SET config = '{"archive_live": true}' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	uid := env.user(t, 100)
+	if _, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"}); err != nil {
+		t.Fatal(err)
+	}
+	a := env.lastLog(t).Attempts[0]
+	if a.SampleID == nil {
+		t.Fatal("开了线上采样的接口，尝试应关联采样")
+	}
+	sample, err := env.extapi.GetSample(context.Background(), *a.SampleID)
+	if err != nil || sample.Kind != "live" || !strings.Contains(string(sample.Response), "上游正文") {
+		t.Errorf("关联的采样不对: %+v %v", sample, err)
+	}
 }

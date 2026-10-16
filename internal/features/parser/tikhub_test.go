@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/extapi"
 )
@@ -38,8 +41,7 @@ func decodeWith(t *testing.T, slug, fixtureName string, tg Target) (*ParseResult
 		t.Fatalf("没有适配器 %s", slug)
 	}
 	res, err := ad.Decode(fixture(t, fixtureName), tg)
-	var inc *incompleteError
-	if err != nil && !errors.As(err, &inc) {
+	if err != nil {
 		t.Fatalf("%s 解码失败: %v", slug, err)
 	}
 	var p decodedPost
@@ -78,7 +80,7 @@ func TestTikHubAdaptersDecodeRealSamples(t *testing.T) {
 		{"tikhub_xiaohongshu_app_v2_get_video_note_detail",
 			target("697c0eee000000000a03c308", "https://www.xiaohongshu.com/discovery/item/697c0eee000000000a03c308?type=video&xsec_token=abc"),
 			"video", "https://www.xiaohongshu.com/explore/697c0eee000000000a03c308?xsec_token=abc", true, 0},
-		// 视频笔记走图文接口：只有封面，记为不完整，交给视频接口（TestIncompleteResults）
+		// 视频笔记走图文接口：只有封面
 		{"tikhub_xiaohongshu_app_v2_get_image_note_detail", target("697c0eee000000000a03c308", ""), "video", "https://www.xiaohongshu.com/explore/", false, 0},
 		{"tikhub_bilibili_web_fetch_one_video", target("BV1M1421t7hT", ""), "video", "https://www.bilibili.com/video/BV1M1421t7hT", false, 0},
 		{"tikhub_bilibili_app_fetch_one_video", target("BV1M1421t7hT", ""), "video", "https://www.bilibili.com/video/BV1M1421t7hT", false, 0},
@@ -149,41 +151,86 @@ func TestTikHubAdaptersDecodeRealSamples(t *testing.T) {
 	}
 }
 
-// 视频作品没拿到视频文件 → 不完整（兜底链继续）；YouTube、B 站本来就没有视频文件，不算。
-func TestIncompleteResults(t *testing.T) {
-	a := TikHubAdapters()
+// 始终取最清晰的一档（用户决定 2026-10-16）：文件由客户端直接从 CDN 下载再上传，
+// 不经我方服务器。每个平台都核对实测样本里最高档的分辨率。
+func TestVideoPicksHighestQuality(t *testing.T) {
 	cases := []struct {
 		slug, fixture string
 		target        Target
-		incomplete    bool
+		w, h          int
+		urlHas        string
 	}{
-		{"tikhub_xiaohongshu_app_v2_get_image_note_detail", "xiaohongshu_app_v2_get_image_note_detail", target("697c0eee000000000a03c308", ""), true},
-		{"tikhub_tiktok_web_fetch_post_detail_v2", "tiktok_web_fetch_post_detail_v2", target("7350810998023949599", ""), true},
-		{"tikhub_youtube_web_v2_get_video_info", "youtube_web_v2_get_video_info", target("dQw4w9WgXcQ", ""), false},
-		{"tikhub_bilibili_web_fetch_one_video", "bilibili_web_fetch_one_video", target("BV1M1421t7hT", ""), false},
-		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_fetch_one_video", target("7448118827402972455", ""), false},
+		// 4K 25 Mbps 那档约 140 MB 也照给
+		{"tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""), 3840, 2160, "/3840x2160/"},
+		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_fetch_one_video", target("7448118827402972455", ""), 1920, 1080, ""},
+		{"tikhub_douyin_web_fetch_one_video", "douyin_web_fetch_one_video", target("7448118827402972455", ""), 3840, 2160, ""},
+		{"tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""), 720, 1280, ""},
+		{"tikhub_tiktok_web_fetch_post_detail", "tiktok_web_fetch_post_detail", target("7350810998023949599", ""), 720, 1280, ""},
+		{"tikhub_xiaohongshu_app_v2_get_video_note_detail", "xiaohongshu_app_v2_get_video_note_detail", target("697c0eee000000000a03c308", ""), 1080, 1920, ""},
+		{"tikhub_weibo_web_v2_fetch_post_detail", "weibo_web_v2_fetch_post_detail", target("5092682368025584", ""), 720, 960, "label=mp4_720p"},
+		{"tikhub_kuaishou_app_fetch_one_video_by_url", "kuaishou_app_fetch_one_video_by_url", target("3xgqdzu8cnrpmqq", "https://v.kuaishou.com/cNYP0Z"), 1080, 1442, ""},
+		{"tikhub_kuaishou_web_fetch_one_video_by_url", "kuaishou_web_fetch_one_video_by_url", target("3xgqdzu8cnrpmqq", "https://v.kuaishou.com/cNYP0Z"), 1080, 1442, ""},
 	}
 	for _, c := range cases {
-		res, err := a[c.slug].Decode(fixture(t, c.fixture), c.target)
-		var inc *incompleteError
-		if got := errors.As(err, &inc); got != c.incomplete || res == nil || !usable(res) {
-			t.Errorf("%s：不完整=%v（期望 %v），err=%v", c.slug, got, c.incomplete, err)
+		_, p := decodeWith(t, c.slug, c.fixture, c.target)
+		if p.Video == nil || p.Video.Width != c.w || p.Video.Height != c.h || !strings.Contains(p.Video.URL, c.urlHas) {
+			t.Errorf("%s：期望 %dx%d，得到 %+v", c.slug, c.w, c.h, p.Video)
 		}
+	}
+	// X 的图片与视频封面取原图
+	_, photo := decodeWith(t, "tikhub_twitter_web_fetch_tweet_detail", "twitter_web_fetch_tweet_detail", target("1808168603721650364", ""))
+	_, video := decodeWith(t, "tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""))
+	if !strings.HasSuffix(photo.Images[0].URL, "?name=orig") || !strings.HasSuffix(video.Cover, "?name=orig") {
+		t.Errorf("X 图片应取原图: %s / %s", photo.Images[0].URL, video.Cover)
 	}
 }
 
-// 带视频的推文（用户提供的 ID，实测）：挑放得进 25 MiB 的最高码率 —— 45.6 秒的视频，
-// 1080p（10.4 Mbps）约 59 MB 放不下，720p（2.2 Mbps）约 12 MB 正好。
-func TestTweetVideoPicksVariantThatFits(t *testing.T) {
-	_, p := decodeWith(t, "tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""))
-	if p.Kind != "video" || p.Video == nil {
-		t.Fatalf("应是视频作品: %+v", p)
+// 小红书网页端复制的链接（不带 type）按 2 倍计费；App 分享的链接带 type，按原价。
+func TestXHSPriceFactor(t *testing.T) {
+	var xhs PriceFactorer
+	for _, p := range NewUpstreamPlatforms() {
+		if p.Provider() == PlatformXiaohongshu {
+			xhs = p.(PriceFactorer)
+		}
 	}
-	if !strings.Contains(p.Video.URL, "/1280x720/") || p.Video.Width != 1280 || p.Video.Height != 720 || p.Video.DurationMs != 45630 {
-		t.Errorf("挑的码率不对: %+v", p.Video)
+	for resolved, want := range map[string]int64{
+		"https://www.xiaohongshu.com/explore/x?xsec_token=t":           2,
+		"https://www.xiaohongshu.com/discovery/item/x?type=video&a=1":  1,
+		"https://www.xiaohongshu.com/discovery/item/x?type=normal&a=1": 1,
+	} {
+		if got := xhs.PriceFactor(target("x", resolved)); got != want {
+			t.Errorf("%s 倍数 %d，期望 %d", resolved, got, want)
+		}
 	}
-	if !strings.Contains(p.Cover, "amplify_video_thumb") || len(p.Images) != 0 {
-		t.Errorf("封面应是视频缩略图，且不该当成图片: cover=%s images=%d", p.Cover, len(p.Images))
+	if xhs.PriceNote() == "" {
+		t.Error("后台定价页要有说明")
+	}
+}
+
+// 内置示例：每一份都能被对应的适配器解码（失败形态不在其中），并且写库只在接口还没有示例时发生。
+func TestBuiltinSamples(t *testing.T) {
+	adapters := TikHubAdapters()
+	covered := map[string]bool{}
+	for _, b := range builtinSamples {
+		ad, ok := adapters[b.slug]
+		if !ok {
+			t.Errorf("%s 没有适配器", b.slug)
+			continue
+		}
+		data, err := readFixture(b.file)
+		if err != nil {
+			t.Errorf("%s 缺样本文件 %s", b.slug, b.file)
+			continue
+		}
+		if res, err := ad.Decode(data, b.fullTarget()); err != nil || !usable(res) {
+			t.Errorf("%s / %s 解码失败: %v", b.slug, b.file, err)
+		}
+		covered[b.slug] = true
+	}
+	for slug := range adapters {
+		if !covered[slug] {
+			t.Errorf("%s 没有内置示例", slug)
+		}
 	}
 }
 
@@ -237,15 +284,16 @@ func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 // 小红书视频接口只接分享链接里标明 type=video 的；B 站网页接口只认 BV 号。
 func TestAdapterAccept(t *testing.T) {
 	a := TikHubAdapters()
-	image := a["tikhub_xiaohongshu_app_v2_get_image_note_detail"].Accept
 	video := a["tikhub_xiaohongshu_app_v2_get_video_note_detail"].Accept
 	typed := func(ty string) Target {
 		return target("x", "https://www.xiaohongshu.com/discovery/item/x"+map[string]string{"": "", "video": "?type=video", "normal": "?type=normal"}[ty])
 	}
-	// type=video 只走视频；type=normal 只走图文（视频接口拿图文 ID 会返回别人的笔记）；没有 type 两个都可以
-	if image(typed("video")) || !video(typed("video")) || !image(typed("normal")) || video(typed("normal")) ||
-		!image(typed("")) || !video(typed("")) {
-		t.Error("小红书两个接口的分流不对")
+	// 视频接口拿图文笔记 ID 会返回别人的笔记：type=normal 绝不交给它；video 与没有 type 都先试它
+	if !video(typed("video")) || video(typed("normal")) || !video(typed("")) {
+		t.Error("小红书视频接口的分流不对")
+	}
+	if a["tikhub_xiaohongshu_app_v2_get_image_note_detail"].Accept != nil {
+		t.Error("图文接口什么链接都接（视频接口失败时也能拿到封面与正文）")
 	}
 	if a["tikhub_bilibili_web_fetch_one_video"].Accept(target("av170001", "")) {
 		t.Error("B 站网页接口不该接 av 号")
@@ -446,5 +494,114 @@ func TestTikHubSeedMatchesAdapters(t *testing.T) {
 		if w, ok := want[p.Provider]; ok && p.AutoCredits != w {
 			t.Errorf("%s 自动售价 %d，期望 %d", p.Provider, p.AutoCredits, w)
 		}
+	}
+}
+
+// 内置示例只写一次；线上采样与之比对：同结构无差异，丢了共有字段会被标出来。
+func TestSeedSamplesAndCompare(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	adapters := TikHubAdapters()
+	ext := extapi.NewService(extapi.NewRepo(pool), extapi.Credentials{}, adapters)
+	SeedSamples(ctx, ext, adapters)
+	SeedSamples(ctx, ext, adapters) // 第二次不应重复写
+
+	var epID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM api_endpoints WHERE slug = 'tikhub_twitter_web_fetch_tweet_detail'`).Scan(&epID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM api_samples WHERE endpoint_id = $1 AND kind = 'sample'`, epID).Scan(&n)
+	if n != 2 {
+		t.Fatalf("推文接口应有 2 份内置示例（图片、视频），实有 %d", n)
+	}
+
+	repo := extapi.NewRepo(pool)
+	photo := fixture(t, "twitter_web_fetch_tweet_detail")
+	okResp, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": json.RawMessage(photo)}})
+	var broken map[string]any
+	_ = json.Unmarshal(photo, &broken)
+	delete(broken, "author")
+	badResp, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": broken}})
+	okID, _ := repo.InsertSample(ctx, epID, "live", "a", nil, okResp, 200, 1, "")
+	badID, _ := repo.InsertSample(ctx, epID, "live", "b", nil, badResp, 200, 1, "")
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = ANY($1)`, []uuid.UUID{okID, badID}) })
+
+	good, err := ext.GetSample(ctx, okID)
+	if err != nil || good.Diff == nil || good.Diff.MissingCount != 0 || good.Diff.Baseline != 2 {
+		t.Errorf("与示例同结构不该有缺失: %+v %v", good.Diff, err)
+	}
+	bad, _ := ext.GetSample(ctx, badID)
+	if bad.Diff == nil || !slices.Contains(bad.Diff.Missing, "author") {
+		t.Errorf("丢了 author 应被标为缺失: %+v", bad.Diff)
+	}
+	list, _ := ext.ListSamples(ctx, epID)
+	for _, x := range list {
+		if len(x.Response) > 0 {
+			t.Error("列表不应带响应正文")
+		}
+	}
+
+	// 存为示例后，它自己就成了基准的一部分
+	newID, err := ext.PromoteSample(ctx, okID, "图片推文（线上）")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = ext.DeleteSample(ctx, newID) })
+	if deleted, _ := ext.DeleteSample(ctx, okID); deleted {
+		t.Error("线上采样不能手工删除")
+	}
+}
+
+// 每个适配器都声明了解码结构，代码读取的字段从 json 标签反射出来；map 只记到键为止。
+func TestWatchedPaths(t *testing.T) {
+	for slug := range TikHubAdapters() {
+		if len(TikHubAdapters().WatchedPaths(slug)) == 0 {
+			t.Errorf("%s 没有声明解码结构", slug)
+		}
+	}
+	paths := watchedPaths(tweet{})
+	for _, want := range []string{"id", "text", "author.screen_name", "media"} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("推文的读取字段缺 %s: %v", want, paths)
+		}
+	}
+	for _, p := range paths {
+		if strings.HasPrefix(p, "media.") {
+			t.Errorf("map 的键是数据，不该展开: %s", p)
+		}
+	}
+	if !slices.Contains(watchedPaths(xhsVideoEnvelope{}), "data[].video_info_v2.media.stream") {
+		t.Error("小红书视频流路径应停在 stream（键是编码名）")
+	}
+}
+
+// 两条正常的小红书视频笔记响应（不同笔记）不该互相报缺失：它们差的是直播间、音乐、字幕这类
+// 代码不读的字段（实测差出 20 多个）。
+func TestStructureDiffIgnoresUnreadFields(t *testing.T) {
+	wrap := func(data []byte) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": json.RawMessage(data)}})
+		return b
+	}
+	pool := testPool(t)
+	ctx := context.Background()
+	adapters := TikHubAdapters()
+	ext := extapi.NewService(extapi.NewRepo(pool), extapi.Credentials{}, adapters)
+	repo := extapi.NewRepo(pool)
+
+	var epID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM api_endpoints WHERE slug = 'tikhub_xiaohongshu_app_v2_get_video_note_detail'`).Scan(&epID); err != nil {
+		t.Fatal(err)
+	}
+	base, _ := repo.InsertSample(ctx, epID, "sample", "x", nil, wrap(fixture(t, "xiaohongshu_app_v2_get_video_note_detail")), 200, 0, "test")
+	live, _ := repo.InsertSample(ctx, epID, "live", "y", nil, wrap(fixture(t, "xhs_video_on_normal")), 200, 0, "")
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = ANY($1)`, []uuid.UUID{base, live}) })
+
+	got, err := ext.GetSample(ctx, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Diff.MissingCount != 0 {
+		t.Errorf("代码不读的字段差异不该算缺失: %v", got.Diff.Missing)
 	}
 }

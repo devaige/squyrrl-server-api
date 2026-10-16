@@ -150,7 +150,7 @@ func (s *Service) Call(ctx context.Context, ep Endpoint, req Request, resourceID
 	}
 
 	if cfg.ArchiveLive {
-		s.archiveLive(context.WithoutCancel(ctx), ep.ID, resourceID, method, u, req, resp.StatusCode, raw, res.LatencyMs)
+		res.SampleID = s.archiveLive(context.WithoutCancel(ctx), ep.ID, resourceID, method, u, req, resp.StatusCode, raw, res.LatencyMs)
 	}
 	return res
 }
@@ -158,16 +158,19 @@ func (s *Service) Call(ctx context.Context, ep Endpoint, req Request, resourceID
 // archiveLive 存一条线上调用采样。请求快照里没有鉴权头 —— 密钥只在 vendor.authorize
 // 里加到 http.Request 上，从不经过这里。
 func (s *Service) archiveLive(ctx context.Context, endpointID uuid.UUID, resourceID, method string,
-	u *url.URL, req Request, status int, raw []byte, latencyMs int) {
+	u *url.URL, req Request, status int, raw []byte, latencyMs int) *uuid.UUID {
 	snapReq := map[string]any{"method": method, "url": u.Scheme + "://" + u.Host + u.Path, "query": req.Query}
 	if len(req.Body) > 0 {
 		snapReq["body"] = jsonOrString(req.Body)
 	}
 	reqJSON, _ := json.Marshal(snapReq)
 	respJSON, _ := json.Marshal(map[string]any{"status": status, "body": jsonOrString(raw)})
-	if err := s.repo.InsertSample(ctx, endpointID, "live", resourceID, reqJSON, respJSON, status, latencyMs, ""); err != nil {
+	id, err := s.repo.InsertSample(ctx, endpointID, "live", resourceID, reqJSON, respJSON, status, latencyMs, "")
+	if err != nil {
 		slog.Warn("extapi 存档失败", "err", err)
+		return nil
 	}
+	return &id
 }
 
 // jsonOrString 尽量把内容存成结构化 JSON（便于 JSONB 检索），非 JSON 则退化为字符串。
@@ -251,12 +254,98 @@ func (s *Service) Adapters() []AdapterInfo { return s.catalog.Adapters() }
 
 // AddSample 录入一条管理员提供的请求/响应示例（kind='sample'）。
 func (s *Service) AddSample(ctx context.Context, id uuid.UUID, in CreateSampleInput) error {
-	return s.repo.InsertSample(ctx, id, "sample", in.ResourceID,
+	_, err := s.repo.InsertSample(ctx, id, "sample", in.ResourceID,
 		nilIfEmpty(in.Request), nilIfEmpty(in.Response), in.HTTPStatus, 0, in.Note)
+	return err
 }
 
+// ListSamples 列出接口的示例与线上采样。线上采样带上相对示例的结构差异计数；
+// 列表不带请求响应正文（单条可达几百 KB），看详情走 GetSample。
 func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, error) {
-	return s.repo.ListSamples(ctx, id)
+	all, err := s.repo.ListSamples(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var watched []string
+	if ep, err := s.repo.Get(ctx, id); err == nil && s.catalog != nil {
+		watched = s.catalog.WatchedPaths(ep.Slug)
+	}
+	var baselines []json.RawMessage
+	for _, x := range all {
+		if x.Kind == "sample" && len(x.Response) > 0 {
+			baselines = append(baselines, x.Response)
+		}
+	}
+	for i := range all {
+		if all[i].Kind == "live" {
+			all[i].Diff = diffAgainst(all[i].Response, baselines, watched, false)
+		}
+		all[i].Request, all[i].Response = nil, nil
+	}
+	return all, nil
+}
+
+// GetSample 返回一条存档的完整请求响应；线上采样附带结构差异的字段清单。
+func (s *Service) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) {
+	x, err := s.repo.GetSample(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var watched []string
+	if ep, err := s.repo.Get(ctx, x.EndpointID); err == nil {
+		x.EndpointSlug, x.Provider = ep.Slug, ep.Provider
+		if s.catalog != nil {
+			watched = s.catalog.WatchedPaths(ep.Slug)
+		}
+	}
+	if x.Kind == "live" {
+		baselines, err := s.repo.SampleResponses(ctx, x.EndpointID)
+		if err != nil {
+			return nil, err
+		}
+		x.Diff = diffAgainst(x.Response, baselines, watched, true)
+	}
+	return x, nil
+}
+
+// PromoteSample 把一条线上采样存为示例，返回新示例的 ID。
+func (s *Service) PromoteSample(ctx context.Context, id uuid.UUID, note string) (uuid.UUID, error) {
+	return s.repo.PromoteSample(ctx, id, note)
+}
+
+func (s *Service) UpdateSampleNote(ctx context.Context, id uuid.UUID, note string) error {
+	return s.repo.UpdateSampleNote(ctx, id, note)
+}
+
+func (s *Service) DeleteSample(ctx context.Context, id uuid.UUID) (bool, error) {
+	return s.repo.DeleteSample(ctx, id)
+}
+
+// SeedSamples 给还没有任何示例的接口写入内置示例（接入时核对过的实测响应）。
+//
+// 只在「一份示例都没有」时写：管理员删掉某几份是有意为之，不该在下次启动时又冒出来；
+// 全删光了再补回来，至少保证结构比对有基准。返回写入的条数。
+func (s *Service) SeedSamples(ctx context.Context, slug string, samples []SeedSample) (int, error) {
+	eps, err := s.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, ep := range eps {
+		if ep.Slug != slug {
+			continue
+		}
+		n, err := s.repo.CountSamples(ctx, ep.ID)
+		if err != nil || n > 0 {
+			return 0, err
+		}
+		for _, x := range samples {
+			if _, err := s.repo.InsertSample(ctx, ep.ID, "sample", x.ResourceID, x.Request, x.Response, http.StatusOK, 0, x.Note); err != nil {
+				return 0, err
+			}
+		}
+		return len(samples), nil
+	}
+	return 0, nil
 }
 
 // nilIfEmpty 把空 RawMessage 归零为 nil —— 空串写进 JSONB 列会报 invalid json。
@@ -267,11 +356,14 @@ func nilIfEmpty(b json.RawMessage) []byte {
 	return b
 }
 
-// LiveSamplesPerEndpoint 是每个 endpoint 保留的线上采样条数上限。
+// 线上采样的保留规则：最近 7 天、每个接口最多 100 条。
 //
-// 写成常量而不是环境变量：它不随部署环境变化，取值只由「要看几条才够判断
-// 适配器对不对」决定，而那个答案是 20 左右，不是需要调的旋钮。
-const LiveSamplesPerEndpoint = 20
+// 7 天对应「从解析记录点回当次响应」的排查窗口；100 条封顶让高频接口的存量与调用量无关
+// （单条几十到上百 KB）。写成常量而不是环境变量：它们不随部署环境变化。
+const (
+	LiveSamplesPerEndpoint = 100
+	LiveSampleRetention    = 7 * 24 * time.Hour
+)
 
 // RunSampleSweeper 阻塞执行线上采样的限量循环；调用方放在独立 goroutine。
 //
@@ -284,7 +376,7 @@ func (s *Service) RunSampleSweeper(ctx context.Context, interval time.Duration) 
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
-	slog.Info("解析 API 采样限量启动", "interval", interval, "keep", LiveSamplesPerEndpoint)
+	slog.Info("解析 API 采样限量启动", "interval", interval, "keep", LiveSamplesPerEndpoint, "retention", LiveSampleRetention)
 	s.pruneOnce(ctx)
 	for {
 		select {
@@ -298,7 +390,7 @@ func (s *Service) RunSampleSweeper(ctx context.Context, interval time.Duration) 
 }
 
 func (s *Service) pruneOnce(ctx context.Context) {
-	n, err := s.repo.PruneLiveSamples(ctx, LiveSamplesPerEndpoint)
+	n, err := s.repo.PruneLiveSamples(ctx, LiveSamplesPerEndpoint, LiveSampleRetention)
 	if err != nil {
 		slog.Warn("解析 API 采样限量失败", "err", err)
 		return

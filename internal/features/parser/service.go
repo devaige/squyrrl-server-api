@@ -122,6 +122,9 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 	if err != nil {
 		return nil, err
 	}
+	if pf, ok := p.(PriceFactorer); ok {
+		price *= pf.PriceFactor(t)
+	}
 	if price > 0 {
 		bal, err := s.wallet.Balance(ctx, userID)
 		if err != nil {
@@ -302,8 +305,6 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 	// 同一账户下的接口共用余额，而 eps 里的余额是链开始前读的：链内前面的调用
 	// 花掉的钱要自己扣回去，否则「余额耗尽就跳过」和余额快照都会慢一拍。
 	spent := map[uuid.UUID]int64{}
-	var fallback *ParseResult // 第一份「不完整但能用」的结果，链走完都没有更好的就用它
-	var fallbackSource string
 	for _, ep := range eps {
 		ep.BalanceMicros -= spent[ep.AccountID]
 		epID, accID := ep.ID, ep.AccountID
@@ -329,7 +330,7 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 
 		call := s.extapi.Call(ctx, ep, ad.Request(t), t.ResourceID)
 		spent[ep.AccountID] += call.CostMicros
-		a.HTTPStatus, a.LatencyMs, a.CostMicros = call.HTTPStatus, call.LatencyMs, call.CostMicros
+		a.HTTPStatus, a.LatencyMs, a.CostMicros, a.SampleID = call.HTTPStatus, call.LatencyMs, call.CostMicros, call.SampleID
 		if call.CostMicros > 0 {
 			bal := call.BalanceAfter
 			a.BalanceAfter = &bal
@@ -340,16 +341,7 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 			continue
 		}
 		res, err := ad.Decode(call.Data, t)
-		var inc *incompleteError
 		switch {
-		case errors.As(err, &inc) && usable(res):
-			// 能用但缺东西：记下来当兜底，接着试后面的来源
-			a.Outcome, a.ErrorKind, a.Error = AttemptPartial, extapi.KindIncomplete, inc.reason
-			add(a)
-			if fallback == nil {
-				fallback, fallbackSource = res, ep.Slug
-			}
-			continue
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
 		case !usable(res):
@@ -362,9 +354,6 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 		add(a)
 	}
 
-	if fallback != nil {
-		return fallback, fallbackSource, attempts, nil
-	}
 	if len(attempts) == 0 {
 		return nil, "", nil, errNoSource
 	}
@@ -470,6 +459,9 @@ func (s *Service) Prices(ctx context.Context) ([]PriceInfo, error) {
 		}
 		if s.defaultPrice <= 0 {
 			info.EffectiveCredits = 0
+		}
+		if pf, ok := p.(PriceFactorer); ok {
+			info.Note = pf.PriceNote()
 		}
 		info.Loss = info.EffectiveCredits*pricing.MicrosPerCredit < info.MaxUnitPriceMicros
 		out = append(out, info)

@@ -25,6 +25,9 @@ type Adapter struct {
 	// type=video 的。nil 表示什么都接。
 	Accept func(t Target) bool
 
+	// Shape 是解码用的外壳类型的零值，结构比对据此知道代码读取哪些字段（见 watchedPaths）。
+	Shape any
+
 	Request func(t Target) extapi.Request
 	// Decode 收到的是去掉上游外壳后的数据。返回的结果若没有标题也没有正文，
 	// 视同失败、继续试下一个来源（这次调用的钱已经花了）。
