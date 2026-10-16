@@ -79,14 +79,21 @@ func (c *Cache) Get(ctx context.Context, provider, resourceID string) (*ParsedSn
 // 差异只可能是上游这次降级了（限流、部分字段缺失）。而这张表是跨用户共享的，
 // 一次降级返回会把一条好缓存换成坏缓存，代价由**所有**后来者承担，且没人会发现。
 // 宁可丢弃这次的结果 —— 它按定义不比已有的更新。
-func (c *Cache) Put(ctx context.Context, provider, resourceID, version string, snip *ParsedSnippet) error {
+//
+// ttl 非零且短于全局保留期时取它：媒体地址会过期的平台（见 ParseResult.CacheTTL），
+// 缓存不该比地址活得久。
+func (c *Cache) Put(ctx context.Context, provider, resourceID, version string, snip *ParsedSnippet, ttl time.Duration) error {
 	raw, err := json.Marshal(snip)
 	if err != nil {
 		return err
 	}
+	keep := c.ttl
+	if ttl > 0 && (keep <= 0 || ttl < keep) {
+		keep = ttl
+	}
 	var expires *time.Time
-	if c.ttl > 0 {
-		t := time.Now().Add(c.ttl)
+	if keep > 0 {
+		t := time.Now().Add(keep)
 		expires = &t
 	}
 	_, err = c.pool.Exec(ctx, `

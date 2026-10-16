@@ -24,8 +24,8 @@ func TestAdminRoutesEndToEnd(t *testing.T) {
 	adapterSlug := "t_admin_" + uuid.NewString()[:8]
 	adapters := AdapterSet{adapterSlug: {
 		Provider: cp.provider, Vendor: extapi.VendorRapidAPI, Note: "测试适配器",
-		Request: func(uri, id string) extapi.Request { return extapi.Request{URL: "http://unused"} },
-		Decode:  func(data []byte, uri, id string) (*ParseResult, error) { return nil, nil },
+		Request: func(Target) extapi.Request { return extapi.Request{URL: "http://unused"} },
+		Decode:  func([]byte, Target) (*ParseResult, error) { return nil, nil },
 	}}
 	reg := NewRegistry()
 	reg.Register(cp)

@@ -20,17 +20,19 @@ type Request struct {
 // 失败类别：写进 parse_attempts.error_kind，后台按它筛选和统计失败原因。
 // 是否计费看的不是类别而是 CallResult.Billed —— 同样叫「失败」，上游收不收钱是两回事。
 const (
-	KindNoAdapter    = "no_adapter"    // 跳过：代码里没有这个 slug 的适配器，或适配器与账户不是同一上游
-	KindNoBalance    = "no_balance"    // 跳过：账户余额耗尽
-	KindConfig       = "config"        // 失败：接口配置或上游登记有误
-	KindNoCredential = "no_credential" // 失败：没配该上游的密钥
-	KindNetwork      = "network"
-	KindTimeout      = "timeout"
-	KindHTTPStatus   = "http_status"  // 非 2xx，具体码见 http_status；一般不计费
-	KindBadResponse  = "bad_response" // 2xx 但不是 JSON、外壳不对或超长；已计费
-	KindEmpty        = "empty"        // 2xx 但没有数据；已计费
-	KindDecode       = "decode"       // 适配器转换失败或结果不可用；已计费
-	KindBuiltin      = "builtin"      // 内置免费来源报错
+	KindNoAdapter     = "no_adapter"     // 跳过：代码里没有这个 slug 的适配器，或适配器与账户不是同一上游
+	KindNoBalance     = "no_balance"     // 跳过：账户余额耗尽
+	KindNotApplicable = "not_applicable" // 跳过：这条链接不归这个接口（如小红书视频接口只接视频笔记）
+	KindConfig        = "config"         // 失败：接口配置或上游登记有误
+	KindNoCredential  = "no_credential"  // 失败：没配该上游的密钥
+	KindNetwork       = "network"
+	KindTimeout       = "timeout"
+	KindHTTPStatus    = "http_status"  // 非 2xx，具体码见 http_status；一般不计费
+	KindBadResponse   = "bad_response" // 2xx 但不是 JSON、外壳不对或超长；已计费
+	KindEmpty         = "empty"        // 2xx 但没有数据；已计费
+	KindDecode        = "decode"       // 适配器转换失败或结果不可用；已计费
+	KindGone          = "gone"         // 上游确认作品不存在或已删除；兜底链就此停止，不再花钱试别的
+	KindBuiltin       = "builtin"      // 内置免费来源报错
 )
 
 // CallError 是一次调用失败的类别与说明。说明只进解析记录，不回给用户 ——
@@ -163,25 +165,36 @@ func isEmptyJSON(b json.RawMessage) bool {
 	return false
 }
 
-// errorMessage 从错误响应里挑一句人能看懂的话：FastAPI 的 detail、常见的 message，
-// 都没有就截一段原文。只进解析记录。
+// errorMessage 从错误响应里挑一句人能看懂的话，只进解析记录。
+//
+// 认得的形态：FastAPI 的 {"detail": "..."}；TikHub 的 {"detail": {"message_zh": ...,
+// "request_id": ...}}（实测 2026-10-16，失败一律不计费）；常见的 message / error。
+// TikHub 的请求 ID 一并带上 —— 找它的客服排查时要报这个号。都不认得就截一段原文。
 func errorMessage(body []byte) string {
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
-		for _, k := range []string{"detail", "message_zh", "message", "error"} {
-			switch v := m[k].(type) {
-			case string:
-				if v != "" {
-					return v
+		if d, ok := m["detail"].(map[string]any); ok {
+			if msg := firstString(d, "message_zh", "message"); msg != "" {
+				if rid := firstString(d, "request_id"); rid != "" {
+					msg += "（request_id " + rid + "）"
 				}
-			case nil:
-			default:
-				b, _ := json.Marshal(v)
-				return truncate(string(b), 300)
+				return truncate(msg, 300)
 			}
+		}
+		if msg := firstString(m, "detail", "message_zh", "message", "error"); msg != "" {
+			return truncate(msg, 300)
 		}
 	}
 	return truncate(strings.TrimSpace(string(body)), 300)
+}
+
+func firstString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func truncate(s string, n int) string {

@@ -78,7 +78,7 @@ func TestCacheKeepsVersionsAndReadsLatest(t *testing.T) {
 		{"e2", "第二版"},
 		{"e3", "第三版"},
 	} {
-		if err := c.Put(ctx, provider, "chat:1", v.version, snip(v.title)); err != nil {
+		if err := c.Put(ctx, provider, "chat:1", v.version, snip(v.title), 0); err != nil {
 			t.Fatalf("写入 %s 失败: %v", v.version, err)
 		}
 		// created_at 是排序依据，同一事务内多次写入可能落在同一时间戳上；
@@ -114,7 +114,7 @@ func TestCacheEmptyVersionStaysSingleRow(t *testing.T) {
 	ctx := context.Background()
 
 	for _, title := range []string{"旧", "新"} {
-		if err := c.Put(ctx, provider, "res:1", "", snip(title)); err != nil {
+		if err := c.Put(ctx, provider, "res:1", "", snip(title), 0); err != nil {
 			t.Fatalf("写入失败: %v", err)
 		}
 	}
@@ -147,11 +147,11 @@ func TestCachePutRejectsDegradedPayload(t *testing.T) {
 	c := newTestCache(t, pool, provider)
 	ctx := context.Background()
 
-	if err := c.Put(ctx, provider, "res:1", "v1", snip("完整标题")); err != nil {
+	if err := c.Put(ctx, provider, "res:1", "v1", snip("完整标题"), 0); err != nil {
 		t.Fatalf("写入失败: %v", err)
 	}
 	// 上游降级：同一版本，但标题丢了
-	if err := c.Put(ctx, provider, "res:1", "v1", snip("")); err != nil {
+	if err := c.Put(ctx, provider, "res:1", "v1", snip(""), 0); err != nil {
 		t.Fatalf("写入失败: %v", err)
 	}
 
@@ -164,7 +164,7 @@ func TestCachePutRejectsDegradedPayload(t *testing.T) {
 	}
 
 	// 反向：有 title 的新结果应当正常覆盖
-	if err := c.Put(ctx, provider, "res:1", "v1", snip("更新后的标题")); err != nil {
+	if err := c.Put(ctx, provider, "res:1", "v1", snip("更新后的标题"), 0); err != nil {
 		t.Fatalf("写入失败: %v", err)
 	}
 	got, _, _, err = c.Get(ctx, provider, "res:1")

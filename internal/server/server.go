@@ -95,6 +95,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 	registry.Register(parser.NewYouTubeProvider())
 	registry.Register(parser.NewGistProvider())
 	registry.Register(parser.NewRedditProvider())
+	for _, p := range parser.NewUpstreamPlatforms() {
+		registry.Register(p)
+	}
 	adapters := parser.DefaultAdapters()
 	extapiSvc := extapi.NewService(extapi.NewRepo(pool),
 		extapi.Credentials{TikHub: cfg.TikHubAPIKey, RapidAPI: cfg.RapidAPIKey}, adapters)

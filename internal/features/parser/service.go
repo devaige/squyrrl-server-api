@@ -23,8 +23,9 @@ type Deps struct {
 	Wallet   *wallet.Service
 	Extapi   *extapi.Service // nil → 只走内置免费来源
 	Adapters AdapterSet
-	Prices   *PriceRepo // nil → 不读覆盖值，全部用自动价
-	Logs     *LogRepo   // nil → 不记解析记录
+	Prices   *PriceRepo        // nil → 不读覆盖值，全部用自动价
+	Logs     *LogRepo          // nil → 不记解析记录
+	Resolver ShortLinkResolver // nil → 真实 HTTP 跟跳转
 
 	// DefaultPrice 是只有免费来源的平台的售价（SQUYRRL_PARSE_COST）；<=0 = 解析整体不扣费。
 	DefaultPrice    int64
@@ -39,6 +40,7 @@ type Service struct {
 	adapters     AdapterSet
 	prices       *PriceRepo
 	logs         *LogRepo
+	resolver     ShortLinkResolver
 	defaultPrice int64
 
 	// flight 让并发解析**同一资源**的请求共用一次上游调用。
@@ -69,11 +71,15 @@ func NewService(d Deps) *Service {
 	if adapters == nil {
 		adapters = AdapterSet{}
 	}
+	var resolver ShortLinkResolver = newHTTPResolver()
+	if d.Resolver != nil {
+		resolver = d.Resolver
+	}
 	return &Service{
 		registry: d.Registry, cache: d.Cache, wallet: d.Wallet,
 		extapi: d.Extapi, adapters: adapters, prices: d.Prices, logs: d.Logs,
-		defaultPrice: d.DefaultPrice,
-		refresh:      ratelimit.New(limit, d.RefreshCooldown),
+		resolver: resolver, defaultPrice: d.DefaultPrice,
+		refresh: ratelimit.New(limit, d.RefreshCooldown),
 	}
 }
 
@@ -86,10 +92,27 @@ func NewService(d Deps) *Service {
 // in.Force 跳过缓存读、直接重取一次（用户侧的「强制刷新」），不改变价格。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*ParseResponse, error) {
 	start := time.Now()
-	p, resourceID, ok := s.registry.Find(in.URI)
+	t := Target{URI: in.URI, Resolved: in.URI}
+
+	// 分享短链先跟跳转拿到作品链接（免费，不碰上游），缓存键才能是作品 ID
+	if sp, ok := s.registry.FindShortLink(in.URI); ok {
+		resolved, err := s.resolver.Resolve(ctx, in.URI, func(u string) bool {
+			_, ok := sp.Match(u)
+			return ok
+		})
+		if err != nil {
+			s.writeLog(ctx, &LogEntry{Provider: sp.Provider(), ResourceID: truncateRunes(in.URI, 200),
+				Status: LogFailed, Error: err.Error()}, start)
+			return nil, ErrParseFailed
+		}
+		t.Resolved = resolved
+	}
+
+	p, resourceID, ok := s.registry.Find(t.Resolved)
 	if !ok {
 		return nil, ErrNoParser // 无法解析的 URI 不产生费用
 	}
+	t.ResourceID = resourceID
 
 	eps, err := s.endpointsFor(ctx, p.Provider())
 	if err != nil {
@@ -124,7 +147,7 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 		}
 	}
 
-	out := s.fetchShared(ctx, p, eps, in.URI, resourceID)
+	out := s.fetchShared(ctx, p, eps, t)
 	entry.Source = out.source
 	entry.Shared = !out.leader
 	if out.leader {
@@ -201,15 +224,15 @@ type fetchOutcome struct {
 // 内部用 context.WithoutCancel：首个调用者断开连接不应让其余等待者一起失败；
 // 上游的钱一旦花出去，结果也该留进缓存。时长由各来源自己的超时兜住
 // （接口的 timeout_ms、内置实现的 http.Client Timeout），不会留下永不返回的调用。
-func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoint, uri, resourceID string) fetchOutcome {
+func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoint, t Target) fetchOutcome {
 	// singleflight 只在发起者自己的 goroutine 里执行闭包，等待者的闭包从不运行，
 	// 所以这个局部变量只会被发起者置真，无需同步。
 	leader := false
-	v, _, _ := s.flight.Do(p.Provider()+"\x00"+resourceID, func() (any, error) {
+	v, _, _ := s.flight.Do(p.Provider()+"\x00"+t.ResourceID, func() (any, error) {
 		leader = true
 		fctx := context.WithoutCancel(ctx)
 
-		res, source, attempts, err := s.runChain(fctx, p, eps, uri, resourceID)
+		res, source, attempts, err := s.runChain(fctx, p, eps, t)
 		if err != nil {
 			return fetchOutcome{attempts: attempts, err: err}, nil
 		}
@@ -230,7 +253,7 @@ func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoi
 			SourceData:  res.SourceData,
 			Assets:      res.Assets,
 		}
-		if err := s.cache.Put(fctx, p.Provider(), resourceID, res.Version, snip); err != nil {
+		if err := s.cache.Put(fctx, p.Provider(), t.ResourceID, res.Version, snip, res.CacheTTL); err != nil {
 			// 缓存失败不影响返回结果
 			slog.Warn("parse_cache 写入失败", "err", err)
 		}
@@ -251,7 +274,7 @@ var (
 //
 // 每一步都记成一次 Attempt，包括被跳过的 —— 「为什么没走到那个接口」在排查时
 // 和「那个接口为什么失败」一样重要。
-func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint, uri, resourceID string) (*ParseResult, string, []Attempt, error) {
+func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint, t Target) (*ParseResult, string, []Attempt, error) {
 	var attempts []Attempt
 	add := func(a Attempt) {
 		a.Seq = len(attempts) + 1
@@ -261,7 +284,7 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 	if b, ok := p.(BuiltinParser); ok {
 		source := "builtin:" + p.Provider()
 		t0 := time.Now()
-		res, err := b.Parse(ctx, uri, resourceID)
+		res, err := b.Parse(ctx, t.Resolved, t.ResourceID)
 		a := Attempt{Source: source, LatencyMs: int(time.Since(t0).Milliseconds())}
 		switch {
 		case err != nil:
@@ -291,13 +314,18 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 			add(a)
 			continue
 		}
+		if ad.Accept != nil && !ad.Accept(t) {
+			a.Outcome, a.ErrorKind, a.Error = AttemptSkipped, extapi.KindNotApplicable, "这条链接不适用此接口"
+			add(a)
+			continue
+		}
 		if ep.UnitPriceMicros > 0 && ep.BalanceMicros <= 0 {
 			a.Outcome, a.ErrorKind, a.Error = AttemptSkipped, extapi.KindNoBalance, "账户余额已用完"
 			add(a)
 			continue
 		}
 
-		call := s.extapi.Call(ctx, ep, ad.Request(uri, resourceID), resourceID)
+		call := s.extapi.Call(ctx, ep, ad.Request(t), t.ResourceID)
 		spent[ep.AccountID] += call.CostMicros
 		a.HTTPStatus, a.LatencyMs, a.CostMicros = call.HTTPStatus, call.LatencyMs, call.CostMicros
 		if call.CostMicros > 0 {
@@ -309,8 +337,12 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 			add(a)
 			continue
 		}
-		res, err := ad.Decode(call.Data, uri, resourceID)
+		res, err := ad.Decode(call.Data, t)
 		switch {
+		case errors.Is(err, errGone):
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindGone, err.Error()
+			add(a)
+			return nil, "", attempts, errGone
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
 		case !usable(res):

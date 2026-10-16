@@ -155,6 +155,14 @@ func TestCallOversizedResponse(t *testing.T) {
 	}
 }
 
+// TikHub 失败时把说明包在 detail 对象里（实测形态，节选）。
+func TestErrorMessageTikHubDetailObject(t *testing.T) {
+	body := `{"detail":{"code":400,"request_id":"d11232f8","message":"Request failed.","message_zh":"请求失败，请重试。本次请求不会被扣费。","router":"/api/v1/twitter/web/fetch_tweet_detail"}}`
+	if got := errorMessage([]byte(body)); got != "请求失败，请重试。本次请求不会被扣费。（request_id d11232f8）" {
+		t.Errorf("得到 %q", got)
+	}
+}
+
 func TestErrorMessagePrefersDetail(t *testing.T) {
 	if got := errorMessage([]byte(`{"detail":"Token expired","message":"x"}`)); got != "Token expired" {
 		t.Errorf("得到 %q", got)

@@ -18,7 +18,7 @@ var ytIDPattern = regexp.MustCompile(
 	`(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})`,
 )
 
-func (p *YouTubeProvider) Provider() string    { return "youtube" }
+func (p *YouTubeProvider) Provider() string    { return PlatformYouTube }
 func (p *YouTubeProvider) SnippetType() string { return "special" }
 
 // MatchPatterns 导出与 Match 完全同一份正则（.String() 取源串），进 manifest 给客户端本地判断。

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 var (
@@ -103,6 +104,13 @@ type ParseResult struct {
 	// 「上游根本没告诉我」挤进同一个值，于是一份新鲜度未知的内容会被当成已确认
 	// 是当前版本存下来。拿不到就留空，让它老老实实走 TTL。
 	Version string `json:"version,omitempty"`
+
+	// CacheTTL 非零时，缓存最多保留这么久（短于全局保留期才生效）。
+	//
+	// 抖音、TikTok、Instagram、微博视频这类平台的媒体地址带签名、几小时到几天就过期。
+	// 缓存照常保留 30 天的话，过期后的命中只剩文字 —— 用户付了同样的钱却拿不到图和视频。
+	// 由来源按实际的过期时间填（见 assetsExpireIn）。
+	CacheTTL time.Duration `json:"-"`
 }
 
 // ParsedSnippet 是解析产物的**原始/中间形态**，不是可直接入库的成品碎片。

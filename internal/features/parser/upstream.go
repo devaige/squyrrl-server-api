@@ -20,10 +20,23 @@ type Adapter struct {
 	Vendor   string // extapi.VendorTikHub / extapi.VendorRapidAPI，须与接口所属账户一致
 	Note     string // 后台展示用：这个接口取的是什么
 
-	Request func(uri, resourceID string) extapi.Request
+	// Accept 可选：返回 false 表示这条链接不该交给这个接口（不发请求、不花钱，记为跳过）。
+	// 例：小红书的视频笔记接口拿图文笔记 ID 会返回**别的**视频笔记，只接链接里标明
+	// type=video 的。nil 表示什么都接。
+	Accept func(t Target) bool
+
+	Request func(t Target) extapi.Request
 	// Decode 收到的是去掉上游外壳后的数据。返回的结果若没有标题也没有正文，
 	// 视同失败、继续试下一个来源（这次调用的钱已经花了）。
-	Decode func(data []byte, uri, resourceID string) (*ParseResult, error)
+	// 上游可能返回别的作品（推荐流、ID 映射错），能核对作品 ID 的必须核对。
+	Decode func(data []byte, t Target) (*ParseResult, error)
+}
+
+// Target 是一次解析的对象。
+type Target struct {
+	URI        string // 用户提交的原始链接，可能是分享短链；「按分享链接取」的接口用它
+	Resolved   string // 跟完短链跳转后的作品链接；本来就不是短链时与 URI 相同
+	ResourceID string // 平台内的作品 ID，也是缓存键
 }
 
 // AdapterSet 是按 slug 索引的适配器目录，实现 extapi.Catalog 供后台建接口时校验。
@@ -65,10 +78,7 @@ func (s AdapterSet) callable(ep extapi.Endpoint) (Adapter, bool) {
 	return a, true
 }
 
-// DefaultAdapters 是生产环境注册的全部适配器。
-//
-// 目前为空：TikHub 各平台要接哪些接口还在逐个确认，每个适配器都要先拿真实响应
-// 存进 api_samples 核对字段，再写转换。空目录下所有平台只走内置免费来源。
+// DefaultAdapters 是生产环境注册的全部适配器。新增上游时把它的目录并进来。
 func DefaultAdapters() AdapterSet {
-	return AdapterSet{}
+	return TikHubAdapters()
 }

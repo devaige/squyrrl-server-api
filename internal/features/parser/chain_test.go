@@ -76,8 +76,8 @@ func testAdapter(provider, url string) Adapter {
 	return Adapter{
 		Provider: provider,
 		Vendor:   extapi.VendorTikHub,
-		Request:  func(uri, id string) extapi.Request { return extapi.Request{URL: url} },
-		Decode: func(data []byte, uri, id string) (*ParseResult, error) {
+		Request:  func(Target) extapi.Request { return extapi.Request{URL: url} },
+		Decode: func(data []byte, _ Target) (*ParseResult, error) {
 			var d struct {
 				Desc string `json:"desc"`
 			}
@@ -450,5 +450,87 @@ func TestChainSharedRequestsCountCostOnce(t *testing.T) {
 	if leaders != 1 || cost != 1_000 || revenue != n*20 {
 		t.Errorf("应只有 1 个发起者承担 1000 成本、%d 个请求各收 20：leaders=%d cost=%d revenue=%d",
 			n, leaders, cost, revenue)
+	}
+}
+
+// fakeResolver 把短链按表换成作品链接，不走网络。
+type fakeResolver map[string]string
+
+func (f fakeResolver) Resolve(_ context.Context, uri string, done func(string) bool) (string, error) {
+	if to, ok := f[uri]; ok && done(to) {
+		return to, nil
+	}
+	return "", errShortLink
+}
+
+// 短链 → 跟跳转 → 按作品 ID 解析；不适用的接口被跳过、不花钱。
+// 短链解析失败不扣费，记一笔失败。用测试专属平台，不碰库里真实平台的种子接口。
+func TestShortLinkResolvesBeforeParsing(t *testing.T) {
+	srv, hits := fakeTikHub(t)
+	plat := &platform{id: uniqueProvider("short"),
+		canonical: res(`notes\.test/item/([0-9a-f]{24})`),
+		short:     res(`(?:^|//)s\.notes\.test/[a-z]+`)}
+
+	video := testAdapter(plat.id, srv.URL+"/ok")
+	video.Accept = xhsIsVideo
+	adapters := AdapterSet{"t_short_video": video, "t_short_image": testAdapter(plat.id, srv.URL+"/ok")}
+	env := newChainEnv(t, plat, adapters, 1_000_000)
+	env.addEndpoint(t, "t_short_video", 10_000)
+	env.addEndpoint(t, "t_short_image", 10_000)
+	svc := NewService(Deps{
+		Registry: env.reg, Cache: env.cache, Wallet: env.wallet, Extapi: env.extapi, Adapters: adapters,
+		Logs: NewLogRepo(env.pool), DefaultPrice: 10,
+		Resolver: fakeResolver{"https://s.notes.test/abc": "https://notes.test/item/697c0eee000000000a03c308?type=normal"},
+	})
+	uid := env.user(t, 1_000)
+	ctx := context.Background()
+
+	res, err := svc.Parse(ctx, uid, ParseInput{URI: "https://s.notes.test/abc"})
+	if err != nil {
+		t.Fatalf("短链解析失败: %v", err)
+	}
+	if res.ResourceID != "697c0eee000000000a03c308" || res.CreditsCharged != 200 {
+		t.Errorf("应按作品 ID 解析并收 200：%+v", res)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("type=normal 时视频接口应被跳过，只调一次上游，实调 %d", hits.Load())
+	}
+	log := env.lastLog(t)
+	if a := log.Attempts[0]; a.Outcome != AttemptSkipped || a.Source != "t_short_video" || a.CostMicros != 0 {
+		t.Errorf("视频接口应记为跳过且不花钱: %+v", a)
+	}
+
+	before := env.balance(t, uid)
+	if _, err := svc.Parse(ctx, uid, ParseInput{URI: "https://s.notes.test/dead"}); !errors.Is(err, ErrParseFailed) {
+		t.Fatalf("短链解析失败应返回通用失败，得到 %v", err)
+	}
+	if env.balance(t, uid) != before {
+		t.Error("短链解析失败不应扣费")
+	}
+	if log := env.lastLog(t); log.Status != LogFailed || !strings.Contains(log.Error, "短链") {
+		t.Errorf("应记一笔短链失败: %+v", log)
+	}
+}
+
+// 上游确认作品已删除：兜底链就此停下，不再花钱问下一个接口；用户不扣费。
+func TestChainStopsWhenGone(t *testing.T) {
+	srv, hits := fakeTikHub(t)
+	cp := &chainParser{provider: uniqueProvider("gone")}
+	gone := testAdapter(cp.provider, srv.URL+"/ok")
+	gone.Decode = func([]byte, Target) (*ParseResult, error) { return nil, errGone }
+	env := newChainEnv(t, cp, AdapterSet{"t_gone": gone, "t_next": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
+	env.addEndpoint(t, "t_gone", 1_000)
+	env.addEndpoint(t, "t_next", 2_000)
+	uid := env.user(t, 100)
+
+	if _, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/x"}); !errors.Is(err, ErrParseFailed) {
+		t.Fatalf("应返回通用失败，得到 %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("确认已删除后不应再调下一个接口，实调 %d 次", hits.Load())
+	}
+	log := env.lastLog(t)
+	if len(log.Attempts) != 1 || log.Attempts[0].ErrorKind != extapi.KindGone || env.balance(t, uid) != 100 {
+		t.Errorf("应只有一次 gone 尝试且不扣费: %+v", log)
 	}
 }

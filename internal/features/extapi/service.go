@@ -20,9 +20,12 @@ import (
 // 异常响应拖垮内存。超出视为坏响应（已计费）。
 const maxRespBytes = 4 << 20
 
-// defaultTimeout 是单次上游调用的默认超时。第三方数据接口普遍比官方 API 慢，
-// 8 秒在 TikHub 这类上游上会误杀正常请求；config.timeout_ms 可按接口覆盖。
-const defaultTimeout = 15 * time.Second
+// defaultTimeout 是单次上游调用的默认超时；config.timeout_ms 可按接口覆盖。
+//
+// 宁长勿短：实测（2026-10-16）同一个 TikHub 接口这次 2 秒、下次 15 秒以上。
+// 而我们这边放弃等待并不会让上游停手 —— 它多半照样处理完、照样扣费，
+// 结果却被丢掉，兜底链还要再花一次钱去试下一个。
+const defaultTimeout = 30 * time.Second
 
 type Service struct {
 	repo    *Repo
@@ -112,7 +115,7 @@ func (s *Service) Call(ctx context.Context, ep Endpoint, req Request, resourceID
 	if err != nil {
 		res.LatencyMs = int(time.Since(start).Milliseconds())
 		if errors.Is(err, context.DeadlineExceeded) {
-			res.Err = &CallError{Kind: KindTimeout, Msg: fmt.Sprintf("超过 %s 未响应", timeout)}
+			res.Err = &CallError{Kind: KindTimeout, Msg: fmt.Sprintf("超过 %s 未响应（上游可能仍会计费，对账时留意）", timeout)}
 		} else {
 			res.Err = &CallError{Kind: KindNetwork, Msg: err.Error()}
 		}
