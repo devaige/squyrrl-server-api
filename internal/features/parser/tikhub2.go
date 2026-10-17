@@ -745,13 +745,7 @@ func decodeToutiaoArticle(data []byte, t Target) (*post, error) {
 type toutiaoPlayInfo struct {
 	Duration float64 `json:"video_duration"` // 秒
 	Poster   string  `json:"poster_url"`
-	best     toutiaoStream
-}
-
-type toutiaoStream struct {
-	URL     string
-	W, H    int
-	Bitrate int64
+	best     streamPick
 }
 
 func (pi *toutiaoPlayInfo) UnmarshalJSON(b []byte) error {
@@ -769,14 +763,16 @@ func (pi *toutiaoPlayInfo) UnmarshalJSON(b []byte) error {
 	}
 	pi.Duration, pi.Poster = raw.Duration, raw.Poster
 	type item struct {
-		MainURL string  `json:"main_url"`
-		VWidth  flexInt `json:"vwidth"`
-		VHeight flexInt `json:"vheight"`
-		Bitrate flexInt `json:"bitrate"`
-		Meta    *struct {
-			VWidth  flexInt `json:"vwidth"`
-			VHeight flexInt `json:"vheight"`
-			Bitrate flexInt `json:"bitrate"`
+		MainURL   string  `json:"main_url"`
+		VWidth    flexInt `json:"vwidth"`
+		VHeight   flexInt `json:"vheight"`
+		Bitrate   flexInt `json:"bitrate"`
+		CodecType string  `json:"codec_type"` // 网页版：h264 / bytevc1 / …
+		Meta      *struct {
+			VWidth    flexInt `json:"vwidth"`
+			VHeight   flexInt `json:"vheight"`
+			Bitrate   flexInt `json:"bitrate"`
+			CodecType string  `json:"codec_type"`
 		} `json:"video_meta"`
 	}
 	var items []item
@@ -796,12 +792,12 @@ func (pi *toutiaoPlayInfo) UnmarshalJSON(b []byte) error {
 			}
 			u = string(dec)
 		}
-		w, h, rate := int(it.VWidth), int(it.VHeight), int64(it.Bitrate)
+		w, h, rate, codec := int(it.VWidth), int(it.VHeight), int64(it.Bitrate), it.CodecType
 		if it.Meta != nil {
-			w, h, rate = int(it.Meta.VWidth), int(it.Meta.VHeight), int64(it.Meta.Bitrate)
+			w, h, rate, codec = int(it.Meta.VWidth), int(it.Meta.VHeight), int64(it.Meta.Bitrate), it.Meta.CodecType
 		}
-		if strings.HasPrefix(u, "http") && better(w, h, rate, pi.best.W, pi.best.H, pi.best.Bitrate) {
-			pi.best = toutiaoStream{URL: u, W: w, H: h, Bitrate: rate}
+		if strings.HasPrefix(u, "http") {
+			pi.best.offer(u, w, h, rate, codec)
 		}
 	}
 	return nil
@@ -921,25 +917,29 @@ type toutiaoShortClip struct {
 		PlayURLList []string `json:"play_url_list"`
 		Definition  string   `json:"definition"` // 1080p / 720p / …
 		Bitrate     flexInt  `json:"bitrate"`
+		CodecType   string   `json:"codec_type"` // bytevc1 / …
 	} `json:"play_addr_list"`
 }
 
-// best 按清晰度名取最高档，尺寸按 play_addr 那一档的比例换算（720×1280 的 1080p 是 1080×1920）。
+// best 先看编码档（codecRank），同档按清晰度名取最高档；尺寸按 play_addr 那一档的比例换算
+// （720×1280 的 1080p 是 1080×1920）。
 func (c *toutiaoShortClip) best() *postVideo {
 	if c == nil {
 		return nil
 	}
 	short := min(c.Width, c.Height)
 	var v *postVideo
-	var bestDef int
+	var bestDef, bestRank int
 	var bestRate int64
 	for _, a := range c.PlayAddrList {
 		u, ok := first(a.PlayURLList)
 		def, _ := strconv.Atoi(strings.TrimSuffix(a.Definition, "p"))
-		if !ok || u == "" || (v != nil && (def < bestDef || def == bestDef && int64(a.Bitrate) <= bestRate)) {
+		rank := codecRank(a.CodecType)
+		if !ok || u == "" || (v != nil && (rank > bestRank ||
+			rank == bestRank && (def < bestDef || def == bestDef && int64(a.Bitrate) <= bestRate))) {
 			continue
 		}
-		bestDef, bestRate = def, int64(a.Bitrate)
+		bestDef, bestRate, bestRank = def, int64(a.Bitrate), rank
 		v = &postVideo{URL: u, DurationMs: int64(c.Duration * 1000)}
 		if short > 0 && def > 0 {
 			v.Width, v.Height = c.Width*def/short, c.Height*def/short
@@ -1039,7 +1039,7 @@ func isHEIC(u string) bool {
 
 // lemon8VideoModel 是 video.video_model：一段 JSON 字符串，video_list 每档的清晰度在 video_meta 里。
 type lemon8VideoModel struct {
-	best toutiaoStream
+	best streamPick
 }
 
 func (m *lemon8VideoModel) UnmarshalJSON(b []byte) error {
@@ -1051,17 +1051,17 @@ func (m *lemon8VideoModel) UnmarshalJSON(b []byte) error {
 		VideoList []struct {
 			MainURL string `json:"main_url"`
 			Meta    struct {
-				VWidth  flexInt `json:"vwidth"`
-				VHeight flexInt `json:"vheight"`
-				Bitrate flexInt `json:"bitrate"`
+				VWidth    flexInt `json:"vwidth"`
+				VHeight   flexInt `json:"vheight"`
+				Bitrate   flexInt `json:"bitrate"`
+				CodecType string  `json:"codec_type"` // h264 / h265 / …
 			} `json:"video_meta"`
 		} `json:"video_list"`
 	}
 	_ = json.Unmarshal([]byte(s), &raw)
 	for _, it := range raw.VideoList {
-		w, h, rate := int(it.Meta.VWidth), int(it.Meta.VHeight), int64(it.Meta.Bitrate)
-		if strings.HasPrefix(it.MainURL, "http") && better(w, h, rate, m.best.W, m.best.H, m.best.Bitrate) {
-			m.best = toutiaoStream{URL: it.MainURL, W: w, H: h, Bitrate: rate}
+		if strings.HasPrefix(it.MainURL, "http") {
+			m.best.offer(it.MainURL, int(it.Meta.VWidth), int(it.Meta.VHeight), int64(it.Meta.Bitrate), it.Meta.CodecType)
 		}
 	}
 	return nil
@@ -1143,9 +1143,10 @@ func decodeLemon8(data []byte, t Target) (*post, error) {
 // ======================== 皮皮虾 ========================
 
 type ppxURLs struct {
-	Width   int `json:"width"`
-	Height  int `json:"height"`
-	URLList []struct {
+	Width     int      `json:"width"`
+	Height    int      `json:"height"`
+	CodecType *flexInt `json:"codec_type"` // 取值同抖音的 is_bytevc1，见 bytevcCodec
+	URLList   []struct {
 		URL string `json:"url"`
 	} `json:"url_list"`
 }
@@ -1222,11 +1223,20 @@ func decodePipixia(data []byte, t Target) (*post, error) {
 	if v := it.Video; v != nil {
 		cands = append(cands, v.VideoDownload, v.VideoHigh, v.VideoMid, v.VideoLow)
 	}
+	// 同分辨率时先出现的胜（offer 只在严格更好时替换），原片排在最前
+	var pick streamPick
 	for _, c := range cands {
-		// 同分辨率时先出现的胜（better 只在严格更好时替换），原片排在最前
-		if u := c.first(); u != "" && (p.Video == nil || better(c.Width, c.Height, 0, p.Video.Width, p.Video.Height, 0)) {
-			p.Video = &postVideo{URL: u, Width: c.Width, Height: c.Height, DurationMs: int64(it.Duration * 1000)}
+		if c == nil {
+			continue
 		}
+		codec := ""
+		if c.CodecType != nil {
+			codec = bytevcCodec(int(*c.CodecType))
+		}
+		pick.offer(c.first(), c.Width, c.Height, 0, codec)
+	}
+	if pick.URL != "" {
+		p.Video = &postVideo{URL: pick.URL, Width: pick.W, Height: pick.H, DurationMs: int64(it.Duration * 1000)}
 	}
 	return p, nil
 }

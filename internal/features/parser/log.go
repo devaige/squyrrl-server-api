@@ -44,6 +44,12 @@ type LogEntry struct {
 	LatencyMs      int       `json:"latency_ms"`
 	CreatedAt      time.Time `json:"created_at"`
 	Attempts       []Attempt `json:"attempts"`
+
+	// 命中缓存的记录自己没有调用上游，内容来自之前某次真正取到内容的调用。只在 List 里填，
+	// 见那里的查询说明。
+	CacheSourceID *uuid.UUID `json:"cache_source_id,omitempty"`
+	CacheSourceAt *time.Time `json:"cache_source_at,omitempty"`
+	CacheSampleID *uuid.UUID `json:"cache_sample_id,omitempty"` // 那次调用的线上采样，已过保留期则为空
 }
 
 // Attempt 是兜底链上的一次尝试（含被跳过的）。
@@ -120,20 +126,39 @@ type LogFilter struct {
 }
 
 // List 按时间倒序返回记录，连同各自的尝试。
+//
+// 命中缓存的记录另外带上缓存来源：同一资源在它之前最近一次真正取到内容的调用
+// （非缓存、非合并、有产出来源；结算失败的 unpaid 也算 —— 那次的内容照样进了缓存）。
+// 缓存只由这类调用写入，所以「之前最近的一次」就是它读到的那份；不另存来源 ID，
+// 省一次迁移，也不用改写入路径。
 func (r *LogRepo) List(ctx context.Context, f LogFilter) ([]LogEntry, error) {
 	if f.Limit <= 0 || f.Limit > 200 {
 		f.Limit = 50
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, provider, resource_id, status, cached, shared, forced,
-		       credits_charged, cost_micros, source, error, latency_ms, created_at
+		SELECT l.id, l.provider, l.resource_id, l.status, l.cached, l.shared, l.forced,
+		       l.credits_charged, l.cost_micros, l.source, l.error, l.latency_ms, l.created_at,
+		       src.id, src.created_at, src.sample_id
 		FROM parse_logs l
-		WHERE ($1 = '' OR provider = $1)
-		  AND ($2 = '' OR status = $2)
-		  AND ($3 = '' OR source = $3 OR EXISTS (
+		LEFT JOIN LATERAL (
+		    SELECT o.id, o.created_at,
+		           (SELECT a.sample_id FROM parse_attempts a
+		            WHERE a.log_id = o.id AND a.outcome = 'ok'
+		            ORDER BY a.seq DESC LIMIT 1) AS sample_id
+		    FROM parse_logs o
+		    WHERE l.cached
+		      AND o.provider = l.provider AND o.resource_id = l.resource_id
+		      AND NOT o.cached AND NOT o.shared AND o.source <> ''
+		      AND o.created_at < l.created_at
+		    ORDER BY o.created_at DESC
+		    LIMIT 1
+		) src ON true
+		WHERE ($1 = '' OR l.provider = $1)
+		  AND ($2 = '' OR l.status = $2)
+		  AND ($3 = '' OR l.source = $3 OR EXISTS (
 		        SELECT 1 FROM parse_attempts a WHERE a.log_id = l.id AND a.source = $3))
-		  AND ($4::timestamptz IS NULL OR (created_at, id) < ($4, $5::uuid))
-		ORDER BY created_at DESC, id DESC
+		  AND ($4::timestamptz IS NULL OR (l.created_at, l.id) < ($4, $5::uuid))
+		ORDER BY l.created_at DESC, l.id DESC
 		LIMIT $6`,
 		f.Provider, f.Status, f.Source, f.Before, f.BeforeID, f.Limit)
 	if err != nil {
@@ -147,7 +172,8 @@ func (r *LogRepo) List(ctx context.Context, f LogFilter) ([]LogEntry, error) {
 	for rows.Next() {
 		var e LogEntry
 		if err := rows.Scan(&e.ID, &e.Provider, &e.ResourceID, &e.Status, &e.Cached, &e.Shared, &e.Forced,
-			&e.CreditsCharged, &e.CostMicros, &e.Source, &e.Error, &e.LatencyMs, &e.CreatedAt); err != nil {
+			&e.CreditsCharged, &e.CostMicros, &e.Source, &e.Error, &e.LatencyMs, &e.CreatedAt,
+			&e.CacheSourceID, &e.CacheSourceAt, &e.CacheSampleID); err != nil {
 			return nil, err
 		}
 		e.RevenueMicros = e.CreditsCharged * pricing.MicrosPerCredit

@@ -29,6 +29,13 @@ func TestStructureDiff(t *testing.T) {
 	if !slices.Equal(changed.Added, []string{"content", "user"}) {
 		t.Errorf("新增应只列最浅一层，得到 %v", changed.Added)
 	}
+	// 计数与列表同口径：user.name 跟着 user 走，不另算一处
+	if changed.MissingCount != 2 || changed.AddedCount != 2 {
+		t.Errorf("计数应按分支，得到 缺失 %d / 新增 %d", changed.MissingCount, changed.AddedCount)
+	}
+	if d := diffAgainst(archived(`{"id":"4","content":"c","user":{"name":"m"},"media":{}}`), baselines, nil, false); d.AddedCount != 2 || d.Added != nil {
+		t.Errorf("不要列表时计数照旧、不带列表: %+v", d)
+	}
 
 	if d := diffAgainst(photo, nil, nil, true); d.Baseline != 0 || d.MissingCount != 0 {
 		t.Errorf("没有示例时无从比较: %+v", d)

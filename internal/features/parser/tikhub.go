@@ -317,6 +317,7 @@ type urlList struct {
 	URLList []string `json:"url_list"`
 	Width   int      `json:"width"`
 	Height  int      `json:"height"`
+	URLKey  string   `json:"url_key"` // 视频档才有，带编码与码率，见 parseURLKey
 }
 
 type aweme struct {
@@ -334,9 +335,13 @@ type aweme struct {
 	Video struct {
 		Cover    urlList `json:"cover"`
 		PlayAddr urlList `json:"play_addr"` // 默认档，常常不是最清晰的（App 给 720p，同一作品 bit_rate 里有 1080p / 4K）
-		BitRate  []struct {
-			BitRate  int64   `json:"bit_rate"`
-			PlayAddr urlList `json:"play_addr"`
+		// 抖音另给的单一编码档：bit_rate 只有 ByteVC2 时，能放的高清档在 play_addr_265 里（实测）
+		PlayAddrH264 urlList `json:"play_addr_h264"`
+		PlayAddr265  urlList `json:"play_addr_265"`
+		BitRate      []struct {
+			BitRate   int64    `json:"bit_rate"`
+			IsBytevc1 *flexInt `json:"is_bytevc1"` // 编码：0 h264 / 1 ByteVC1 / 2 ByteVC2，url_key 认不出时用
+			PlayAddr  urlList  `json:"play_addr"`
 		} `json:"bit_rate"`
 		Duration int64 `json:"duration"` // 毫秒
 		Width    int   `json:"width"`
@@ -394,21 +399,26 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		}
 	}
 	if len(p.Images) == 0 {
-		v := &postVideo{URL: firstURL(a.Video.PlayAddr.URLList), DurationMs: a.Video.Duration,
-			Width: a.Video.PlayAddr.Width, Height: a.Video.PlayAddr.Height}
-		if v.Width == 0 {
-			v.Width, v.Height = a.Video.Width, a.Video.Height
+		// 默认档、单一编码档与 bit_rate 各档一起比：编码能放的优先，同档取分辨率最高、码率高的
+		var pick streamPick
+		for _, pa := range []urlList{a.Video.PlayAddr, a.Video.PlayAddrH264, a.Video.PlayAddr265} {
+			w, h := pa.Width, pa.Height
+			if w == 0 {
+				w, h = a.Video.Width, a.Video.Height
+			}
+			codec, rate := parseURLKey(pa.URLKey)
+			pick.offer(firstURL(pa.URLList), w, h, rate, codec)
 		}
-		// 多档码率里取分辨率最高的，同分辨率取码率高的
-		var bestRate int64
 		for _, b := range a.Video.BitRate {
-			u := firstURL(b.PlayAddr.URLList)
-			if u == "" {
-				continue
+			codec, _ := parseURLKey(b.PlayAddr.URLKey)
+			if codec == "" && b.IsBytevc1 != nil {
+				codec = bytevcCodec(int(*b.IsBytevc1))
 			}
-			if better(b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate, v.Width, v.Height, bestRate) {
-				v.URL, v.Width, v.Height, bestRate = u, b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate
-			}
+			pick.offer(firstURL(b.PlayAddr.URLList), b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate, codec)
+		}
+		v := &postVideo{URL: pick.URL, DurationMs: a.Video.Duration, Width: pick.W, Height: pick.H}
+		if v.URL == "" {
+			v.Width, v.Height = a.Video.Width, a.Video.Height
 		}
 		p.Video = v
 	}
@@ -421,6 +431,80 @@ func better(w, h int, rate int64, bestW, bestH int, bestRate int64) bool {
 		return px > bestPx
 	}
 	return rate > bestRate
+}
+
+// 编码分档：先看编码能不能播，同档再比清晰度（用户决定 2026-10-17）。
+//
+// 存下来的视频要在客户端放（video_player：Android / iOS / macOS / 鸿蒙）。h264 与 HEVC
+// （含字节的 ByteVC1）都能硬解，同档只比清晰度 —— 同画质 HEVC 体积约为一半，大陆慢链路上
+// 差别很大；AV1 老 iPhone 解不了，没别的才用；字节自研的 ByteVC2 和 H.266/VVC 几乎没有
+// 播放器支持，最后才轮到。实测抖音一条视频的 bit_rate 只给了 ByteVC2 的几档，按清晰度
+// 取出来的那档存下来打不开，而 play_addr_265 里就有能放的 720p HEVC。
+//
+// 认不出的编码按可播放算：多数平台根本不给编码信息，它们的选档行为保持不变。
+const (
+	codecPlayable   = iota // h264、HEVC、认不出的
+	codecAV1               // 能放的设备有限
+	codecUnplayable        // ByteVC2、H.266/VVC
+)
+
+func codecRank(codec string) int {
+	c := strings.ToLower(codec)
+	switch {
+	case strings.Contains(c, "bytevc2"), strings.Contains(c, "h266"), strings.Contains(c, "vvc"), strings.HasPrefix(c, "vvi1"):
+		return codecUnplayable
+	case strings.Contains(c, "av1"), strings.HasPrefix(c, "av01"):
+		return codecAV1
+	}
+	return codecPlayable
+}
+
+// bytevcCodec 把字节系接口的数字编码标记（抖音 / TikTok 的 is_bytevc1、皮皮虾的 codec_type）
+// 换成编码名：0 = h264，1 = ByteVC1（HEVC），2 = ByteVC2。皮皮虾同一档的 video_model 里
+// 写着 codec_type=bytevc1、外层是 1，与抖音的取值一致。
+func bytevcCodec(n int) string {
+	switch n {
+	case 0:
+		return "h264"
+	case 1:
+		return "bytevc1"
+	case 2:
+		return "bytevc2"
+	}
+	return ""
+}
+
+// parseURLKey 从抖音 / TikTok 的 url_key（vid_编码_清晰度_码率，如 …_h264_540p_945629）
+// 取编码与码率。play_addr 没有单独的码率字段，只能从这里拿；格式对不上时返回零值。
+func parseURLKey(key string) (codec string, rate int64) {
+	parts := strings.Split(key, "_")
+	if len(parts) < 4 {
+		return "", 0
+	}
+	rate, _ = strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	return parts[len(parts)-3], rate
+}
+
+// streamPick 在多路码流里挑一路：编码档低的胜，同档按 better 比清晰度（严格更好才换，
+// 所以并列时先送进来的留下）。
+type streamPick struct {
+	URL  string
+	W, H int
+	Rate int64
+	rank int
+}
+
+// offer 送进一路候选，换上了返回 true；url 为空的忽略。
+func (p *streamPick) offer(url string, w, h int, rate int64, codec string) bool {
+	if url == "" {
+		return false
+	}
+	r := codecRank(codec)
+	if p.URL != "" && (r > p.rank || r == p.rank && !better(w, h, rate, p.W, p.H, p.Rate)) {
+		return false
+	}
+	*p = streamPick{URL: url, W: w, H: h, Rate: rate, rank: r}
+	return true
 }
 
 func decodeAwemeTikTok(data []byte, t Target) (*post, error) {
@@ -464,12 +548,14 @@ type tiktokWebItem struct {
 	Video struct {
 		Cover       string `json:"cover"`
 		PlayAddr    string `json:"playAddr"`
-		Duration    int64  `json:"duration"` // 秒
+		CodecType   string `json:"codecType"` // playAddr 那一档的编码
+		Duration    int64  `json:"duration"`  // 秒
 		Width       int    `json:"width"`
 		Height      int    `json:"height"`
 		BitrateInfo []struct {
-			Bitrate  int64 `json:"Bitrate"`
-			PlayAddr struct {
+			Bitrate   int64  `json:"Bitrate"`
+			CodecType string `json:"CodecType"` // h264 / h265_hvc1 / …
+			PlayAddr  struct {
 				URLList []string `json:"UrlList"`
 				Width   int      `json:"Width"`
 				Height  int      `json:"Height"`
@@ -529,13 +615,13 @@ func decodeTikTokWeb(withVideo bool) func([]byte, Target) (*post, error) {
 			p.Kind = "video"
 			v := &postVideo{DurationMs: it.Video.Duration * 1000, Width: it.Video.Width, Height: it.Video.Height}
 			if withVideo {
-				v.URL = it.Video.PlayAddr
-				var bestRate int64
+				var pick streamPick
+				pick.offer(it.Video.PlayAddr, it.Video.Width, it.Video.Height, 0, it.Video.CodecType)
 				for _, b := range it.Video.BitrateInfo {
-					if u := firstURL(b.PlayAddr.URLList); u != "" &&
-						better(b.PlayAddr.Width, b.PlayAddr.Height, b.Bitrate, v.Width, v.Height, bestRate) {
-						v.URL, v.Width, v.Height, bestRate = u, b.PlayAddr.Width, b.PlayAddr.Height, b.Bitrate
-					}
+					pick.offer(firstURL(b.PlayAddr.URLList), b.PlayAddr.Width, b.PlayAddr.Height, b.Bitrate, b.CodecType)
+				}
+				if pick.URL != "" {
+					v.URL, v.Width, v.Height = pick.URL, pick.W, pick.H
 				}
 			}
 			p.Video = v
@@ -652,18 +738,23 @@ func xhsPost(n xhsNote, t Target) (*post, error) {
 		p.Video = &postVideo{}
 		if v := n.VideoInfoV2; v != nil {
 			p.Video.DurationMs = v.Media.Video.Duration * 1000
-			// 所有编码（h264 / h265 / av1……）里取分辨率最高的一路：同一笔记 h265 有 1080p 而 h264 只有 720p（实测）
-			var bestRate int64
-			for _, streams := range v.Media.Stream {
-				for _, st := range streams {
-					if st.MasterURL != "" && better(st.Width, st.Height, st.AvgBitrate, p.Video.Width, p.Video.Height, bestRate) {
-						p.Video.URL, p.Video.Width, p.Video.Height, bestRate = httpsURL(st.MasterURL), st.Width, st.Height, st.AvgBitrate
-						if st.Duration > 0 {
-							p.Video.DurationMs = st.Duration
-						}
+			// 各编码（键为 h264 / h265 / h266 / av1）按 codecRank 一起比：h264 与 h265 同档取分辨率
+			// 最高的一路（同一笔记 h265 有 1080p 而 h264 只有 720p，实测），h266 / av1 没别的才用。
+			// 键按字母序遍历，并列时的结果不随 map 顺序变。
+			codecs := make([]string, 0, len(v.Media.Stream))
+			for codec := range v.Media.Stream {
+				codecs = append(codecs, codec)
+			}
+			sort.Strings(codecs)
+			var pick streamPick
+			for _, codec := range codecs {
+				for _, st := range v.Media.Stream[codec] {
+					if pick.offer(httpsURL(st.MasterURL), st.Width, st.Height, st.AvgBitrate, codec) && st.Duration > 0 {
+						p.Video.DurationMs = st.Duration
 					}
 				}
 			}
+			p.Video.URL, p.Video.Width, p.Video.Height = pick.URL, pick.W, pick.H
 		}
 	} else {
 		p.Images = images
@@ -772,6 +863,7 @@ type weiboMedia struct {
 				Width   int     `json:"width"`
 				Height  int     `json:"height"`
 				Bitrate flexInt `json:"bitrate"`
+				Codecs  string  `json:"video_codecs"` // avc1.64001f / hvc1… / av01…
 			} `json:"play_info"`
 		} `json:"playback_list"`
 	} `json:"media_info"`
@@ -780,13 +872,13 @@ type weiboMedia struct {
 // video 取最清晰的一档：playback_list 里分辨率最高的 mp4（列表里还混着预览图，按 mime 过滤）；
 // 没有列表时按 720p → hd(480p) → sd 的顺序退。
 func (m weiboMedia) video() (url string, w, h int) {
-	var bestRate int64
+	var pick streamPick
 	for _, pb := range m.MediaInfo.PlaybackList {
-		pi := pb.PlayInfo
-		if pi.Mime == "video/mp4" && pi.URL != "" && better(pi.Width, pi.Height, int64(pi.Bitrate), w, h, bestRate) {
-			url, w, h, bestRate = pi.URL, pi.Width, pi.Height, int64(pi.Bitrate)
+		if pi := pb.PlayInfo; pi.Mime == "video/mp4" {
+			pick.offer(pi.URL, pi.Width, pi.Height, int64(pi.Bitrate), pi.Codecs)
 		}
 	}
+	url, w, h = pick.URL, pick.W, pick.H
 	if url == "" {
 		url = nonEmpty(m.MediaInfo.MP4720P, m.MediaInfo.MP4HDURL, m.MediaInfo.StreamURLHD, m.MediaInfo.MP4SDURL, m.MediaInfo.StreamURL)
 	}
@@ -1198,8 +1290,9 @@ type ksManifest struct {
 			Width      int    `json:"width"`
 			Height     int    `json:"height"`
 			AvgBitrate int64  `json:"avgBitrate"`
-			Mute       bool   `json:"mute"`   // 静音轨，不要
-			Hidden     bool   `json:"hidden"` // 客户端不展示的档
+			VideoCodec string `json:"videoCodec"` // avc / hevc；App 接口给的是编码器名，认不出按可播放算
+			Mute       bool   `json:"mute"`       // 静音轨，不要
+			Hidden     bool   `json:"hidden"`     // 客户端不展示的档
 		} `json:"representation"`
 	} `json:"adaptationSet"`
 }
@@ -1222,15 +1315,15 @@ func (m *ksManifest) best() (url string, w, h int) {
 	if m == nil {
 		return "", 0, 0
 	}
-	var bestRate int64
+	var pick streamPick
 	for _, a := range m.AdaptationSet {
 		for _, r := range a.Representation {
-			if r.URL != "" && !r.Mute && !r.Hidden && better(r.Width, r.Height, r.AvgBitrate, w, h, bestRate) {
-				url, w, h, bestRate = r.URL, r.Width, r.Height, r.AvgBitrate
+			if !r.Mute && !r.Hidden {
+				pick.offer(r.URL, r.Width, r.Height, r.AvgBitrate, r.VideoCodec)
 			}
 		}
 	}
-	return httpsURL(url), w, h
+	return httpsURL(pick.URL), pick.W, pick.H
 }
 
 func ksFirst(xs []ksURL) string {
