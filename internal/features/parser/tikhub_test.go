@@ -184,7 +184,8 @@ func TestVideoPicksHighestQuality(t *testing.T) {
 		{"tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""), 3840, 2160, "/3840x2160/"},
 		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_fetch_one_video", target("7448118827402972455", ""), 1920, 1080, ""},
 		{"tikhub_douyin_web_fetch_one_video", "douyin_web_fetch_one_video", target("7448118827402972455", ""), 3840, 2160, ""},
-		{"tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""), 720, 1280, ""},
+		// 最清晰的 720p 两档都是 ByteVC2，存下来放不了；h264 / ByteVC1 里默认档码率最高（url_key 里的 1020692）
+		{"tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""), 576, 1024, ""},
 		{"tikhub_tiktok_web_fetch_post_detail", "tiktok_web_fetch_post_detail", target("7350810998023949599", ""), 720, 1280, ""},
 		{"tikhub_xiaohongshu_app_v2_get_video_note_detail", "xiaohongshu_app_v2_get_video_note_detail", target("697c0eee000000000a03c308", ""), 1080, 1920, ""},
 		{"tikhub_weibo_web_v2_fetch_post_detail", "weibo_web_v2_fetch_post_detail", target("5092682368025584", ""), 720, 960, "label=mp4_720p"},
@@ -202,6 +203,66 @@ func TestVideoPicksHighestQuality(t *testing.T) {
 	_, video := decodeWith(t, "tikhub_twitter_web_fetch_tweet_detail", "twitter_video", target("2110919060557107441", ""))
 	if !strings.HasSuffix(photo.Images[0].URL, "?name=orig") || !strings.HasSuffix(video.Cover, "?name=orig") {
 		t.Errorf("X 图片应取原图: %s / %s", photo.Images[0].URL, video.Cover)
+	}
+}
+
+// 编码先于清晰度：ByteVC2 / H.266 存下来放不了，AV1 老 iPhone 解不了；h264 与 HEVC 同档比清晰度。
+func TestCodecRank(t *testing.T) {
+	for codec, want := range map[string]int{
+		"h264": codecPlayable, "avc": codecPlayable, "avc1.64001f": codecPlayable, "hevc": codecPlayable,
+		"h265": codecPlayable, "h265_hvc1": codecPlayable, "bytevc1": codecPlayable,
+		"": codecPlayable, "venus7-cape4-v1": codecPlayable, // 认不出的按可播放算
+		"av1": codecAV1, "av01.0.08M.08": codecAV1,
+		"bytevc2": codecUnplayable, "h266": codecUnplayable, "vvc1": codecUnplayable,
+	} {
+		if got := codecRank(codec); got != want {
+			t.Errorf("codecRank(%q) = %d，期望 %d", codec, got, want)
+		}
+	}
+	if c, r := parseURLKey("v0200fg10000db082lfog65if4e6gca0_bytevc1_720p_312106"); c != "bytevc1" || r != 312106 {
+		t.Errorf("url_key 解析: %q %d", c, r)
+	}
+	if c, r := parseURLKey("v0200fg10000db082lfog65if4e6gca0"); c != "" || r != 0 {
+		t.Errorf("格式不对应返回零值: %q %d", c, r)
+	}
+}
+
+// 实测（2026-10-17，抖音 7692290629665988800）：bit_rate 只给了 ByteVC2 的三档，按清晰度取出的
+// 720p 存下来打不开；能放的 720p 在 play_addr_265（HEVC），默认档 play_addr 是 540p h264。
+func TestAwemeSkipsByteVC2(t *testing.T) {
+	ad := TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"]
+	decode := func(video string) decodedPost {
+		t.Helper()
+		res, err := ad.Decode([]byte(`{"aweme_detail":{"aweme_id":"1","desc":"d","video":`+video+`}}`), target("1", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p decodedPost
+		if err := json.Unmarshal(res.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	bvc2 := `"bit_rate":[
+		{"bit_rate":251743,"is_bytevc1":2,"play_addr":{"url_list":["https://cdn/bvc2-540"],"width":576,"height":1024,"url_key":"v_bytevc2_540p_251743"}},
+		{"bit_rate":250331,"is_bytevc1":2,"play_addr":{"url_list":["https://cdn/bvc2-720"],"width":720,"height":1280,"url_key":"v_bytevc2_720p_250331"}}]`
+	h264 := `"play_addr":{"url_list":["https://cdn/h264-540"],"width":576,"height":1024,"url_key":"v_h264_540p_945629"}`
+	hevc := `"play_addr_265":{"url_list":["https://cdn/hevc-720"],"width":720,"height":1280,"url_key":"v_bytevc1_720p_312106"}`
+
+	if v := decode(`{"width":576,"height":1024,` + h264 + `,` + hevc + `,` + bvc2 + `}`).Video; v == nil || v.URL != "https://cdn/hevc-720" || v.Width != 720 {
+		t.Errorf("应取 play_addr_265 的 720p HEVC，得到 %+v", v)
+	}
+	if v := decode(`{"width":576,"height":1024,` + h264 + `,` + bvc2 + `}`).Video; v == nil || v.URL != "https://cdn/h264-540" {
+		t.Errorf("没有 HEVC 时应退到 540p h264，而不是 720p ByteVC2，得到 %+v", v)
+	}
+	// 只有 ByteVC2 也照给：有一份总比没有强
+	if v := decode(`{"width":576,"height":1024,` + bvc2 + `}`).Video; v == nil || v.URL != "https://cdn/bvc2-720" {
+		t.Errorf("只有 ByteVC2 时取其中最清晰的，得到 %+v", v)
+	}
+	// url_key 缺失时按 is_bytevc1 认编码
+	noKey := `"bit_rate":[{"bit_rate":9,"is_bytevc1":2,"play_addr":{"url_list":["https://cdn/bvc2-1080"],"width":1080,"height":1920}}]`
+	if v := decode(`{"width":576,"height":1024,` + h264 + `,` + noKey + `}`).Video; v == nil || v.URL != "https://cdn/h264-540" {
+		t.Errorf("is_bytevc1=2 也应排在后面，得到 %+v", v)
 	}
 }
 

@@ -27,10 +27,10 @@ const (
 
 // StructureDiff 是一份响应相对于示例的结构差异。
 type StructureDiff struct {
-	Baseline     int      `json:"baseline"` // 参与比对的示例数；0 表示还没有示例，无从比较
-	MissingCount int      `json:"missing_count"`
+	Baseline     int      `json:"baseline"`      // 参与比对的示例数；0 表示还没有示例，无从比较
+	MissingCount int      `json:"missing_count"` // 按分支计：缺了 author 只算一处，不再数 author 底下的子键
 	AddedCount   int      `json:"added_count"`
-	Missing      []string `json:"missing,omitempty"`
+	Missing      []string `json:"missing,omitempty"` // 最多 maxDiffList 条，计数不受这个截断影响
 	Added        []string `json:"added,omitempty"`
 }
 
@@ -141,15 +141,18 @@ func diffAgainst(response json.RawMessage, baselines []json.RawMessage, watched 
 			added = append(added, p)
 		}
 	}
+	// 计数与列表用同一口径（按分支）：原先计数算的是全部路径，新增了 suggest_words 就把
+	// 它底下每个子键都算一遍，页面上写着「新增 24」却只列出 12 行。
+	missing, added = topLevelFirst(missing), topLevelFirst(added)
 	d.MissingCount, d.AddedCount = len(missing), len(added)
 	if withLists {
-		d.Missing, d.Added = topLevelFirst(missing), topLevelFirst(added)
+		d.Missing, d.Added = missing[:min(len(missing), maxDiffList)], added[:min(len(added), maxDiffList)]
 	}
 	return d
 }
 
 // topLevelFirst 只保留每条分支的最浅一层：缺了 author 就不必再列 author.name、author.id……
-// 然后按字母序截断。
+// 结果按字母序。
 func topLevelFirst(paths []string) []string {
 	sort.Strings(paths)
 	var out []string
@@ -161,9 +164,6 @@ func topLevelFirst(paths []string) []string {
 			}
 		}
 		out = append(out, p)
-		if len(out) >= maxDiffList {
-			break
-		}
 	}
 	return out
 }
