@@ -15,7 +15,7 @@ var (
 	ErrIntentState    = errors.New("upload intent is not pending")
 	ErrPartsMismatch  = errors.New("committed parts do not match the intent")
 	ErrEdgeDisabled   = errors.New("edge is not configured")
-	ErrThumbNotImage  = errors.New("thumbnail declared for a non-image upload")
+	ErrThumbMime      = errors.New("thumbnail declared for an upload that is neither image nor video")
 	ErrThumbTooLarge  = errors.New("thumbnail must be under the ceiling and smaller than the blob")
 )
 

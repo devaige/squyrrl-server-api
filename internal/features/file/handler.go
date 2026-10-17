@@ -107,8 +107,8 @@ func (h *Handler) intent(c *gin.Context) {
 			// 客户端此时**没有**回退路径 —— 中转上传已随 ADR-069 删除，
 			// 这正是想要的：漏配的后果是传不了文件，而不是账单上多一笔出网流量。
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用边缘"})
-		case errors.Is(err, ErrThumbNotImage):
-			c.JSON(http.StatusBadRequest, gin.H{"error": "只有图片可以附带缩略图"})
+		case errors.Is(err, ErrThumbMime):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "只有图片和视频可以附带缩略图"})
 		case errors.Is(err, ErrThumbTooLarge):
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "缩略图超过上限或不小于本体"})
 		default:

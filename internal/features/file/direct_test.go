@@ -235,7 +235,9 @@ func TestValidateThumb(t *testing.T) {
 		// 没声明时连 mime 都不该看：不带缩略图是所有文件类型的默认状态。
 		{"没声明时不看 mime", "video/mp4", blob, 0, nil, nil},
 		{"正常图片", "image/jpeg", blob, 20 * 1024, hash, nil},
-		{"非图片不许带", "application/pdf", blob, 20 * 1024, hash, ErrThumbNotImage},
+		// 视频的缩略图是解析拿到的封面
+		{"视频可以带", "video/mp4", blob, 20 * 1024, hash, nil},
+		{"图片视频以外不许带", "application/pdf", blob, 20 * 1024, hash, ErrThumbMime},
 		{"超过 64 KiB 上限", "image/png", blob, MaxThumbBytes + 1, hash, ErrThumbTooLarge},
 		{"恰好 64 KiB 可以", "image/png", blob, MaxThumbBytes, hash, nil},
 		// 这条是把「不计配额的字节」框死的不变式，不是手滑校验：

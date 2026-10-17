@@ -424,7 +424,9 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 // validateThumb 校验一次缩略图声明。thumbHash 为空 = 本次不带缩略图，合法且常见。
 //
 // 三条规则各挡一件事：
-//   - 只有图片能带缩略图 —— 给一份 PDF 签出 thumb_url，客户端会拿它当图去渲染；
+//   - 只有图片和视频能带缩略图 —— 视频的缩略图是解析拿到的封面（客户端解不了视频帧），
+//     与 TG 摄取给视频挂 Telegram 封面是同一回事；PDF 等其余类型仍不签：客户端只会把
+//     thumb_url 当图去渲染，没有生成它们的路径，放开只会多一种无人使用的状态；
 //   - 上限 MaxThumbBytes —— 缩略图字节不计存储配额，总得有个天花板；
 //   - 必须严格小于本体 —— 这条才是真正把「未计费面积」框死的那一条。
 //
@@ -437,8 +439,8 @@ func validateThumb(mime string, size, thumbSize int64, thumbHash []byte) error {
 	if len(thumbHash) == 0 {
 		return nil
 	}
-	if !strings.HasPrefix(mime, "image/") {
-		return ErrThumbNotImage
+	if !strings.HasPrefix(mime, "image/") && !strings.HasPrefix(mime, "video/") {
+		return ErrThumbMime
 	}
 	if thumbSize <= 0 || thumbSize > MaxThumbBytes || thumbSize >= size {
 		return ErrThumbTooLarge
