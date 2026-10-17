@@ -83,8 +83,12 @@ func (h *Handler) parse(c *gin.Context) {
 		case errors.Is(err, ErrNoParser):
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		case errors.Is(err, ErrParseFailed):
-			// 只回一句通用原因：具体是哪个来源、为什么失败在解析记录里，不能让用户看到
-			c.JSON(http.StatusBadGateway, gin.H{"error": ErrParseFailed.Error()})
+			// 只回一句通用原因：具体是哪个来源、为什么失败在解析记录里，不能让用户看到。
+			//
+			// 不用 502：Cloudflare 会把源站的 502 / 504 换成它自己的错误页，这句 JSON 到不了
+			// 客户端；而客户端又把大陆入口的 502 / 504 当成「中继断了」去换入口（ADR-079），
+			// 一次解析失败就会把用户切到另一个入口。这里的失败是「这条内容取不到」，不是网关故障。
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": ErrParseFailed.Error()})
 		case errors.Is(err, wallet.ErrInsufficientCredits):
 			// 与档位门槛共用一套 402 形状：客户端靠 reason 分流（去充值 / 去升级），
 			// 而不是匹配文案。文案本身也交还给客户端 —— 它有三语 arb，服务端没有。

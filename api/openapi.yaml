@@ -794,10 +794,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '502':
+        '422':
           description: >-
             所有来源都没拿到内容，未扣费。响应体恒为 `{"error":"parse failed"}` ——
-            具体原因只进后台的解析记录，不暴露给客户端。
+            具体原因只进后台的解析记录，不暴露给客户端。不用 502：Cloudflare 会替换源站的
+            502 / 504 响应体，且客户端把大陆入口的 502 / 504 当作入口故障去换入口。
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
