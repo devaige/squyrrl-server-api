@@ -347,7 +347,10 @@ type aweme struct {
 		Width    int   `json:"width"`
 		Height   int   `json:"height"`
 	} `json:"video"`
-	Images        []urlList `json:"images"` // 抖音图文
+	Images []struct { // 抖音图文
+		urlList
+		DownloadURLList []string `json:"download_url_list"` // 带水印
+	} `json:"images"`
 	ImagePostInfo *struct {
 		Images []struct {
 			DisplayImage urlList `json:"display_image"`
@@ -378,8 +381,8 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		ID:        t.ResourceID,
 		Text:      a.Desc,
 		CreatedAt: unixRFC3339(a.CreateTime),
-		Author:    &postAuthor{Name: a.Author.Nickname, ID: nonEmpty(a.Author.SecUID, string(a.Author.UID)), Avatar: firstURL(a.Author.AvatarThumb.URLList)},
-		Cover:     firstURL(a.Video.Cover.URLList),
+		Author:    &postAuthor{Name: a.Author.Nickname, ID: nonEmpty(a.Author.SecUID, string(a.Author.UID)), Avatar: displayURL(a.Author.AvatarThumb.URLList)},
+		Cover:     displayURL(a.Video.Cover.URLList),
 		Stats: &postStats{Likes: i64(int64(a.Statistics.Digg)), Comments: i64(int64(a.Statistics.Comment)),
 			Shares: i64(int64(a.Statistics.Share)), Collects: i64(int64(a.Statistics.Collect))},
 	}
@@ -387,13 +390,14 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		p.Stats.Views = i64(int64(a.Statistics.Play))
 	}
 	for _, img := range a.Images {
-		if u := firstURL(img.URLList); u != "" {
+		// 无水印图没有 HEIC 以外的格式时，带水印的也比一张 Android 上打不开的图强（同 Lemon8）
+		if u := displayURL(img.URLList, img.DownloadURLList); u != "" {
 			p.Images = append(p.Images, postImage{URL: u, Width: img.Width, Height: img.Height})
 		}
 	}
 	if a.ImagePostInfo != nil {
 		for _, img := range a.ImagePostInfo.Images {
-			if u := firstURL(img.DisplayImage.URLList); u != "" {
+			if u := displayURL(img.DisplayImage.URLList); u != "" {
 				p.Images = append(p.Images, postImage{URL: u, Width: img.DisplayImage.Width, Height: img.DisplayImage.Height})
 			}
 		}

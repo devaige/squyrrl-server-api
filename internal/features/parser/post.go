@@ -297,3 +297,24 @@ func firstURL(xs []string) string {
 	u, _ := first(xs)
 	return u
 }
+
+// displayURL 按顺序在几组候选地址里取第一个不是 HEIC 的（见 isHEIC）；全是 HEIC 时退回第一组的
+// 第一个 —— 苹果端还能显示，总比没有图好。
+//
+// 字节系（抖音 / TikTok App、Lemon8）的 url_list 常把 HEIC 排在最前，同一张图的 webp / jpeg 跟在
+// 后面。Android、网页与桌面端都解不了它们的 HEIC（见客户端 thumbnailer）：做不出缩略图，列表与详情
+// 也显示不了。抖音图文作品原先取 url_list 第一个，测试反馈存下来后列表一张图都出不来、Android 报
+// 解码失败（2026-10-18）。
+func displayURL(lists ...[]string) string {
+	for _, xs := range lists {
+		for _, u := range xs {
+			if u != "" && !isHEIC(u) {
+				return u
+			}
+		}
+	}
+	if len(lists) == 0 {
+		return ""
+	}
+	return firstURL(lists[0])
+}

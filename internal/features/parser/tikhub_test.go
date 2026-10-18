@@ -266,6 +266,51 @@ func TestAwemeSkipsByteVC2(t *testing.T) {
 	}
 }
 
+// 字节系 url_list 常把 HEIC 排在最前，Android 等端解不了：图文的图、封面都跳过 HEIC（2026-10-18）。
+func TestAwemeSkipsHEIC(t *testing.T) {
+	ad := TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"]
+	images := func(imgs string) []postImage {
+		t.Helper()
+		res, err := ad.Decode([]byte(`{"aweme_detail":{"aweme_id":"1","desc":"d","images":[`+imgs+`]}}`), target("1", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p decodedPost
+		if err := json.Unmarshal(res.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		if p.Kind != "image" || p.Video != nil || !strings.HasPrefix(p.URL, "https://www.douyin.com/note/") {
+			t.Errorf("图文作品解成了 kind=%s url=%s", p.Kind, p.URL)
+		}
+		return p.Images
+	}
+	const heic = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images:q75.heic?x-expires=1"`
+	const webp = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images:q75.webp?x-expires=1"`
+	const mark = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images-v2:3000:3000:q75.jpeg?x-expires=1"`
+
+	if im := images(`{"url_list":[` + heic + `,` + webp + `],"download_url_list":[` + mark + `],"width":1080,"height":1440}`); len(im) != 1 ||
+		!strings.Contains(im[0].URL, ".webp?") || im[0].Width != 1080 {
+		t.Errorf("应取无水印的 webp，得到 %+v", im)
+	}
+	if im := images(`{"url_list":[` + heic + `],"download_url_list":[` + mark + `]}`); len(im) != 1 || !strings.Contains(im[0].URL, ".jpeg?") {
+		t.Errorf("无水印图只有 HEIC 时应退到带水印的 jpeg，得到 %+v", im)
+	}
+	if im := images(`{"url_list":[` + heic + `]}`); len(im) != 1 || !isHEIC(im[0].URL) {
+		t.Errorf("只有 HEIC 也照给（苹果端能显示），得到 %+v", im)
+	}
+
+	// TikTok App 的封面 url_list 是 heic、heic、jpeg（实测样本）
+	res, p := decodeWith(t, "tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""))
+	if p.Cover == "" || isHEIC(p.Cover) {
+		t.Errorf("封面应取 jpeg，得到 %s", p.Cover)
+	}
+	for _, a := range res.Assets {
+		if isHEIC(a.URL) {
+			t.Errorf("下载的文件里不该有 HEIC: %s", a.URL)
+		}
+	}
+}
+
 // 小红书网页端复制的链接（不带 type）按 2 倍计费；App 分享的链接带 type，按原价。
 func TestXHSPriceFactor(t *testing.T) {
 	var xhs PriceFactorer
