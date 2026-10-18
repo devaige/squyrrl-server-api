@@ -266,8 +266,26 @@ func TestAwemeSkipsByteVC2(t *testing.T) {
 	}
 }
 
-// 字节系 url_list 常把 HEIC 排在最前，Android 等端解不了：图文的图、封面都跳过 HEIC（2026-10-18）。
-func TestAwemeSkipsHEIC(t *testing.T) {
+// 字节系 url_list 常把客户端解不了的格式（HEIC、VVC）排在最前：图文的图、封面都取能显示的（2026-10-18）。
+func TestAwemePicksDisplayableImage(t *testing.T) {
+	// 实测（抖音 7692800900575176625，图文 8 张）：每张的 url_list 前两个是 VVC 原图（.image），
+	// 第三个是无水印的 1920 宽 jpeg；download_url_list 是带水印的 webp / jpeg；play_addr 是背景音乐。
+	res, p := decodeWith(t, "tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_image_post", target("7692800900575176625", ""))
+	checkSample(t, res, p, sampleWant{kind: "image", urlPrefix: "https://www.douyin.com/note/7692800900575176625", minImages: 8})
+	if p.Video != nil {
+		t.Errorf("图文作品不该有视频（play_addr 是背景音乐）: %+v", p.Video)
+	}
+	for _, im := range p.Images {
+		if imageRank(im.URL) != 0 || strings.Contains(im.URL, "water") || im.Width != 1920 || im.Height != 1146 {
+			t.Errorf("应取无水印的 1920×1146 jpeg，得到 %+v", im)
+		}
+	}
+	for _, a := range res.Assets {
+		if imageRank(a.URL) != 0 {
+			t.Errorf("下载的文件里不该有解不了的格式: %s", a.URL)
+		}
+	}
+
 	ad := TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"]
 	images := func(imgs string) []postImage {
 		t.Helper()
@@ -279,20 +297,16 @@ func TestAwemeSkipsHEIC(t *testing.T) {
 		if err := json.Unmarshal(res.Payload, &p); err != nil {
 			t.Fatal(err)
 		}
-		if p.Kind != "image" || p.Video != nil || !strings.HasPrefix(p.URL, "https://www.douyin.com/note/") {
-			t.Errorf("图文作品解成了 kind=%s url=%s", p.Kind, p.URL)
-		}
 		return p.Images
 	}
 	const heic = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images:q75.heic?x-expires=1"`
 	const webp = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images:q75.webp?x-expires=1"`
-	const mark = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-aweme-images-v2:3000:3000:q75.jpeg?x-expires=1"`
+	const mark = `"https://p3-sign.douyinpic.com/tos-cn-i-0813/a~tplv-dy-kuchen-v1-water:1920:1146:q80.jpeg?x-expires=1"`
 
-	if im := images(`{"url_list":[` + heic + `,` + webp + `],"download_url_list":[` + mark + `],"width":1080,"height":1440}`); len(im) != 1 ||
-		!strings.Contains(im[0].URL, ".webp?") || im[0].Width != 1080 {
+	if im := images(`{"url_list":[` + heic + `,` + webp + `],"download_url_list":[` + mark + `]}`); len(im) != 1 || !strings.Contains(im[0].URL, ".webp?") {
 		t.Errorf("应取无水印的 webp，得到 %+v", im)
 	}
-	if im := images(`{"url_list":[` + heic + `],"download_url_list":[` + mark + `]}`); len(im) != 1 || !strings.Contains(im[0].URL, ".jpeg?") {
+	if im := images(`{"url_list":[` + heic + `],"download_url_list":[` + mark + `]}`); len(im) != 1 || !strings.Contains(im[0].URL, "water") {
 		t.Errorf("无水印图只有 HEIC 时应退到带水印的 jpeg，得到 %+v", im)
 	}
 	if im := images(`{"url_list":[` + heic + `]}`); len(im) != 1 || !isHEIC(im[0].URL) {
@@ -300,13 +314,29 @@ func TestAwemeSkipsHEIC(t *testing.T) {
 	}
 
 	// TikTok App 的封面 url_list 是 heic、heic、jpeg（实测样本）
-	res, p := decodeWith(t, "tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""))
-	if p.Cover == "" || isHEIC(p.Cover) {
+	res, p = decodeWith(t, "tikhub_tiktok_app_v3_fetch_one_video", "tiktok_app_v3_fetch_one_video", target("7350810998023949599", ""))
+	if imageRank(p.Cover) != 0 {
 		t.Errorf("封面应取 jpeg，得到 %s", p.Cover)
 	}
 	for _, a := range res.Assets {
-		if isHEIC(a.URL) {
-			t.Errorf("下载的文件里不该有 HEIC: %s", a.URL)
+		if r := imageRank(a.URL); a.Role != "media" && r != 0 {
+			t.Errorf("下载的图片里不该有 HEIC: %s", a.URL)
+		}
+	}
+}
+
+func TestImageRank(t *testing.T) {
+	for u, want := range map[string]int{
+		"https://p3.douyinpic.com/a~tplv-dy-aweme-images-ds-rs-v1:1920:1146:q80.jpeg?x=1":                                    0,
+		"https://p3.douyinpic.com/aweme/100x100/a.webp?from=1":                                                               0,
+		"https://pbs.twimg.com/media/a.JPG":                                                                                  0,
+		"https://p3-sign.douyinpic.com/obj/c8510002be9a3a61aad2?lk3s=1":                                                      1,
+		"https://p16.tiktokcdn.com/a~tplv-tiktokx-origin.image?x=1":                                                          1,
+		"https://p16.tiktokcdn.com/a~tplv-tiktokx-cropcenter-q:300:400:q70.heic?x=1":                                         2,
+		"https://p5-sign.douyinpic.com/tos-cn-i-wftb4kr1i9/_offtrans__2836x1692_e8_46_vvic~tplv-wftb4kr1i9-origin.image?x=1": 2,
+	} {
+		if got := imageRank(u); got != want {
+			t.Errorf("imageRank(%s) = %d，期望 %d", u, got, want)
 		}
 	}
 }

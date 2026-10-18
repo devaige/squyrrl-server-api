@@ -298,23 +298,44 @@ func firstURL(xs []string) string {
 	return u
 }
 
-// displayURL 按顺序在几组候选地址里取第一个不是 HEIC 的（见 isHEIC）；全是 HEIC 时退回第一组的
-// 第一个 —— 苹果端还能显示，总比没有图好。
+// displayURL 在几组候选地址里挑一张各端都能显示的图：按 imageRank 取档最好的，同档取先出现的
+// （所以前一组优先）；没有候选时为空。
 //
-// 字节系（抖音 / TikTok App、Lemon8）的 url_list 常把 HEIC 排在最前，同一张图的 webp / jpeg 跟在
-// 后面。Android、网页与桌面端都解不了它们的 HEIC（见客户端 thumbnailer）：做不出缩略图，列表与详情
-// 也显示不了。抖音图文作品原先取 url_list 第一个，测试反馈存下来后列表一张图都出不来、Android 报
-// 解码失败（2026-10-18）。
+// 字节系（抖音 / TikTok App、Lemon8）的 url_list 常把客户端解不了的格式排在最前：TikTok 封面是
+// heic、heic、jpeg；抖音图文作品前两个是 VVC（H.266）编码的原图（路径带 _vvic，扩展名 .image），
+// 第三个才是 1920 宽的 jpeg。原先取第一个，测试反馈图文作品存下来后列表一张图都出不来、Android
+// 报解码失败（2026-10-18，作品 7692800900575176625）。
+//
+// 只剩解不了的格式时照给：苹果端能显示 HEIC，总比没有图好。
 func displayURL(lists ...[]string) string {
+	best, rank := "", 3
 	for _, xs := range lists {
 		for _, u := range xs {
-			if u != "" && !isHEIC(u) {
-				return u
+			if u == "" {
+				continue
+			}
+			if r := imageRank(u); r < rank {
+				best, rank = u, r
 			}
 		}
 	}
-	if len(lists) == 0 {
-		return ""
+	return best
+}
+
+// imageRank 按客户端能不能显示给图片地址分档：0 = jpeg / png / webp / gif，各端都能解；
+// 1 = 认不出格式（没有扩展名、字节的 .image 之类）；2 = HEIC 或字节的 VVC 图，Android、网页与
+// 桌面端都解不了（见客户端 thumbnailer）。
+func imageRank(u string) int {
+	path, _, _ := strings.Cut(u, "?")
+	path = strings.ToLower(path)
+	switch {
+	case isHEIC(path), strings.Contains(path, "_vvic"):
+		return 2
 	}
-	return firstURL(lists[0])
+	for _, ext := range []string{".jpeg", ".jpg", ".png", ".webp", ".gif"} {
+		if strings.HasSuffix(path, ext) {
+			return 0
+		}
+	}
+	return 1
 }

@@ -41,6 +41,7 @@ var builtinSamples = []builtinSample{
 	{"tikhub_douyin_app_v3_fetch_one_video_v3", "douyin_app_v3_fetch_one_video_v3", Target{ResourceID: "7448118827402972455"}, "视频作品"},
 	{"tikhub_douyin_web_fetch_one_video", "douyin_web_fetch_one_video", Target{ResourceID: "7448118827402972455"}, "视频作品"},
 	{"tikhub_douyin_web_fetch_one_video_v2", "douyin_web_fetch_one_video_v2", Target{ResourceID: "7448118827402972455"}, "视频作品"},
+	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_image_post", Target{ResourceID: "7692800900575176625"}, "图文作品（原图是 VVC，另有 jpeg）"},
 
 	{"tikhub_xiaohongshu_app_v2_get_video_note_detail", "xiaohongshu_app_v2_get_video_note_detail", Target{ResourceID: "697c0eee000000000a03c308"}, "视频笔记（返回请求的笔记加推荐）"},
 	{"tikhub_xiaohongshu_app_v2_get_image_note_detail", "xhs_image_on_normal", Target{ResourceID: "6a3e33b2000000001603e982"}, "图文笔记"},

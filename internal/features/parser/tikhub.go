@@ -390,7 +390,7 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		p.Stats.Views = i64(int64(a.Statistics.Play))
 	}
 	for _, img := range a.Images {
-		// 无水印图没有 HEIC 以外的格式时，带水印的也比一张 Android 上打不开的图强（同 Lemon8）
+		// 无水印图只有客户端解不了的格式时，带水印的也比一张 Android 上打不开的图强（同 Lemon8）
 		if u := displayURL(img.URLList, img.DownloadURLList); u != "" {
 			p.Images = append(p.Images, postImage{URL: u, Width: img.Width, Height: img.Height})
 		}
