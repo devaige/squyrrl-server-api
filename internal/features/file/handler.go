@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/auth"
+	"github.com/squyrrl/api/internal/features/quota"
 )
 
 type Handler struct {
@@ -21,6 +22,8 @@ func (h *Handler) Register(g *gin.RouterGroup) {
 	g.POST("/check", h.check)
 	// 直传两步（ADR-069）：签发 → 客户端把字节分片送进边缘 Worker → 收尾
 	g.POST("/intent", h.intent)
+	// 断点续传（ADR-083）：同一个意图换一组新票，已传的分片照旧有效
+	g.POST("/intent/:id/renew", h.renew)
 	g.POST("/commit", h.commit)
 	g.GET("/:id", h.metadata)
 	// 下载票据（ADR-070）：回一组短期边缘 URL，字节不经 api
@@ -101,6 +104,11 @@ func (h *Handler) intent(c *gin.Context) {
 		ThumbDims:       NormDims(in.ThumbWidth, in.ThumbHeight),
 	})
 	if err != nil {
+		// 空间不足 / 没买存储是 402：客户端据此把附件记成「空间不足」并停止后面的上传。
+		// 原先落进 500，被当成服务器抖动反复重试，任务停在「服务器连接失败」等一个不会来的恢复。
+		if quota.WriteIfQuota(c, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, ErrEdgeDisabled):
 			// 503 而不是 500：这是配置缺失，不是偶发故障，重试不会好。
@@ -111,6 +119,37 @@ func (h *Handler) intent(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "只有图片和视频可以附带缩略图"})
 		case errors.Is(err, ErrThumbTooLarge):
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "缩略图超过上限或不小于本体"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// renew 给还没收尾的直传换一组新票（见 Service.RenewIntent）。
+//
+// 404 / 409 都意味着这次上传回不去了（意图不存在、已收尾或已被 sweeper 作废），
+// 客户端据此丢掉本机的断点，从签发开始重传这个文件。
+func (h *Handler) renew(c *gin.Context) {
+	id := auth.MustIdentity(c)
+	iid, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 intent_id"})
+		return
+	}
+	resp, err := h.svc.RenewIntent(c.Request.Context(), id.UserID, iid)
+	if err != nil {
+		if quota.WriteIfQuota(c, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, ErrEdgeDisabled):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本服务未启用边缘"})
+		case errors.Is(err, ErrIntentNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "上传意图不存在或不属于当前用户"})
+		case errors.Is(err, ErrIntentState):
+			c.JSON(http.StatusConflict, gin.H{"error": "该上传意图已收尾或已作废"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}

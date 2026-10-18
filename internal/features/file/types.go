@@ -40,9 +40,10 @@ const PartSize int64 = 8 * 1024 * 1024
 // 收益是票据一旦随日志/截图外泄，可用窗口只有几分钟。
 const downloadTTL = 10 * time.Minute
 
-// intentTTL 是上传令牌与意图行的存活时间。
-// 必须显著长于最慢的预期上传（弱网下 100 MiB 可能要几十分钟），
-// 又必须短到让 sweeper 能及时回收 R2 里的半成品分片。
+// intentTTL 是上传令牌与意图行的存活时间，续期（RenewIntent）每次再给这么久。
+// 必须显著长于两次续期之间的间隔（客户端每传一片前看一眼，弱网下一片 8 MiB 也就几分钟），
+// 又必须短到让 sweeper 能及时回收 R2 里的半成品分片，并让没传完的上传别把配额
+// 预留太久（heldBytes 只算未过期的 pending）。客户端停下超过这么久，这个文件从头再传。
 const intentTTL = 2 * time.Hour
 
 // MaxThumbBytes 是客户端缩略图（**混淆后**）的字节上限。
@@ -141,6 +142,18 @@ type IntentResponse struct {
 	// 单独一张票而不是给本体那张加字段：边缘凭「票里的 key」决定写哪个对象，
 	// 一张票只能写一个 key 是这套令牌最要紧的不变式（见 token.go）。
 	ThumbToken string `json:"thumb_token,omitempty"`
+
+	// ExpiresAt 是两张票的过期时刻（Unix 秒）。客户端据此在过期前续期，
+	// 而不是撞上边缘的 401 才知道。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+}
+
+// RenewResponse 是 POST /files/intent/{id}/renew 的回包：同一个意图、同一组已传分片，
+// 换一组新票。意图其余的东西（分片大小、片数、upload_url）都没变，不再重复下发。
+type RenewResponse struct {
+	Token      string `json:"token"`
+	ThumbToken string `json:"thumb_token,omitempty"`
+	ExpiresAt  int64  `json:"expires_at"`
 }
 
 type IntentInput struct {

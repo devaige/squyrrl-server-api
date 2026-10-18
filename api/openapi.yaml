@@ -640,6 +640,40 @@ paths:
         '503':
           description: 未配置上传令牌密钥，直传不可用
 
+  /files/intent/{id}/renew:
+    post:
+      operationId: renewUploadIntent
+      tags: [Files]
+      summary: 给没传完的直传换一组新票（断点续传，ADR-083）
+      description: |
+        客户端把已传分片的 ETag 记在本机，断网或被系统杀掉之后接着传剩下的片。
+        R2 的 multipart 只要没被 abort 就一直在，缺的只是一张没过期的票；这里把意图行
+        再保留 2 小时，并签一组同样久的新票（本体与缩略图各一张，只有 exp 不同）。
+
+        已经过期、但 sweeper 还没作废的意图也能续，此时会重查一次配额（它的预留已经不算了）。
+        **404 / 409 即这次上传回不去了**：意图不存在、已收尾或已作废，客户端应丢掉断点、
+        从 `/files/intent` 开始重传这个文件。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: 已续期
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadRenewResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: 意图已过期且现在放不下（重查配额失败）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
+        '404':
+          description: 意图不存在或不属于当前用户
+        '409':
+          description: 意图已收尾或已作废
+        '503':
+          description: 未配置上传令牌密钥，直传不可用
+
   /files/commit:
     post:
       operationId: commitUpload
@@ -2485,6 +2519,18 @@ components:
 
             单独一张票而不是给 `token` 加字段：一张票只能写一个 key，是这套令牌
             最要紧的不变式（key 由服务端签死，客户端不能自选）。
+        expires_at:
+          type: integer
+          format: int64
+          description: 两张票的过期时刻（Unix 秒）。还没传完就快到期时调 `/files/intent/{id}/renew` 换票
+
+    UploadRenewResponse:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token:       { type: string, description: 新的本体上传票，key / uploadId / 大小 / 哈希与签发时相同 }
+        thumb_token: { type: string, description: 签发时声明过缩略图才有 }
+        expires_at:  { type: integer, format: int64, description: 新票的过期时刻（Unix 秒） }
 
     UploadCommitInput:
       type: object

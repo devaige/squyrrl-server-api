@@ -85,6 +85,24 @@ func (r *Repo) MarkIntentStatus(ctx context.Context, id uuid.UUID, status string
 	return nil
 }
 
+// ExtendIntent 把仍在 pending 的意图续到 expiresAt（RenewIntent 用）。
+//
+// 带 status='pending' 条件，与 TakeExpiredIntents 的领取互斥：sweeper 先拿到行锁的话，
+// 这里等锁之后重新求值 WHERE，影响 0 行，调用方据此让客户端从头再传；
+// 这里先拿到的话，sweeper 的 SKIP LOCKED 跳过它，提交后它也不再满足 expires_at < now()。
+func (r *Repo) ExtendIntent(ctx context.Context, id uuid.UUID, expiresAt time.Time) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE upload_intents SET expires_at = $2 WHERE id = $1 AND status = 'pending'`,
+		id, expiresAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrIntentState
+	}
+	return nil
+}
+
 // TakeExpiredIntents 领取一批过期未收尾的意图交给 sweeper。
 //
 // 直接 UPDATE 成 'aborted' 再返回，而不是先读后写：sweeper 可能与下一轮 tick

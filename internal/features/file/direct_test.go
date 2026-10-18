@@ -346,3 +346,58 @@ func TestNormDims(t *testing.T) {
 		})
 	}
 }
+
+// 续期换的只能是 exp：key / uploadId / 大小 / 片数 / 哈希任何一项变了，
+// 已经传上去的分片就与新票对不上（边缘按票里的值校验每一片、写哪个对象）。
+func TestSignIntentTokens_RenewKeepsEverythingButExpiry(t *testing.T) {
+	const secret = "test-secret"
+	s := &Service{edgeBase: "https://files.example", tokenSecret: secret}
+	cipher := make([]byte, 32)
+	cipher[0] = 7
+	it := &UploadIntent{
+		StorageKey: StorageKeyFor(cipher), R2UploadID: "mp-1",
+		SizeBytes: 3*PartSize + 5, PartSize: PartSize, PartCount: 4, CipherHash: cipher,
+		ThumbCipherHash: make([]byte, 32), ThumbSizeBytes: 2048,
+	}
+	first := time.Now().Add(time.Hour)
+	later := first.Add(2 * time.Hour)
+
+	tok1, thumb1, err := s.signIntentTokens(it, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok2, thumb2, err := s.signIntentTokens(it, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thumb1 == "" || thumb2 == "" {
+		t.Fatal("声明过缩略图的意图续期后也要有缩略图票")
+	}
+	a, err := VerifyUploadToken(secret, tok1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := VerifyUploadToken(secret, tok2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ExpiresAt != later.Unix() || a.ExpiresAt != first.Unix() {
+		t.Fatalf("过期时刻不对：%d / %d", a.ExpiresAt, b.ExpiresAt)
+	}
+	b.ExpiresAt = a.ExpiresAt
+	if *a != *b {
+		t.Fatalf("续期改了 exp 以外的字段：%+v → %+v", a, b)
+	}
+	tb, err := VerifyUploadToken(secret, thumb2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tb.UploadID != "" || tb.Key != ThumbnailKeyFor(it.StorageKey) || tb.SizeBytes != 2048 {
+		t.Fatalf("续期后的缩略图票不对：%+v", tb)
+	}
+
+	it.ThumbCipherHash, it.ThumbSizeBytes = nil, 0
+	if _, thumb, err := s.signIntentTokens(it, later); err != nil || thumb != "" {
+		t.Fatalf("没声明缩略图就不该签缩略图票：%q %v", thumb, err)
+	}
+}

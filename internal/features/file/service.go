@@ -376,49 +376,92 @@ func (s *Service) IssueIntent(ctx context.Context, in IntentRequest) (*IntentRes
 		return nil, err
 	}
 
-	token, err := SignUploadToken(s.tokenSecret, UploadClaims{
-		IntentID:   it.ID.String(),
-		Key:        storageKey,
-		UploadID:   r2UploadID,
-		SizeBytes:  in.SizeBytes,
-		PartSize:   PartSize,
-		PartCount:  partCount,
-		CipherHash: hex.EncodeToString(in.CipherHash),
-		ExpiresAt:  expiresAt.Unix(),
-	})
+	token, thumbToken, err := s.signIntentTokens(it, expiresAt)
 	if err != nil {
 		return nil, err
 	}
-
-	resp := &IntentResponse{
+	return &IntentResponse{
 		Exists:   false,
 		IntentID: it.ID.String(),
 		// 恒为非空（EdgeEnabled 已挡住空值），指向 Worker 自定义域。
-		UploadURL: s.edgeBase,
-		Token:     token,
-		PartSize:  PartSize,
-		PartCount: partCount,
-	}
+		UploadURL:  s.edgeBase,
+		Token:      token,
+		PartSize:   PartSize,
+		PartCount:  partCount,
+		ThumbToken: thumbToken,
+		ExpiresAt:  expiresAt.Unix(),
+	}, nil
+}
 
-	if len(in.ThumbCipherHash) > 0 {
-		// 缩略图恒走单片（MaxThumbBytes 远小于 PartSize），所以 UploadID 留空 ——
-		// 边缘据此把它路由到 /v1/single 那条分支并做整体哈希校验。
-		// 边缘因此一行都不用改：key / sz / ch 本来就是令牌里三个互相独立的字段。
-		thumbToken, err := SignUploadToken(s.tokenSecret, UploadClaims{
-			IntentID:   it.ID.String(),
-			Key:        ThumbnailKeyFor(storageKey),
-			SizeBytes:  in.ThumbSizeBytes,
-			PartSize:   in.ThumbSizeBytes,
-			PartCount:  1,
-			CipherHash: hex.EncodeToString(in.ThumbCipherHash),
-			ExpiresAt:  expiresAt.Unix(),
-		})
-		if err != nil {
+// signIntentTokens 按意图行签出本体票与（声明过缩略图时的）缩略图票，两张同一个过期时刻。
+// 签发与续期共用：续期换的只是 exp，key / uploadId / 大小 / 哈希必须与签发时逐字相同，
+// 否则已经传上去的分片就对不上了。
+func (s *Service) signIntentTokens(it *UploadIntent, expiresAt time.Time) (token, thumbToken string, err error) {
+	token, err = SignUploadToken(s.tokenSecret, UploadClaims{
+		IntentID:   it.ID.String(),
+		Key:        it.StorageKey,
+		UploadID:   it.R2UploadID,
+		SizeBytes:  it.SizeBytes,
+		PartSize:   it.PartSize,
+		PartCount:  it.PartCount,
+		CipherHash: hex.EncodeToString(it.CipherHash),
+		ExpiresAt:  expiresAt.Unix(),
+	})
+	if err != nil || len(it.ThumbCipherHash) == 0 {
+		return token, "", err
+	}
+	// 缩略图恒走单片（MaxThumbBytes 远小于 PartSize），所以 UploadID 留空 ——
+	// 边缘据此把它路由到 /v1/single 那条分支并做整体哈希校验。
+	// 边缘因此一行都不用改：key / sz / ch 本来就是令牌里三个互相独立的字段。
+	thumbToken, err = SignUploadToken(s.tokenSecret, UploadClaims{
+		IntentID:   it.ID.String(),
+		Key:        ThumbnailKeyFor(it.StorageKey),
+		SizeBytes:  it.ThumbSizeBytes,
+		PartSize:   it.ThumbSizeBytes,
+		PartCount:  1,
+		CipherHash: hex.EncodeToString(it.ThumbCipherHash),
+		ExpiresAt:  expiresAt.Unix(),
+	})
+	return token, thumbToken, err
+}
+
+// RenewIntent 给一次还没收尾的直传续期：意图行再保留 intentTTL，换一组同样久的新票。
+//
+// 断点续传靠它（ADR-083）：客户端把已传分片的 ETag 记在本机，被系统杀掉或断网之后
+// 接着传剩下的片。R2 的 multipart 只要没被 abort 就一直在，缺的只是一张没过期的票 ——
+// 而票的有效期必须短（见 intentTTL），所以由仍在传的客户端隔一段时间来换。
+//
+// 已经过期、只是 sweeper 还没来得及领走的意图也给续：它的分片还在 R2 里。
+// 但那份预留已经不算进 heldBytes 了，复活它之前要重查一次配额 —— 不查的话，
+// 这段时间里别的上传占掉的空间就被它悄悄超出去。没过期的不查：它本来就占着预留，
+// 再查一次会把自己算两遍。
+func (s *Service) RenewIntent(ctx context.Context, userID, intentID uuid.UUID) (*RenewResponse, error) {
+	if !s.EdgeEnabled() {
+		return nil, ErrEdgeDisabled
+	}
+	it, err := s.repo.GetIntentForUser(ctx, intentID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if it.Status != "pending" {
+		return nil, ErrIntentState
+	}
+	now := time.Now()
+	if s.quota != nil && !it.ExpiresAt.After(now) {
+		if err := s.quota.CheckUpload(ctx, userID, it.SizeBytes); err != nil {
 			return nil, err
 		}
-		resp.ThumbToken = thumbToken
 	}
-	return resp, nil
+	expiresAt := now.Add(intentTTL)
+	// 带 status='pending' 条件：与 sweeper 的领取互斥，谁先拿到行锁算谁的
+	if err := s.repo.ExtendIntent(ctx, it.ID, expiresAt); err != nil {
+		return nil, err
+	}
+	token, thumbToken, err := s.signIntentTokens(it, expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	return &RenewResponse{Token: token, ThumbToken: thumbToken, ExpiresAt: expiresAt.Unix()}, nil
 }
 
 // validateThumb 校验一次缩略图声明。thumbHash 为空 = 本次不带缩略图，合法且常见。
