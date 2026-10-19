@@ -252,8 +252,8 @@ func (s *Service) GetEndpoint(ctx context.Context, id uuid.UUID) (*Endpoint, err
 // Adapters 返回代码里注册的全部适配器。
 func (s *Service) Adapters() []AdapterInfo { return s.catalog.Adapters() }
 
-// ListSamples 列出接口的线上采样（带上相对示例的结构差异计数）与作为基准的示例。
-// 列表不带请求响应正文（单条可达几百 KB），看详情走 GetSample。
+// ListSamples 列出接口的线上采样（带上相对示例的结构差异计数）与作为基准的示例（带上示例
+// 之间的结构差异）。列表不带请求响应正文（单条可达几百 KB），看详情走 GetSample。
 func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, []Example, error) {
 	all, err := s.repo.ListSamples(ctx, id)
 	if err != nil {
@@ -265,6 +265,7 @@ func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, []Ex
 		examples, watched = s.comparisonFor(ep.Slug)
 	}
 	bases := baselinesOf(examples)
+	compareExamples(examples, bases)
 	for i := range all {
 		if diffable(all[i]) {
 			all[i].Diff = diffAgainst(all[i].Response, bases, watched, false)

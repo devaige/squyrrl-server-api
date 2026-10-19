@@ -75,6 +75,35 @@ func TestStructureDiffClosestExample(t *testing.T) {
 	}
 }
 
+// 示例两两比对：收录进来的形态不再在线上采样里报差异，示例之间差在哪要看得到。
+// 比全部字段，解析不了的示例不参与，也不出现在别人的对比里。
+func TestCompareExamples(t *testing.T) {
+	examples := []Example{
+		{Note: "图片推文", Data: json.RawMessage(`{"id":"1","author":{"name":"n"},"photos":[{"url":"u"}]}`)},
+		{Note: "坏的", Data: json.RawMessage(`{`)},
+		{Note: "视频推文", Data: json.RawMessage(`{"id":"2","author":{"name":"n","live":{"room":1}},"video":{"url":"u"}}`)},
+	}
+	compareExamples(examples, baselinesOf(examples))
+
+	photo, broken, video := examples[0].Versus, examples[1].Versus, examples[2].Versus
+	if len(photo) != 1 || photo[0].Other != "视频推文" ||
+		!slices.Equal(photo[0].Added, []string{"photos"}) || !slices.Equal(photo[0].Missing, []string{"author.live", "video"}) ||
+		photo[0].AddedCount != 1 || photo[0].MissingCount != 2 {
+		t.Errorf("图片推文相对视频推文: %+v", photo)
+	}
+	if len(video) != 1 || video[0].Other != "图片推文" ||
+		!slices.Equal(video[0].Added, photo[0].Missing) || !slices.Equal(video[0].Missing, photo[0].Added) {
+		t.Errorf("反过来比应正好对调: %+v", video)
+	}
+	if broken != nil {
+		t.Errorf("解析不了的示例不参与比对: %+v", broken)
+	}
+	one := []Example{{Note: "图片推文", Data: examples[0].Data}}
+	if compareExamples(one, baselinesOf(one)); one[0].Versus != nil {
+		t.Errorf("只有一份示例时无从比较: %+v", one[0].Versus)
+	}
+}
+
 // 只比上游正常应答的线上采样：失败应答是一段错误说明，比出来的「缺失」不是改版。
 func TestDiffableOnlySuccess(t *testing.T) {
 	for _, c := range []struct {

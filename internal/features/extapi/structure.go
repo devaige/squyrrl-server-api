@@ -37,6 +37,17 @@ type StructureDiff struct {
 	Added        []string `json:"added,omitempty"`
 }
 
+// ExampleDiff 是一份示例相对同接口另一份示例的结构差异。线上采样对上某份示例就不再报差异，
+// 收录进来的形态差在哪由这里看（用户决定 2026-10-19）。比全部字段，不只代码会读的：要看的是
+// 两种形态本身差在哪。
+type ExampleDiff struct {
+	Other        string   `json:"other"`         // 另一份示例（它的备注）
+	AddedCount   int      `json:"added_count"`   // 这一份有、另一份没有；按分支计
+	MissingCount int      `json:"missing_count"` // 另一份有、这一份没有
+	Added        []string `json:"added,omitempty"`
+	Missing      []string `json:"missing,omitempty"`
+}
+
 // diffable 判断一条线上采样要不要和示例比：只比上游正常应答（2xx）的那些。
 // 上游明说失败的应答（TikHub 的 400「本次请求不会被扣费」）是一段错误说明，拿去比会报出
 // 一长串「缺失」，看起来像上游改了结构，其实只是这次没取到。
@@ -97,6 +108,7 @@ func shapeOf(v any) map[string]struct{} {
 
 // baseline 是一份示例算好的字段集合。示例单份可达几百 KB，一次比多条采样时只解析一遍。
 type baseline struct {
+	of    int // 在 examples 里的下标
 	note  string
 	shape map[string]struct{}
 }
@@ -104,12 +116,41 @@ type baseline struct {
 // baselinesOf 把示例解析成比对用的字段集合；解析不了的跳过（Baseline 计数也不算它）。
 func baselinesOf(examples []Example) []baseline {
 	out := make([]baseline, 0, len(examples))
-	for _, ex := range examples {
+	for i, ex := range examples {
 		var v any
 		if json.Unmarshal(ex.Data, &v) != nil {
 			continue
 		}
-		out = append(out, baseline{note: ex.Note, shape: shapeOf(v)})
+		out = append(out, baseline{of: i, note: ex.Note, shape: shapeOf(v)})
+	}
+	return out
+}
+
+// compareExamples 把同一接口的示例两两比对，结果填进各自的 Versus。
+func compareExamples(examples []Example, bases []baseline) {
+	for _, a := range bases {
+		for _, b := range bases {
+			if a.of == b.of {
+				continue
+			}
+			added, missing := topLevelFirst(pathsNotIn(a.shape, b.shape)), topLevelFirst(pathsNotIn(b.shape, a.shape))
+			examples[a.of].Versus = append(examples[a.of].Versus, ExampleDiff{
+				Other:        b.note,
+				AddedCount:   len(added),
+				MissingCount: len(missing),
+				Added:        added[:min(len(added), maxDiffList)],
+				Missing:      missing[:min(len(missing), maxDiffList)],
+			})
+		}
+	}
+}
+
+func pathsNotIn(a, b map[string]struct{}) []string {
+	var out []string
+	for p := range a {
+		if _, ok := b[p]; !ok {
+			out = append(out, p)
+		}
 	}
 	return out
 }

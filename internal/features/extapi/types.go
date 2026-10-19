@@ -149,6 +149,9 @@ type Example struct {
 	Note       string          `json:"note"` // 是哪种结构
 	ResourceID string          `json:"resource_id"`
 	Data       json.RawMessage `json:"-"` // 业务数据本身，即 TikHub 外壳里的 data
+
+	// 仅接口的采样列表：和同接口其他每份示例的结构差异
+	Versus []ExampleDiff `json:"versus,omitempty"`
 }
 
 // Sample 是一条线上采样：archive_live 打开时每次调用自动存一条请求与原始响应，保留最近
