@@ -88,6 +88,9 @@ func (s *TrashSweeper) sweepOnce(ctx context.Context) {
 // 硬删而非再软删一次：elements 对 snippets 是 ON DELETE CASCADE，
 // 而 element 的删除触发器会把 files.ref_count 减回去，随后既有的 file GC
 // 在孤儿豁免期之后回收字节。整条回收链路已经存在，这里只需要删掉行。
+//
+// 每删一行在同一条语句里留一块墓碑（ADR-084）：离线超过保留期的设备回来时，
+// 靠它才知道这条是用户删的，而不是把它当成「服务端没有」重新传上来。
 func (s *TrashSweeper) Sweep(ctx context.Context) (int, error) {
 	minDays := minRetentionDays()
 	if minDays <= 0 {
@@ -147,10 +150,16 @@ func (s *TrashSweeper) sweepUser(ctx context.Context, userID uuid.UUID) (int, er
 	}
 
 	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM snippets
-		WHERE user_id = $1
-		  AND deleted_at IS NOT NULL
-		  AND deleted_at < now() - make_interval(days => $2)`,
+		WITH purged AS (
+			DELETE FROM snippets
+			WHERE user_id = $1
+			  AND deleted_at IS NOT NULL
+			  AND deleted_at < now() - make_interval(days => $2)
+			RETURNING id, user_id, sync_seq
+		)
+		INSERT INTO snippet_tombstones (id, user_id, sync_seq)
+		SELECT id, user_id, sync_seq FROM purged
+		ON CONFLICT (id) DO NOTHING`,
 		userID, t.TrashDays)
 	if err != nil {
 		return 0, fmt.Errorf("删除过期回收站条目: %w", err)

@@ -14,6 +14,12 @@ var (
 	ErrTagNotOwned     = errors.New("one or more tag_ids do not belong to user")
 	ErrPageNotOwned    = errors.New("page_id does not belong to user")
 	ErrFileNotFound    = errors.New("one or more file_ids do not exist")
+	// ErrTypeChange 是同步写入试图把碎片改成另一种非 normal 类型。
+	// 类型只能原样保持或坍塌为 normal（ADR-001，单向）。
+	ErrTypeChange = errors.New("snippet type can only stay the same or flatten to normal")
+	// ErrIDTaken 是客户端指定的 id 已被别的账号占用。UUIDv4 不会自然撞上，
+	// 撞上只可能是有人拿别人的 id 来试。
+	ErrIDTaken = errors.New("snippet id is taken")
 )
 
 // ConflictError 在 PATCH 触发版本冲突时由 Service 返回。
@@ -74,6 +80,9 @@ type Snippet struct {
 	UpdatedAt   time.Time       `json:"updated_at"`
 	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
 
+	// SyncSeq 是这条碎片最近一次改动领到的号（ADR-084），只供增量拉取算游标，不下发。
+	SyncSeq int64 `json:"-"`
+
 	// RestrictedAt 是这条碎片进入「降级后超额」生命周期的时刻。内部字段，不下发 ——
 	// 客户端需要的是阶段名而不是一个要自己做日期算术的时间戳，
 	// 那种算术分散在三个客户端里就会出现三种边界行为。
@@ -112,13 +121,18 @@ type CreateInput struct {
 	SourceData  json.RawMessage `json:"source_data,omitempty"`
 	TagIDs      []uuid.UUID     `json:"tag_ids,omitempty"`
 	Elements    []ElementInput  `json:"elements,omitempty"`
+
+	// 用户本机的创建 / 修改时刻（ADR-084）：只用来显示与排序，原样存储。
+	// 不带时（TG Bot、浏览器扩展、网页端）取服务端当前时间。
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // UpdateInput 采用「字段存在即更新」语义。version 字段做乐观锁。
 // 限制：title / description / text_lang 仍不支持显式置空（pointer 无法区分 omit 与 null）。
 // page_id 是例外，见下面的 ClearPage。
 type UpdateInput struct {
-	Version int64 `json:"version" binding:"required"`
+	Version int64 `json:"version"` // 改正文时必填（请求体或 If-Match），见 handler.update
 
 	PageID *uuid.UUID `json:"page_id,omitempty"`
 	// ClearPage 把碎片移出页面，回到「全部碎片」虚拟视图。
@@ -144,6 +158,16 @@ type UpdateInput struct {
 	// Flatten 把非 normal 碎片坍塌为 normal（ADR-001，单向不可逆），与本次编辑在同一事务里生效。
 	// 见 applyFlatten。与 payload 互斥：坍塌就是丢弃 payload，同时再给一份是自相矛盾的请求。
 	Flatten bool `json:"flatten,omitempty"`
+}
+
+// HasContent 报告这次 PATCH 是否改了正文类字段。
+//
+// 只有正文类字段参与版本判定（ADR-084）：移动页面、改标签不必带对版本，
+// 也不让版本 +1 —— 否则「手机上移了页面、电脑上改了正文」会被误判成冲突。
+func (in *UpdateInput) HasContent() bool {
+	return in.Title != nil || in.Description != nil || in.TextContent != nil ||
+		in.TextFormat != nil || in.TextLang != nil || len(in.Payload) > 0 ||
+		in.Elements != nil || in.Flatten
 }
 
 // ErrFlattenWithPayload 是 flatten 与 payload 同时出现时的拒绝原因。
@@ -172,20 +196,21 @@ func applyFlatten(cur *Snippet, in *UpdateInput) {
 	}
 }
 
+// ListInput 是浏览用的列表查询（网页端等在线客户端）。
+//
+// 原先的 `since=<RFC3339>` 增量模式随 ADR-084 删除：updated_at 现在是客户端墙上时间，
+// 拿它当游标会漏数据。增量同步走 GET /sync/pull 的 sync_seq。
 type ListInput struct {
 	// PageID / TagID 不通过 Gin form binding —— Gin v1.12 对 *uuid.UUID query 解析有 quirk
 	// （把单值包成 ["..."] 再 stringify）。handler 显式调 uuid.Parse 填充。
-	PageID         *uuid.UUID `form:"-"`
-	TagID          *uuid.UUID `form:"-"`
-	Since          *time.Time `form:"since"`           // RFC3339；返回 updated_at >= since
-	IncludeDeleted bool       `form:"include_deleted"` // 同步场景需要
-	Limit          int        `form:"limit"`
+	PageID *uuid.UUID `form:"-"`
+	TagID  *uuid.UUID `form:"-"`
+	Limit  int        `form:"limit"`
 	// q：全文搜索关键字。Phase 1.5 仅对 title / description 做 ILIKE 单词包含匹配；
 	// text_content 因将来要走客户端混淆，不在服务端索引。
 	Q *string `form:"q"`
 }
 
 type ListOutput struct {
-	Items     []Snippet  `json:"items"`
-	NextSince *time.Time `json:"next_since,omitempty"`
+	Items []Snippet `json:"items"`
 }

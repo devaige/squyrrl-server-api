@@ -10,13 +10,13 @@ import (
 
 	"github.com/squyrrl/api/internal/config"
 	"github.com/squyrrl/api/internal/features/auth"
-	"github.com/squyrrl/api/internal/features/claim"
 	"github.com/squyrrl/api/internal/features/extapi"
 	"github.com/squyrrl/api/internal/features/file"
 	"github.com/squyrrl/api/internal/features/page"
 	"github.com/squyrrl/api/internal/features/parser"
 	"github.com/squyrrl/api/internal/features/pricing"
 	"github.com/squyrrl/api/internal/features/quota"
+	"github.com/squyrrl/api/internal/features/replica"
 	"github.com/squyrrl/api/internal/features/snippet"
 	"github.com/squyrrl/api/internal/features/subscriptions"
 	"github.com/squyrrl/api/internal/features/tag"
@@ -42,7 +42,6 @@ type Server struct {
 	passkeySvc  *auth.PasskeyService
 	walletSvc   *wallet.Service
 	subSvc      *subscriptions.Service
-	claimSvc    *claim.Service
 	extapiSvc   *extapi.Service
 	parseCache  *parser.Cache
 	quotaSvc    *quota.Service
@@ -125,7 +124,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		slog.Error("Stripe 价目表解析失败，购买入口将不可用", "err", err)
 	}
 	checkoutSvc := subscriptions.NewCheckout(cfg.StripeSecretKey, priceBook, cfg.CheckoutReturnBase)
-	claimSvc := claim.NewService(pool, quotaSvc)
 
 	s := &Server{
 		cfg: cfg, pool: pool, engine: engine,
@@ -135,7 +133,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 		passkeySvc:  passkeySvc,
 		walletSvc:   walletSvc,
 		subSvc:      subSvc,
-		claimSvc:    claimSvc,
 		extapiSvc:   extapiSvc,
 		parseCache:  parseCache,
 		quotaSvc:    quotaSvc,
@@ -187,6 +184,9 @@ func (s *Server) routes() {
 	page.NewHandler(s.pageSvc).Register(api.Group("/pages"))
 	tag.NewHandler(s.tagRepo, s.quotaSvc).Register(api.Group("/tags"))
 	snippet.NewHandler(s.snipSvc).Register(api.Group("/snippets"))
+	// 原生客户端的增量同步（ADR-084）；网页端与扩展仍走上面三组 REST 接口
+	replica.NewHandler(replica.NewService(s.pool, s.quotaSvc, s.snipSvc, s.pageSvc, s.tagRepo)).
+		Register(api.Group("/sync"))
 	file.NewHandler(s.fileSvc).Register(api.Group("/files"))
 	parserHandler := parser.NewHandler(s.parsSvc)
 	parserHandler.Register(api.Group("/uris")) // POST /uris/parse（鉴权 + 计费）
@@ -197,11 +197,10 @@ func (s *Server) routes() {
 	// 它也是唯一能不发版调价的机制，客户端冷启动拉一次。
 	pricing.NewHandler().RegisterPublic(s.engine.Group("/"))
 
-	// 钱包 — 用户端在 /me/wallet；匿名数据归属在 /me/anonymous/claim
+	// 钱包 — 用户端在 /me/wallet
 	meGroup := api.Group("/me")
 	walletHandler := wallet.NewHandler(s.walletSvc, s.quotaSvc)
 	walletHandler.RegisterUser(meGroup)
-	claim.NewHandler(s.claimSvc).Register(meGroup)
 
 	// GET /me/export：整批导出云端数据（ADR-075 降级生命周期的出口）。
 	// 挂在 /me 而不是 /snippets：它导的是「我的全部数据」而不是碎片列表的一种查询，

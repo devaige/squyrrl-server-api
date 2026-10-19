@@ -3,7 +3,7 @@ info:
   title: Squyrrl API
   version: 0.1.0
   description: |
-    Squyrrl（箩筐）主 API 契约。本文件描述 Phase 1 已实现的 20 个端点。
+    Squyrrl（箩筐）主 API 契约。本文件描述已实现的端点（部分；以注册的 handler 为准）。
 
     ## 认证模型
 
@@ -12,13 +12,17 @@ info:
     - access token 过期后用 `/auth/refresh` 旋转出新的 access；refresh token 不旋转。
     - 任何 token 都仅以 SHA-256 哈希入库；明文 token 永不持久化。
 
-    ## 同步并发控制
+    ## 同步并发控制（ADR-084）
 
-    - `snippets.version` 是单调自增的乐观锁。
-    - 写入端点（PATCH / DELETE）必须携带 `If-Match: "<version>"` 头，否则 400 / 409。
-    - 读取端点会返回 `ETag: "<version>"` 响应头。
-    - 增量同步：`GET /snippets?since=<RFC3339>` 返回 `updated_at >= since` 的碎片，按时间升序，附带 `next_since` 用于下一次请求。
-    - `?include_deleted=true` 让同步流包含软删除的碎片（带 `deleted_at`），客户端据此本地下架。
+    三个时钟各管一件事，绝不混用：
+    - `created_at` / `updated_at`：用户本机的墙上时间，只用来显示与排序，服务端原样存储。
+    - `snippets.version`：正文版本（乐观锁）。只有正文类字段的修改与删除让它 +1；
+      移动页面、改标签不核对也不改变它。
+    - `sync_seq`：服务端给每个账号分配的递增号，增量拉取的游标，不出现在响应体里。
+
+    原生客户端本机存完整数据，用 `/sync/pull` 拉取、`/sync/push` 推送。
+    网页端、浏览器扩展在线读写本文件里的 REST 接口：改正文的 PATCH 与 DELETE 携带
+    `If-Match: "<version>"`，读取端点返回 `ETag: "<version>"`。
 
     ## 数据混淆
 
@@ -45,6 +49,8 @@ tags:
     description: 用户的标签（碎片组织单元，N:N）
   - name: Snippets
     description: 碎片 — 产品的核心实体
+  - name: Sync
+    description: 原生客户端的增量同步（ADR-084）：本机存完整数据，后台拉取与推送
   - name: Files
     description: 文件存储（混淆字节）+ 跨用户去重
   - name: URIs
@@ -326,11 +332,6 @@ paths:
               schema: { $ref: '#/components/schemas/Tag' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '409':
-          description: 标签名重复
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
     get:
       operationId: listTags
       tags: [Tags]
@@ -357,6 +358,7 @@ paths:
       operationId: updateTag
       tags: [Tags]
       summary: 重命名标签
+      description: 同名标签是允许的：身份只认 id，名字只用来显示。
       requestBody:
         required: true
         content:
@@ -375,16 +377,11 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409':
-          description: 同名标签已存在
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
     delete:
       operationId: deleteTag
       tags: [Tags]
       summary: 删除标签
-      description: 物理删除；通过外键级联自动清理 `snippet_tags` 关联。
+      description: 软删除，并摘掉它在碎片上的关联；删除与受影响的碎片都会随增量同步下发。
       responses:
         '204': { description: 已删除 }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -399,6 +396,7 @@ paths:
       description: |
         客户端可通过 `id` 字段携带本地生成的 UUID（用于离线写）。
         `tag_ids` 与 `page_id` 必须归属当前用户，否则返回 400。
+        `created_at` / `updated_at` 可带用户本机时间；不带取服务端当前时间。
       requestBody:
         required: true
         content:
@@ -419,11 +417,10 @@ paths:
     get:
       operationId: listSnippets
       tags: [Snippets]
-      summary: 列出 / 同步碎片
+      summary: 列出碎片
       description: |
-        - 不传 `since`：浏览模式，按 `updated_at` 倒序，最多 `limit`（默认 100，上限 200）。
-        - 传 `since`：同步模式，按 `updated_at` 升序，返回 `updated_at >= since` 的条目，附 `next_since` 供下次请求。
-        - `include_deleted=true` 让结果包含软删除条目（`deleted_at` 非空）。
+        浏览用：未删除的碎片按 `updated_at` 倒序，最多 `limit`（默认 100，上限 200）。
+        原先按 `updated_at` 增量同步的 `since` 模式已删除（ADR-084）——增量同步走 `GET /sync/pull`。
       parameters:
         - in: query
           name: page_id
@@ -431,13 +428,6 @@ paths:
         - in: query
           name: tag_id
           schema: { type: string, format: uuid }
-        - in: query
-          name: since
-          description: RFC3339 时间戳；触发同步模式
-          schema: { type: string, format: date-time }
-        - in: query
-          name: include_deleted
-          schema: { type: boolean, default: false }
         - in: query
           name: limit
           schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
@@ -487,9 +477,12 @@ paths:
       tags: [Snippets]
       summary: 更新碎片（乐观锁）
       description: |
-        必须携带版本号，渠道有二选一：
+        改正文类字段（title / description / text_* / payload / elements / flatten）时必须携带版本号，
+        渠道有二选一：
         - HTTP 头 `If-Match: "<version>"`（推荐）
         - body 中的 `version` 字段（兜底）
+
+        只移动页面、改标签的请求不核对版本，也不让版本 +1、不改 `updated_at`（ADR-084）。
 
         字段存在即更新；缺省字段保持不变。`tag_ids` 为空数组表示清空所有标签。
         type / subtype / source 不能直接修改，唯一的例外是 `flatten`：把非 normal
@@ -539,7 +532,7 @@ paths:
       summary: 软删除碎片
       description: |
         必须携带 `If-Match` 头。删除会设置 `deleted_at = now()` 并把 `version + 1`，
-        以便客户端能通过同步流（include_deleted=true）感知到此次删除。
+        原生客户端通过 `GET /sync/pull` 的删除标记感知到此次删除。
       parameters:
         - in: header
           name: If-Match
@@ -560,6 +553,99 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------- Sync
+  /sync/pull:
+    get:
+      operationId: syncPull
+      tags: [Sync]
+      summary: 增量拉取
+      description: |
+        返回 `sync_seq > since` 的页面、标签、碎片，按号升序分页。每一项都是该实体此刻的
+        完整状态（或删除标记），实体之间互不依赖，按任意顺序应用结果相同。
+        `since=0` 是首次同步，不含删除标记。`has_more` 为真时带着 `cursor` 继续拉。
+        `reconcile_gen` 与上次不同时，按 `GET /sync/manifest` 对一次账。
+      parameters:
+        - in: query
+          name: since
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - in: query
+          name: limit
+          description: 每类实体的条数上限
+          schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+      responses:
+        '200':
+          description: 一页增量
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncPullOutput' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /sync/manifest:
+    get:
+      operationId: syncManifest
+      tags: [Sync]
+      summary: 服务端现存碎片清单（对账用）
+      description: |
+        `reconcile_gen` 变化说明服务端只删除了云端副本（降级后清理超额数据），没有留删除标记。
+        客户端先拉到不小于 `cursor`，再把「本机标着已同步、清单里却没有」的碎片改回未同步，
+        它们会在允许同步时重新上传。
+      responses:
+        '200':
+          description: 清单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncManifestOutput' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /sync/push:
+    post:
+      operationId: syncPush
+      tags: [Sync]
+      summary: 推送本机改动
+      description: |
+        一批最多 100 条改动，逐条各自一个事务，结果与请求一一对应；一条失败不影响其它条。
+        客户端按实体合并后再发（同一条碎片只发最后的样子；新建后又删掉就不发），
+        页面、标签的新建排在引用它们的碎片之前。
+
+        冲突规则：
+        - 碎片 `put`：正文类字段整份发送并带 `base_version`（0 = 本机新建）。版本对不上时服务端那份保留，
+          客户端的内容（含附件）进冲突收件箱。内容与服务端已经相同时直接成功，所以重发是安全的。
+        - 碎片 `move` / `tags`：不核对版本；移动以后到达的为准，标签按增减合并。
+        - 碎片 `delete`：别处先改了正文时删除被拒（`conflict`），碎片带着新内容回到本机。
+        - 页面、标签 `put`：以后到达的为准；已删除的不会被复活。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mutations]
+              properties:
+                mutations:
+                  type: array
+                  maxItems: 100
+                  items: { $ref: '#/components/schemas/SyncMutation' }
+      responses:
+        '200':
+          description: 逐条结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/SyncResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: 免费档不同步（`reason = sync_required`），整批拒绝
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuotaError' }
 
   # ---------------------------------------------------------------- Files
   /files/check:
@@ -2339,6 +2425,141 @@ components:
         elements:
           type: array
           items: { $ref: '#/components/schemas/ElementInput' }
+        created_at:
+          type: string
+          format: date-time
+          description: 用户本机的创建时刻，只用于显示与排序；缺省取服务端当前时间
+        updated_at:
+          type: string
+          format: date-time
+          description: 用户本机的修改时刻；缺省同 created_at
+
+    SyncPullOutput:
+      type: object
+      required: [pages, tags, snippets, deleted, cursor, has_more, reconcile_gen]
+      properties:
+        pages:
+          type: array
+          items: { $ref: '#/components/schemas/Page' }
+        tags:
+          type: array
+          items: { $ref: '#/components/schemas/Tag' }
+        snippets:
+          type: array
+          items: { $ref: '#/components/schemas/Snippet' }
+        deleted:
+          type: object
+          required: [pages, tags, snippets]
+          properties:
+            pages: { type: array, items: { type: string, format: uuid } }
+            tags: { type: array, items: { type: string, format: uuid } }
+            snippets: { type: array, items: { type: string, format: uuid } }
+        cursor:
+          type: integer
+          format: int64
+          description: 下次请求的 since
+        has_more: { type: boolean }
+        reconcile_gen: { type: integer, format: int64 }
+
+    SyncManifestOutput:
+      type: object
+      required: [snippet_ids, cursor, reconcile_gen]
+      properties:
+        snippet_ids:
+          type: array
+          items: { type: string, format: uuid }
+        cursor: { type: integer, format: int64 }
+        reconcile_gen: { type: integer, format: int64 }
+
+    SyncMutation:
+      type: object
+      required: [entity, op, id]
+      properties:
+        entity: { type: string, enum: [snippet, page, tag] }
+        op:
+          type: string
+          enum: [put, delete, move, tags]
+          description: move / tags 只用于碎片
+        id: { type: string, format: uuid }
+        base_version:
+          type: integer
+          format: int64
+          description: 碎片 put / delete 所基于的服务端版本；0 = 本机新建
+        snippet:
+          description: 碎片 put：正文的完整状态（null 即清空），外加只在新建时使用的 page_id / tag_ids
+          type: object
+          required: [type, source_type]
+          properties:
+            type: { $ref: '#/components/schemas/SnippetType' }
+            subtype: { type: [string, 'null'] }
+            title: { type: [string, 'null'] }
+            description: { type: [string, 'null'] }
+            text_content: { type: [string, 'null'], format: byte }
+            text_format: { $ref: '#/components/schemas/SnippetTextFormat' }
+            text_lang: { type: [string, 'null'] }
+            payload: { type: object, additionalProperties: true }
+            source_type: { $ref: '#/components/schemas/SnippetSourceType' }
+            source_data: { type: object, additionalProperties: true }
+            elements:
+              type: array
+              items: { $ref: '#/components/schemas/ElementInput' }
+            created_at: { type: [string, 'null'], format: date-time }
+            updated_at: { type: [string, 'null'], format: date-time }
+            page_id: { type: [string, 'null'], format: uuid }
+            tag_ids:
+              type: array
+              items: { type: string, format: uuid }
+        page_id:
+          type: [string, 'null']
+          format: uuid
+          description: 碎片 move 的目标页面；null = 移出页面
+        add:
+          type: array
+          items: { type: string, format: uuid }
+        remove:
+          type: array
+          items: { type: string, format: uuid }
+        page:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string, minLength: 1, maxLength: 100 }
+            is_hidden: { type: boolean }
+            order_idx: { type: integer }
+            created_at: { type: [string, 'null'], format: date-time }
+        tag:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string, minLength: 1, maxLength: 50 }
+            created_at: { type: [string, 'null'], format: date-time }
+
+    SyncResult:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, conflict, rejected, retry]
+          description: |
+            - ok：已应用（或服务端本来就是这样），采用返回的状态。
+            - conflict：本次改动没生效，采用返回的状态；碎片内容已进冲突收件箱（loser_id）。
+            - rejected：要等用户处理（额度、受限、数据不合法），保留在本机、不自动重试。
+            - retry：暂时失败，稍后原样重试。
+        code:
+          type: string
+          enum: [quota, invalid, id_taken, file_missing, read_only]
+        error: { type: string }
+        quota: { $ref: '#/components/schemas/QuotaError' }
+        snippet: { $ref: '#/components/schemas/Snippet' }
+        page: { $ref: '#/components/schemas/Page' }
+        tag: { $ref: '#/components/schemas/Tag' }
+        deleted:
+          type: boolean
+          description: 该实体在服务端已删除，本机应删掉它
+        loser_id:
+          type: string
+          format: uuid
 
     SnippetUpdateInput:
       type: object
@@ -2394,12 +2615,6 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/Snippet' }
-        next_since:
-          type: [string, 'null']
-          format: date-time
-          description: |
-            仅同步模式（请求带 `since`）会出现，作为下次请求的 `since` 值。
-            浏览模式下省略。
 
     # ---------- 文件 ----------
     File:

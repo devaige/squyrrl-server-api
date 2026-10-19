@@ -20,7 +20,7 @@ func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 const snippetCols = `
 	id, page_id, type, subtype, title, description,
 	text_content, text_format, text_lang, payload,
-	source_type, source_data, version, created_at, updated_at, deleted_at, restricted_at,
+	source_type, source_data, version, created_at, updated_at, deleted_at, restricted_at, sync_seq,
 	COALESCE((SELECT array_agg(tag_id) FROM snippet_tags WHERE snippet_id = s.id), '{}') AS tag_ids,
 	COALESCE(
 		(SELECT json_agg(jsonb_build_object(
@@ -49,7 +49,7 @@ func scanSnippet(row pgx.Row) (*Snippet, error) {
 		&s.ID, &s.PageID, &s.Type, &s.Subtype, &s.Title, &s.Description,
 		&s.TextContent, &s.TextFormat, &s.TextLang, &s.Payload,
 		&s.SourceType, &s.SourceData, &s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
-		&s.RestrictedAt, &s.TagIDs, &elementsJSON,
+		&s.RestrictedAt, &s.SyncSeq, &s.TagIDs, &elementsJSON,
 	)
 	if err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func (r *Repo) EnsureTagsOwned(ctx context.Context, userID uuid.UUID, tagIDs []u
 	}
 	var n int
 	if err := r.pool.QueryRow(ctx, `
-		SELECT count(*) FROM tags WHERE user_id = $1 AND id = ANY($2)`,
+		SELECT count(*) FROM tags WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL`,
 		userID, tagIDs).Scan(&n); err != nil {
 		return err
 	}
@@ -168,6 +168,10 @@ func (r *Repo) InsertConflictLoser(
 	if len(in.Payload) > 0 {
 		payload = in.Payload
 	}
+	elements := elementInputsOf(cur.Elements)
+	if in.Elements != nil {
+		elements = *in.Elements
+	}
 	typ, subtype := cur.Type, cur.Subtype
 	if in.Flatten && typ != "normal" {
 		// 输掉的那次编辑本来要坍塌：副本按坍塌后的形态落。否则冲突收件箱里会出现一条
@@ -178,15 +182,47 @@ func (r *Repo) InsertConflictLoser(
 		}
 	}
 
+	return r.insertLoser(ctx, userID, pageID, cur.ID, cur.Version, in.Version, &Content{
+		Type: typ, Subtype: subtype, Title: title, Description: description,
+		TextContent: textContent, TextFormat: textFormat, TextLang: textLang,
+		Payload: payload, Elements: elements,
+	})
+}
+
+// insertLoser 把一份完整的「客户端想写成的样子」作为新碎片落进冲突收件箱。
+//
+// 附件引用一并带上：副本只留文字、丢了附件，等于冲突时悄悄弄丢一半内容。
+// 来源一律记成 device + conflict 标记 —— 收件箱里的这条是「那台设备的意图」，
+// 原来的上游溯源留在主版本上。
+func (r *Repo) insertLoser(
+	ctx context.Context,
+	userID, pageID, originalID uuid.UUID,
+	originalVersion, attemptedVersion int64,
+	c *Content,
+) (uuid.UUID, error) {
 	sourceData, _ := json.Marshal(map[string]any{
 		"provider":                     "conflict",
-		"original_snippet_id":          cur.ID.String(),
-		"original_version_at_conflict": cur.Version,
-		"client_attempted_version":     in.Version,
+		"original_snippet_id":          originalID.String(),
+		"original_version_at_conflict": originalVersion,
+		"client_attempted_version":     attemptedVersion,
 	})
+	payload := c.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage("{}")
+	}
+	textFormat := c.TextFormat
+	if textFormat == "" {
+		textFormat = "plain"
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
 
 	var id uuid.UUID
-	err := r.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO snippets (
 			user_id, page_id, type, subtype, title, description,
 			text_content, text_format, text_lang, payload,
@@ -194,10 +230,26 @@ func (r *Repo) InsertConflictLoser(
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id`,
-		userID, pageID, typ, subtype,
-		title, description, textContent, textFormat, textLang, payload,
-		"device", sourceData).Scan(&id)
-	return id, err
+		userID, pageID, c.Type, c.Subtype,
+		c.Title, c.Description, c.TextContent, textFormat, c.TextLang, payload,
+		"device", sourceData).Scan(&id); err != nil {
+		return uuid.Nil, err
+	}
+	if len(c.Elements) > 0 {
+		if err := insertElements(ctx, tx, id, c.Elements); err != nil {
+			return uuid.Nil, err
+		}
+	}
+	return id, tx.Commit(ctx)
+}
+
+// elementInputsOf 把读出来的附件还原成写入形态。
+func elementInputsOf(els []Element) []ElementInput {
+	out := make([]ElementInput, 0, len(els))
+	for _, e := range els {
+		out = append(out, ElementInput{FileID: e.FileID, OrderIdx: e.OrderIdx, AltText: e.AltText})
+	}
+	return out
 }
 
 // EnsureFilesExist 校验所有 fileIDs 都存在（files 是全局共享去重表，不属于具体用户）
@@ -256,17 +308,17 @@ func (r *Repo) Create(ctx context.Context, userID uuid.UUID, in *CreateInput) (*
 		INSERT INTO snippets (
 			id, user_id, page_id, type, subtype, title, description,
 			text_content, text_format, text_lang, payload,
-			source_type, source_data
+			source_type, source_data, created_at, updated_at
 		)
 		VALUES (
 			COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7,
 			$8, $9, $10, $11,
-			$12, $13
+			$12, $13, COALESCE($14, now()), COALESCE($15, $14, now())
 		)
 		RETURNING id`,
 		in.ID, userID, in.PageID, in.Type, in.Subtype, in.Title, in.Description,
 		in.TextContent, textFormat, in.TextLang, payload,
-		in.SourceType, sourceData,
+		in.SourceType, sourceData, in.CreatedAt, in.UpdatedAt,
 	).Scan(&id); err != nil {
 		return nil, err
 	}
@@ -302,7 +354,7 @@ func (r *Repo) Get(ctx context.Context, userID, id uuid.UUID) (*Snippet, error) 
 	return s, err
 }
 
-// List 按过滤条件返回；若提供了 since，按 updated_at 升序作为同步流；否则按 updated_at 降序作为浏览流
+// List 按过滤条件返回未删除的碎片，按 updated_at 降序（浏览用）。
 func (r *Repo) List(ctx context.Context, userID uuid.UUID, in *ListInput) ([]Snippet, error) {
 	limit := in.Limit
 	if limit <= 0 || limit > 200 {
@@ -311,11 +363,8 @@ func (r *Repo) List(ctx context.Context, userID uuid.UUID, in *ListInput) ([]Sni
 
 	var conds []string
 	args := []any{userID}
-	conds = append(conds, "s.user_id = $1")
+	conds = append(conds, "s.user_id = $1", "s.deleted_at IS NULL")
 
-	if !in.IncludeDeleted {
-		conds = append(conds, "s.deleted_at IS NULL")
-	}
 	if in.PageID != nil {
 		args = append(args, *in.PageID)
 		conds = append(conds, "s.page_id = $"+itoa(len(args)))
@@ -333,19 +382,13 @@ func (r *Repo) List(ctx context.Context, userID uuid.UUID, in *ListInput) ([]Sni
 				" OR COALESCE(s.description, '') ILIKE $"+itoa(len(args))+")")
 	}
 
-	order := "s.updated_at DESC"
-	if in.Since != nil {
-		args = append(args, *in.Since)
-		conds = append(conds, "s.updated_at >= $"+itoa(len(args)))
-		order = "s.updated_at ASC"
-	}
 	args = append(args, limit)
 
 	q := `
 		SELECT ` + snippetCols + `
 		FROM snippets s
 		WHERE ` + strings.Join(conds, " AND ") + `
-		ORDER BY ` + order + `, s.id ASC
+		ORDER BY s.updated_at DESC, s.id ASC
 		LIMIT $` + itoa(len(args))
 
 	rows, err := r.pool.Query(ctx, q, args...)
@@ -365,8 +408,10 @@ func (r *Repo) List(ctx context.Context, userID uuid.UUID, in *ListInput) ([]Sni
 	return out, rows.Err()
 }
 
-// Update 应用乐观锁；要求 expectedVersion 与当前版本一致
-// 字段为 nil 则保持不变；TagIDs 为 nil 不变，空切片清空，非空替换
+// Update 应用乐观锁；字段为 nil 则保持不变；TagIDs 为 nil 不变，空切片清空，非空替换。
+//
+// 只有改了正文类字段时才核对版本、版本才 +1、updated_at 才更新（ADR-084）：
+// 移动页面、改标签不算修改正文，不该让别处一次并发的正文编辑变成冲突。
 func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput) (*Snippet, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -378,7 +423,8 @@ func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput
 	if err != nil {
 		return nil, err
 	}
-	if cur.Version != in.Version {
+	content := in.HasContent()
+	if content && cur.Version != in.Version {
 		return nil, ErrVersionConflict
 	}
 	if cur.DeletedAt != nil {
@@ -426,12 +472,13 @@ func (r *Repo) Update(ctx context.Context, userID, id uuid.UUID, in *UpdateInput
 			subtype = $9,
 			source_type = $10,
 			source_data = $11,
-			version = version + 1
-		WHERE id = $12 AND user_id = $13 AND version = $14`,
+			version = version + CASE WHEN $14 THEN 1 ELSE 0 END,
+			updated_at = CASE WHEN $14 THEN now() ELSE updated_at END
+		WHERE id = $12 AND user_id = $13`,
 		cur.PageID, cur.Title, cur.Description, cur.TextContent,
 		cur.TextFormat, cur.TextLang, cur.Payload,
 		cur.Type, cur.Subtype, cur.SourceType, cur.SourceData,
-		id, userID, in.Version); err != nil {
+		id, userID, content); err != nil {
 		return nil, err
 	}
 

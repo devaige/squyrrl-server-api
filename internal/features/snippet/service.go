@@ -70,11 +70,6 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, in *ListInput) (*L
 	if items == nil {
 		out.Items = []Snippet{}
 	}
-	// 同步流（升序）下，把最后一项的 updated_at 作为下一次请求的 since
-	if in.Since != nil && len(items) > 0 {
-		last := items[len(items)-1].UpdatedAt
-		out.NextSince = &last
-	}
 	return out, nil
 }
 

@@ -109,7 +109,8 @@ func (h *Handler) update(c *gin.Context) {
 	if v, ok := parseIfMatch(c.GetHeader("If-Match")); ok {
 		in.Version = v
 	}
-	if in.Version == 0 {
+	// 只有改正文才核对版本（ADR-084）；只移动页面、改标签的请求可以不带
+	if in.Version == 0 && in.HasContent() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 version（请求体或 If-Match 头）"})
 		return
 	}

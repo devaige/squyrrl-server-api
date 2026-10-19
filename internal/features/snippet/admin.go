@@ -91,7 +91,7 @@ func (r *AdminRepo) List(ctx context.Context, userID uuid.UUID, in AdminListInpu
 	if err := r.names(ctx, `SELECT id, name FROM pages WHERE user_id = $1`, userID, out.Pages); err != nil {
 		return nil, err
 	}
-	if err := r.names(ctx, `SELECT id, name FROM tags WHERE user_id = $1`, userID, out.Tags); err != nil {
+	if err := r.names(ctx, `SELECT id, name FROM tags WHERE user_id = $1 AND deleted_at IS NULL`, userID, out.Tags); err != nil {
 		return nil, err
 	}
 	return out, nil

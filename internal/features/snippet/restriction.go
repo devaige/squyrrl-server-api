@@ -220,14 +220,30 @@ func (s *RestrictionSweeper) reconcileUser(ctx context.Context, userID uuid.UUID
 // 与回收站清理（TrashSweeper）是两条独立的链路，删除的也是两类东西：
 // 那边删的是用户自己删过、超出保留期的；这边删的是用户没删、但已经不在额度内
 // 且两个阶段都走完了的。共用 elements 的 CASCADE 与 ref_count 触发器。
+//
+// 这里删的只是**云端副本**（ADR-084，用户决策 D）：用户本机的数据不受影响。
+// 所以活着的碎片不留墓碑 —— 墓碑会让设备把本机那份也删掉 —— 而是给账号的
+// reconcile_gen +1，设备见到后对一次账，把这些碎片重新标成未同步。
+// 用户自己删过（deleted_at 非空）又恰好受限的照样留墓碑：那是用户的删除。
 func (s *RestrictionSweeper) purge(ctx context.Context) (int, error) {
-	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM snippets
-		WHERE restricted_at IS NOT NULL
-		  AND restricted_at < now() - $1::interval`,
-		(RestrictionGrace + RestrictionFreeze).String())
-	if err != nil {
-		return 0, err
-	}
-	return int(tag.RowsAffected()), nil
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		WITH purged AS (
+			DELETE FROM snippets
+			WHERE restricted_at IS NOT NULL
+			  AND restricted_at < now() - $1::interval
+			RETURNING id, user_id, sync_seq, deleted_at
+		),
+		tombstones AS (
+			INSERT INTO snippet_tombstones (id, user_id, sync_seq)
+			SELECT id, user_id, sync_seq FROM purged WHERE deleted_at IS NOT NULL
+			ON CONFLICT (id) DO NOTHING
+		),
+		reconciled AS (
+			UPDATE sync_cursors c SET reconcile_gen = c.reconcile_gen + 1
+			WHERE c.user_id IN (SELECT user_id FROM purged WHERE deleted_at IS NULL)
+		)
+		SELECT count(*) FROM purged`,
+		(RestrictionGrace + RestrictionFreeze).String()).Scan(&n)
+	return n, err
 }

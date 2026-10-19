@@ -105,7 +105,7 @@ func (e *Exporter) writePages(ctx context.Context, userID uuid.UUID, w io.Writer
 // 而中途失败就会留下一批没有标签的碎片。
 func (e *Exporter) writeTags(ctx context.Context, userID uuid.UUID, w io.Writer) error {
 	rows, err := e.pool.Query(ctx,
-		`SELECT id, name FROM tags WHERE user_id = $1 ORDER BY name, id`, userID)
+		`SELECT id, name FROM tags WHERE user_id = $1 AND deleted_at IS NULL ORDER BY name, id`, userID)
 	if err != nil {
 		return err
 	}

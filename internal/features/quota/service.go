@@ -86,7 +86,7 @@ func (s *Service) CheckPageCreate(ctx context.Context, userID uuid.UUID) error {
 // CheckTagCreate 在新建标签前校验总量。
 func (s *Service) CheckTagCreate(ctx context.Context, userID uuid.UUID) error {
 	return s.checkCount(ctx, userID, LimitTags,
-		`SELECT count(*) FROM tags WHERE user_id = $1`)
+		`SELECT count(*) FROM tags WHERE user_id = $1 AND deleted_at IS NULL`)
 }
 
 // deviceCountSQL 数「真正的设备」。
@@ -323,7 +323,7 @@ func (s *Service) CurrentUsage(ctx context.Context, userID uuid.UUID) (Usage, er
 		SELECT
 			(SELECT count(*) FROM snippets WHERE user_id = $1 AND deleted_at IS NULL),
 			(SELECT count(*) FROM pages    WHERE user_id = $1 AND deleted_at IS NULL AND is_system = FALSE),
-			(SELECT count(*) FROM tags     WHERE user_id = $1),
+			(SELECT count(*) FROM tags     WHERE user_id = $1 AND deleted_at IS NULL),
 			(SELECT count(*) FROM devices d WHERE d.user_id = $1 AND d.revoked_at IS NULL
 			   AND NOT EXISTS (SELECT 1 FROM platform_bindings pb WHERE pb.device_id = d.id))`,
 		userID).Scan(&u.Snippets, &u.Pages, &u.Tags, &u.Devices)
