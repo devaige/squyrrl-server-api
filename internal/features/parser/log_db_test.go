@@ -37,7 +37,7 @@ func TestLogListCacheSource(t *testing.T) {
 		t.Fatalf("取种子接口失败: %v", err)
 	}
 	var sampleID uuid.UUID
-	if err := pool.QueryRow(ctx, `INSERT INTO api_samples (endpoint_id, kind, http_status) VALUES ($1, 'live', 200) RETURNING id`,
+	if err := pool.QueryRow(ctx, `INSERT INTO api_samples (endpoint_id, http_status) VALUES ($1, 200) RETURNING id`,
 		endpointID).Scan(&sampleID); err != nil {
 		t.Fatalf("建采样失败: %v", err)
 	}

@@ -563,7 +563,7 @@ func TestAttemptLinksLiveSample(t *testing.T) {
 		t.Fatal("开了线上采样的接口，尝试应关联采样")
 	}
 	sample, err := env.extapi.GetSample(context.Background(), *a.SampleID)
-	if err != nil || sample.Kind != "live" || !strings.Contains(string(sample.Response), "上游正文") {
+	if err != nil || !strings.Contains(string(sample.Response), "上游正文") {
 		t.Errorf("关联的采样不对: %+v %v", sample, err)
 	}
 }

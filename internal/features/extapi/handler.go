@@ -29,14 +29,11 @@ func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 	g.GET("/api-endpoints/:id", h.get)
 	g.PATCH("/api-endpoints/:id", h.update)
 	g.GET("/api-endpoints/:id/samples", h.listSamples)
-	g.POST("/api-endpoints/:id/samples", h.addSample)
 
 	g.GET("/api-adapters", h.adapters)
 
+	// 线上采样只读：示例在代码里维护，后台不增删
 	g.GET("/api-samples/:id", h.getSample)
-	g.POST("/api-samples/:id/promote", h.promoteSample)
-	g.PATCH("/api-samples/:id", h.updateSample)
-	g.DELETE("/api-samples/:id", h.deleteSample)
 }
 
 func (h *Handler) getSample(c *gin.Context) {
@@ -50,58 +47,6 @@ func (h *Handler) getSample(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, x)
-}
-
-func (h *Handler) promoteSample(c *gin.Context) {
-	id, ok := parseID(c)
-	if !ok {
-		return
-	}
-	var in PromoteSampleInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	newID, err := h.svc.PromoteSample(c.Request.Context(), id, in.Note)
-	if err != nil {
-		writeErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"id": newID})
-}
-
-func (h *Handler) updateSample(c *gin.Context) {
-	id, ok := parseID(c)
-	if !ok {
-		return
-	}
-	var in UpdateSampleInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := h.svc.UpdateSampleNote(c.Request.Context(), id, in.Note); err != nil {
-		writeErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-func (h *Handler) deleteSample(c *gin.Context) {
-	id, ok := parseID(c)
-	if !ok {
-		return
-	}
-	deleted, err := h.svc.DeleteSample(c.Request.Context(), id)
-	if err != nil {
-		writeErr(c, err)
-		return
-	}
-	if !deleted {
-		c.JSON(http.StatusNotFound, gin.H{"error": "只能删除示例；线上采样按保留期自动清理"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (h *Handler) listAccounts(c *gin.Context) {
@@ -237,29 +182,12 @@ func (h *Handler) listSamples(c *gin.Context) {
 	if !ok {
 		return
 	}
-	items, err := h.svc.ListSamples(c.Request.Context(), id)
+	items, examples, err := h.svc.ListSamples(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
-}
-
-func (h *Handler) addSample(c *gin.Context) {
-	id, ok := parseID(c)
-	if !ok {
-		return
-	}
-	var in CreateSampleInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := h.svc.AddSample(c.Request.Context(), id, in); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"items": items, "examples": examples})
 }
 
 func parseID(c *gin.Context) (uuid.UUID, bool) {

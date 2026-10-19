@@ -1,20 +1,19 @@
 package parser
 
 import (
-	"context"
 	"embed"
-	"encoding/json"
 	"log/slog"
 
 	"github.com/squyrrl/api/internal/features/extapi"
 )
 
-// 内置示例：接入每个上游接口时核对过的实测响应（2026-10-16，两批都是 TikHub 返回的完整 data）。
+// 示例：接入或补全每个上游接口时核对过的实测响应（首批 2026-10-16，都是 TikHub 返回的完整 data）。
 //
-// 同一批文件有两个用途：测试拿它们验证适配器；首次部署时写进后台，成为各接口的第一批
-// 「示例」，线上采样的结构比对以它们为基准。之后发现新结构，在后台把线上采样存为示例即可，
-// 不必回到这里加。失败形态的样本（上游空壳、v1 误报不存在）只用于测试，不进示例 ——
-// 它们会把「所有示例共有的字段」压到几乎为零，结构比对就失去意义。
+// 同一批文件有两个用途：测试拿它们验证适配器；它们就是各接口的「示例」，后台线上采样的
+// 结构比对以它们为基准（AdapterSet.Examples）。示例只在这里维护，部署即生效，后台只读：
+// 发现缺失或新增时，把那条线上采样的响应精简后放进 testdata/tikhub/、登记到下面的清单
+// （用户决定 2026-10-19）。失败形态的样本（上游空壳、v1 误报不存在）只用于测试，不进示例 ——
+// 它们几乎没有字段，任何响应和它比都「不缺」，结构比对就失去意义。
 //
 //go:embed testdata/tikhub/*.json
 var tikhubFixtures embed.FS
@@ -125,49 +124,22 @@ func readFixture(file string) ([]byte, error) {
 	return tikhubFixtures.ReadFile("testdata/tikhub/" + file + ".json")
 }
 
-// SeedSamples 把内置示例写进还没有任何示例的接口。失败只记日志 —— 示例是排查辅助，
-// 不该让 API 起不来。
-func SeedSamples(ctx context.Context, ext *extapi.Service, adapters AdapterSet) {
-	bySlug := map[string][]extapi.SeedSample{}
-	var order []string
+// Examples 实现 extapi.Catalog：某个接口的示例，即清单里属于它的那几份实测响应。
+func (s AdapterSet) Examples(slug string) []extapi.Example {
+	if _, ok := s[slug]; !ok {
+		return nil
+	}
+	var out []extapi.Example
 	for _, b := range builtinSamples {
-		ad, ok := adapters[b.slug]
-		if !ok {
+		if b.slug != slug {
 			continue
 		}
 		data, err := readFixture(b.file)
 		if err != nil {
-			slog.Warn("内置示例缺文件", "file", b.file, "err", err)
+			slog.Warn("示例缺文件", "file", b.file, "err", err)
 			continue
 		}
-		req := ad.Request(b.fullTarget())
-		snapReq := map[string]any{"method": nonEmpty(req.Method, "GET"), "url": req.URL, "query": req.Query}
-		if len(req.Body) > 0 {
-			snapReq["body"] = json.RawMessage(req.Body)
-		}
-		reqJSON, _ := json.Marshal(snapReq)
-		// 与线上采样同一形状 {"status", "body"}；TikHub 外壳只留 code 与 data
-		respJSON, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": json.RawMessage(data)}})
-		if _, seen := bySlug[b.slug]; !seen {
-			order = append(order, b.slug)
-		}
-		bySlug[b.slug] = append(bySlug[b.slug], extapi.SeedSample{
-			ResourceID: b.target.ResourceID, Request: reqJSON, Response: respJSON,
-			Note: "接入时实测：" + b.note,
-		})
+		out = append(out, extapi.Example{Note: b.note, ResourceID: b.target.ResourceID, Data: data})
 	}
-	total, endpoints := 0, 0
-	for _, slug := range order {
-		n, err := ext.SeedSamples(ctx, slug, bySlug[slug])
-		if err != nil {
-			slog.Warn("写入内置示例失败", "slug", slug, "err", err)
-			continue
-		}
-		if n > 0 {
-			total, endpoints = total+n, endpoints+1
-		}
-	}
-	if total > 0 {
-		slog.Info("已写入内置示例", "samples", total, "endpoints", endpoints)
-	}
+	return out
 }

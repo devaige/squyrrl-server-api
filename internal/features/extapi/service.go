@@ -165,7 +165,7 @@ func (s *Service) archiveLive(ctx context.Context, endpointID uuid.UUID, resourc
 	}
 	reqJSON, _ := json.Marshal(snapReq)
 	respJSON, _ := json.Marshal(map[string]any{"status": status, "body": jsonOrString(raw)})
-	id, err := s.repo.InsertSample(ctx, endpointID, "live", resourceID, reqJSON, respJSON, status, latencyMs, "")
+	id, err := s.repo.InsertSample(ctx, endpointID, resourceID, reqJSON, respJSON, status, latencyMs)
 	if err != nil {
 		slog.Warn("extapi 存档失败", "err", err)
 		return nil
@@ -252,108 +252,52 @@ func (s *Service) GetEndpoint(ctx context.Context, id uuid.UUID) (*Endpoint, err
 // Adapters 返回代码里注册的全部适配器。
 func (s *Service) Adapters() []AdapterInfo { return s.catalog.Adapters() }
 
-// AddSample 录入一条管理员提供的请求/响应示例（kind='sample'）。
-func (s *Service) AddSample(ctx context.Context, id uuid.UUID, in CreateSampleInput) error {
-	_, err := s.repo.InsertSample(ctx, id, "sample", in.ResourceID,
-		nilIfEmpty(in.Request), nilIfEmpty(in.Response), in.HTTPStatus, 0, in.Note)
-	return err
-}
-
-// ListSamples 列出接口的示例与线上采样。线上采样带上相对示例的结构差异计数；
+// ListSamples 列出接口的线上采样（带上相对示例的结构差异计数）与作为基准的示例。
 // 列表不带请求响应正文（单条可达几百 KB），看详情走 GetSample。
-func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, error) {
+func (s *Service) ListSamples(ctx context.Context, id uuid.UUID) ([]Sample, []Example, error) {
 	all, err := s.repo.ListSamples(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var examples []Example
 	var watched []string
-	if ep, err := s.repo.Get(ctx, id); err == nil && s.catalog != nil {
-		watched = s.catalog.WatchedPaths(ep.Slug)
+	if ep, err := s.repo.Get(ctx, id); err == nil {
+		examples, watched = s.comparisonFor(ep.Slug)
 	}
-	var baselines []json.RawMessage
-	for _, x := range all {
-		if x.Kind == "sample" && len(x.Response) > 0 {
-			baselines = append(baselines, x.Response)
-		}
-	}
+	bases := baselinesOf(examples)
 	for i := range all {
 		if diffable(all[i]) {
-			all[i].Diff = diffAgainst(all[i].Response, baselines, watched, false)
+			all[i].Diff = diffAgainst(all[i].Response, bases, watched, false)
 		}
 		all[i].Request, all[i].Response = nil, nil
 	}
-	return all, nil
+	return all, examples, nil
 }
 
-// GetSample 返回一条存档的完整请求响应；线上采样附带结构差异的字段清单。
+// GetSample 返回一条线上采样的完整请求响应，附带结构差异的字段清单。
 func (s *Service) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) {
 	x, err := s.repo.GetSample(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	var examples []Example
 	var watched []string
 	if ep, err := s.repo.Get(ctx, x.EndpointID); err == nil {
 		x.EndpointSlug, x.Provider = ep.Slug, ep.Provider
-		if s.catalog != nil {
-			watched = s.catalog.WatchedPaths(ep.Slug)
-		}
+		examples, watched = s.comparisonFor(ep.Slug)
 	}
 	if diffable(*x) {
-		baselines, err := s.repo.SampleResponses(ctx, x.EndpointID)
-		if err != nil {
-			return nil, err
-		}
-		x.Diff = diffAgainst(x.Response, baselines, watched, true)
+		x.Diff = diffAgainst(x.Response, baselinesOf(examples), watched, true)
 	}
 	return x, nil
 }
 
-// PromoteSample 把一条线上采样存为示例，返回新示例的 ID。
-func (s *Service) PromoteSample(ctx context.Context, id uuid.UUID, note string) (uuid.UUID, error) {
-	return s.repo.PromoteSample(ctx, id, note)
-}
-
-func (s *Service) UpdateSampleNote(ctx context.Context, id uuid.UUID, note string) error {
-	return s.repo.UpdateSampleNote(ctx, id, note)
-}
-
-func (s *Service) DeleteSample(ctx context.Context, id uuid.UUID) (bool, error) {
-	return s.repo.DeleteSample(ctx, id)
-}
-
-// SeedSamples 给还没有任何示例的接口写入内置示例（接入时核对过的实测响应）。
-//
-// 只在「一份示例都没有」时写：管理员删掉某几份是有意为之，不该在下次启动时又冒出来；
-// 全删光了再补回来，至少保证结构比对有基准。返回写入的条数。
-func (s *Service) SeedSamples(ctx context.Context, slug string, samples []SeedSample) (int, error) {
-	eps, err := s.repo.List(ctx)
-	if err != nil {
-		return 0, err
+// comparisonFor 取结构比对的两样输入：接口的示例，和适配器代码读取的字段。
+func (s *Service) comparisonFor(slug string) ([]Example, []string) {
+	if s.catalog == nil {
+		return nil, nil
 	}
-	for _, ep := range eps {
-		if ep.Slug != slug {
-			continue
-		}
-		n, err := s.repo.CountSamples(ctx, ep.ID)
-		if err != nil || n > 0 {
-			return 0, err
-		}
-		for _, x := range samples {
-			if _, err := s.repo.InsertSample(ctx, ep.ID, "sample", x.ResourceID, x.Request, x.Response, http.StatusOK, 0, x.Note); err != nil {
-				return 0, err
-			}
-		}
-		return len(samples), nil
-	}
-	return 0, nil
-}
-
-// nilIfEmpty 把空 RawMessage 归零为 nil —— 空串写进 JSONB 列会报 invalid json。
-func nilIfEmpty(b json.RawMessage) []byte {
-	if len(b) == 0 {
-		return nil
-	}
-	return b
+	return s.catalog.Examples(slug), s.catalog.WatchedPaths(slug)
 }
 
 // 线上采样的保留规则：最近 7 天、每个接口最多 100 条。

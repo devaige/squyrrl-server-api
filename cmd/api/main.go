@@ -92,9 +92,6 @@ func main() {
 	go srv.ParseCache().RunSweeper(rootCtx, cfg.RetentionSweepInterval)
 	go srv.ExtapiService().RunSampleSweeper(rootCtx, cfg.RetentionSweepInterval)
 
-	// 首次部署时给解析接口写入内置示例（各接口已有示例就跳过），结构比对以它们为基准
-	go srv.SeedParseSamples(rootCtx)
-
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler(),

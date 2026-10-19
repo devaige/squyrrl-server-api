@@ -7,17 +7,19 @@ import (
 )
 
 // 结构比对：上游返回的 data 没有契约，会随内容形态（图文 / 视频 / 动图……）和上游改版变化。
-// 「示例」是我们核对过的请求与响应，每发现一种新结构就存一份（用户决定 2026-10-16）。
+// 「示例」是我们核对过的响应，每种形态一份，在代码里维护（Catalog.Examples，用户决定 2026-10-19）。
 // 线上采样拿来和示例逐字段比，只比字段有没有、不比值：
 //
-//	缺失 = 适配器代码会读、所有示例都有、这一份却没有的字段 —— 多半是上游改了结构，
-//	       或者是一种还没存过的新形态；
+//	缺失 = 和最接近的那份示例比，适配器代码会读、示例里有、这一份却没有的字段 ——
+//	       多半是上游改了结构，或者是一种还没收录的新形态；
 //	新增 = 所有示例都没有、这一份有的字段 —— 只作提示，可能是新形态。
 //
-// 缺失要同时满足两个条件才算，都是为了压掉噪音：
-//   - 「所有示例都有」：结构本来就随内容形态变，视频推文有 media.video、图片推文没有；
-//   - 「代码会读」：大量字段随内容可有可无（直播间、背景音乐、各语言字幕），实测同一接口
-//     两条正常响应差出 20 多个这类字段，而代码不读的字段缺了不影响解析。
+// 缺失按最接近的示例算：结构本来就随内容形态变（视频推文有 video、图片推文没有），对得上
+// 某一种已知形态就不算缺。原先按「所有示例共有的字段」算，每收录一种形态共有字段就少一些，
+// 视频推文丢了视频字段也不再报 —— 示例越多比对越松（改于 2026-10-19）。
+//
+// 只看「代码会读」的字段：大量字段随内容可有可无（直播间、背景音乐、各语言字幕），实测同一接口
+// 两条正常响应差出 20 多个这类字段，而代码不读的字段缺了不影响解析。
 
 const (
 	maxShapeDepth = 12
@@ -27,18 +29,19 @@ const (
 
 // StructureDiff 是一份响应相对于示例的结构差异。
 type StructureDiff struct {
-	Baseline     int      `json:"baseline"`      // 参与比对的示例数；0 表示还没有示例，无从比较
-	MissingCount int      `json:"missing_count"` // 按分支计：缺了 author 只算一处，不再数 author 底下的子键
+	Baseline     int      `json:"baseline"`          // 参与比对的示例数；0 表示还没有示例，无从比较
+	Closest      string   `json:"closest,omitempty"` // 最接近的那份示例（它的备注），缺失是相对它算的
+	MissingCount int      `json:"missing_count"`     // 按分支计：缺了 author 只算一处，不再数 author 底下的子键
 	AddedCount   int      `json:"added_count"`
 	Missing      []string `json:"missing,omitempty"` // 最多 maxDiffList 条，计数不受这个截断影响
 	Added        []string `json:"added,omitempty"`
 }
 
-// diffable 判断一条存档要不要和示例比：只比线上采样里上游正常应答（2xx）的那些。
+// diffable 判断一条线上采样要不要和示例比：只比上游正常应答（2xx）的那些。
 // 上游明说失败的应答（TikHub 的 400「本次请求不会被扣费」）是一段错误说明，拿去比会报出
 // 一长串「缺失」，看起来像上游改了结构，其实只是这次没取到。
 func diffable(x Sample) bool {
-	return x.Kind == "live" && x.HTTPStatus >= 200 && x.HTTPStatus < 300
+	return x.HTTPStatus >= 200 && x.HTTPStatus < 300
 }
 
 // payloadOf 从存档里取出要比的部分：存档是 {"status", "body"}，TikHub 的业务数据在 body.data，
@@ -92,58 +95,84 @@ func shapeOf(v any) map[string]struct{} {
 	return out
 }
 
+// baseline 是一份示例算好的字段集合。示例单份可达几百 KB，一次比多条采样时只解析一遍。
+type baseline struct {
+	note  string
+	shape map[string]struct{}
+}
+
+// baselinesOf 把示例解析成比对用的字段集合；解析不了的跳过（Baseline 计数也不算它）。
+func baselinesOf(examples []Example) []baseline {
+	out := make([]baseline, 0, len(examples))
+	for _, ex := range examples {
+		var v any
+		if json.Unmarshal(ex.Data, &v) != nil {
+			continue
+		}
+		out = append(out, baseline{note: ex.Note, shape: shapeOf(v)})
+	}
+	return out
+}
+
 // diffAgainst 把一份响应和一组示例比。watched 为空时缺失按全部字段算。
-func diffAgainst(response json.RawMessage, baselines []json.RawMessage, watched []string, withLists bool) *StructureDiff {
-	d := &StructureDiff{Baseline: len(baselines)}
-	if len(baselines) == 0 {
+//
+// 最接近 = 缺失（按分支）最少；一样少时取这一份比它多出的字段最少的 —— 图片推文和视频推文
+// 都不缺字段时，带着 video 的这一份更像视频推文。
+func diffAgainst(response json.RawMessage, bases []baseline, watched []string, withLists bool) *StructureDiff {
+	d := &StructureDiff{Baseline: len(bases)}
+	if len(bases) == 0 {
 		return d
 	}
 	live := shapeOf(payloadOf(response))
 
-	var core map[string]struct{} // 所有示例共有
-	union := map[string]struct{}{}
-	for _, b := range baselines {
-		s := shapeOf(payloadOf(b))
-		for p := range s {
-			union[p] = struct{}{}
-		}
-		if core == nil {
-			core = s
-			continue
-		}
-		for p := range core {
-			if _, ok := s[p]; !ok {
-				delete(core, p)
-			}
-		}
-	}
-
+	var keep map[string]struct{}
 	if len(watched) > 0 {
-		keep := make(map[string]struct{}, len(watched))
+		keep = make(map[string]struct{}, len(watched))
 		for _, p := range watched {
 			keep[p] = struct{}{}
 		}
-		for p := range core {
-			if _, ok := keep[p]; !ok {
-				delete(core, p)
+	}
+
+	var missing []string
+	bestExtra := 0
+	for i, b := range bases {
+		var miss []string
+		for p := range b.shape {
+			if _, read := keep[p]; keep != nil && !read {
+				continue
 			}
+			if _, ok := live[p]; !ok {
+				miss = append(miss, p)
+			}
+		}
+		miss = topLevelFirst(miss)
+		extra := 0
+		for p := range live {
+			if _, ok := b.shape[p]; !ok {
+				extra++
+			}
+		}
+		if i == 0 || len(miss) < len(missing) || (len(miss) == len(missing) && extra < bestExtra) {
+			missing, bestExtra, d.Closest = miss, extra, b.note
 		}
 	}
 
-	var missing, added []string
-	for p := range core {
-		if _, ok := live[p]; !ok {
-			missing = append(missing, p)
-		}
-	}
+	var added []string
 	for p := range live {
-		if _, ok := union[p]; !ok {
+		known := false
+		for _, b := range bases {
+			if _, ok := b.shape[p]; ok {
+				known = true
+				break
+			}
+		}
+		if !known {
 			added = append(added, p)
 		}
 	}
 	// 计数与列表用同一口径（按分支）：原先计数算的是全部路径，新增了 suggest_words 就把
 	// 它底下每个子键都算一遍，页面上写着「新增 24」却只列出 12 行。
-	missing, added = topLevelFirst(missing), topLevelFirst(added)
+	added = topLevelFirst(added)
 	d.MissingCount, d.AddedCount = len(missing), len(added)
 	if withLists {
 		d.Missing, d.Added = missing[:min(len(missing), maxDiffList)], added[:min(len(added), maxDiffList)]

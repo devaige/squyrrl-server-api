@@ -264,43 +264,40 @@ func (r *Repo) ListLedger(ctx context.Context, accountID uuid.UUID, includeCalls
 	return out, rows.Err()
 }
 
-// ---- 存档 ----
+// ---- 线上采样 ----
 
-func (r *Repo) InsertSample(ctx context.Context, endpointID uuid.UUID, kind, resourceID string,
-	request, response []byte, httpStatus, latencyMs int, note string) (uuid.UUID, error) {
-	var rid, nt *string
+func (r *Repo) InsertSample(ctx context.Context, endpointID uuid.UUID, resourceID string,
+	request, response []byte, httpStatus, latencyMs int) (uuid.UUID, error) {
+	var rid *string
 	if resourceID != "" {
 		rid = &resourceID
 	}
-	if note != "" {
-		nt = &note
-	}
 	var id uuid.UUID
 	err := r.pool.QueryRow(ctx, `
-		INSERT INTO api_samples (endpoint_id, kind, resource_id, request, response, http_status, latency_ms, note)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO api_samples (endpoint_id, resource_id, request, response, http_status, latency_ms)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id`,
-		endpointID, kind, rid, request, response, httpStatus, latencyMs, nt).Scan(&id)
+		endpointID, rid, request, response, httpStatus, latencyMs).Scan(&id)
 	return id, err
 }
 
-const sampleCols = `id, endpoint_id, kind, COALESCE(resource_id, ''), request, response,
-	COALESCE(http_status, 0), COALESCE(latency_ms, 0), COALESCE(note, ''), created_at`
+const sampleCols = `id, endpoint_id, COALESCE(resource_id, ''), request, response,
+	COALESCE(http_status, 0), COALESCE(latency_ms, 0), created_at`
 
 func scanSample(row pgx.Row) (Sample, error) {
 	var s Sample
 	var req, resp []byte
-	err := row.Scan(&s.ID, &s.EndpointID, &s.Kind, &s.ResourceID, &req, &resp,
-		&s.HTTPStatus, &s.LatencyMs, &s.Note, &s.CreatedAt)
+	err := row.Scan(&s.ID, &s.EndpointID, &s.ResourceID, &req, &resp,
+		&s.HTTPStatus, &s.LatencyMs, &s.CreatedAt)
 	s.Request, s.Response = json.RawMessage(req), json.RawMessage(resp)
 	return s, err
 }
 
-// ListSamples 返回接口的全部示例与线上采样（含完整请求响应，供服务层算结构差异）。
+// ListSamples 返回接口的线上采样（含完整请求响应，供服务层算结构差异）。
 func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+sampleCols+` FROM api_samples WHERE endpoint_id = $1
-		ORDER BY kind DESC, created_at DESC LIMIT 500`, endpointID) // kind DESC：sample 排在 live 前
+		ORDER BY created_at DESC LIMIT 500`, endpointID)
 	if err != nil {
 		return nil, err
 	}
@@ -316,25 +313,6 @@ func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample,
 	return out, rows.Err()
 }
 
-// SampleResponses 取接口全部示例的响应，作为结构比对的基准。
-func (r *Repo) SampleResponses(ctx context.Context, endpointID uuid.UUID) ([]json.RawMessage, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT response FROM api_samples WHERE endpoint_id = $1 AND kind = 'sample' AND response IS NOT NULL`, endpointID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []json.RawMessage
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		out = append(out, json.RawMessage(b))
-	}
-	return out, rows.Err()
-}
-
 func (r *Repo) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) {
 	s, err := scanSample(r.pool.QueryRow(ctx, `SELECT `+sampleCols+` FROM api_samples WHERE id = $1`, id))
 	if err != nil {
@@ -343,41 +321,12 @@ func (r *Repo) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) {
 	return &s, nil
 }
 
-// PromoteSample 把一条存档复制成示例（原线上采样照常按保留期清理）。
-func (r *Repo) PromoteSample(ctx context.Context, id uuid.UUID, note string) (uuid.UUID, error) {
-	var newID uuid.UUID
-	err := r.pool.QueryRow(ctx, `
-		INSERT INTO api_samples (endpoint_id, kind, resource_id, request, response, http_status, latency_ms, note)
-		SELECT endpoint_id, 'sample', resource_id, request, response, http_status, latency_ms, $2
-		FROM api_samples WHERE id = $1
-		RETURNING id`, id, note).Scan(&newID)
-	return newID, err
-}
-
-func (r *Repo) UpdateSampleNote(ctx context.Context, id uuid.UUID, note string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE api_samples SET note = $2 WHERE id = $1 AND kind = 'sample'`, id, note)
-	return err
-}
-
-// DeleteSample 只删示例；线上采样由保留期清理，不手工删。
-func (r *Repo) DeleteSample(ctx context.Context, id uuid.UUID) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM api_samples WHERE id = $1 AND kind = 'sample'`, id)
-	return tag.RowsAffected() > 0, err
-}
-
-func (r *Repo) CountSamples(ctx context.Context, endpointID uuid.UUID) (int, error) {
-	var n int
-	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM api_samples WHERE endpoint_id = $1 AND kind = 'sample'`, endpointID).Scan(&n)
-	return n, err
-}
-
 // PruneLiveSamples 清理线上采样：超过 maxAge 的删掉，每个接口超过 keep 条的删掉旧的。
 //
 // 按时间保留是为了解析记录：排查一次失败时要能点回当次的响应，所以「最近几天」比
 // 「最近几条」更有用；按条数封顶是为了高频接口不至于在几天里攒下几万行。
 //
 // 排序带 id 兜底：同毫秒写入的多条若只按 created_at 排，谁进窗口是不确定的。
-// kind='sample'（示例）不在范围内 —— 那是核对过的结构，永久保留。
 func (r *Repo) PruneLiveSamples(ctx context.Context, keep int, maxAge time.Duration) (int64, error) {
 	tag, err := r.pool.Exec(ctx, `
 		DELETE FROM api_samples s
@@ -386,7 +335,6 @@ func (r *Repo) PruneLiveSamples(ctx context.Context, keep int, maxAge time.Durat
 				PARTITION BY endpoint_id ORDER BY created_at DESC, id DESC
 			) AS rn
 			FROM api_samples
-			WHERE kind = 'live'
 		) ranked
 		WHERE s.id = ranked.id AND (ranked.rn > $1 OR ranked.created_at < now() - $2::interval)`,
 		keep, fmt.Sprintf("%d seconds", int64(maxAge.Seconds())))

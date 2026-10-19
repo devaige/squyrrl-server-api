@@ -363,7 +363,7 @@ func TestXHSPriceFactor(t *testing.T) {
 	}
 }
 
-// 内置示例：每一份都能被对应的适配器解码（失败形态不在其中），并且写库只在接口还没有示例时发生。
+// 示例：每一份都能被对应的适配器解码（失败形态不在其中），每个适配器至少有一份。
 func TestBuiltinSamples(t *testing.T) {
 	adapters := TikHubAdapters()
 	covered := map[string]bool{}
@@ -662,23 +662,16 @@ func TestTikHubSeedMatchesAdapters(t *testing.T) {
 	}
 }
 
-// 内置示例只写一次；线上采样与之比对：同结构无差异，丢了共有字段会被标出来。
-func TestSeedSamplesAndCompare(t *testing.T) {
+// 线上采样与代码里的示例比对：同结构无差异，丢了代码读的字段会被标出来。
+func TestCompareAgainstExamples(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	adapters := TikHubAdapters()
 	ext := extapi.NewService(extapi.NewRepo(pool), extapi.Credentials{}, adapters)
-	SeedSamples(ctx, ext, adapters)
-	SeedSamples(ctx, ext, adapters) // 第二次不应重复写
 
 	var epID uuid.UUID
 	if err := pool.QueryRow(ctx, `SELECT id FROM api_endpoints WHERE slug = 'tikhub_twitter_web_fetch_tweet_detail'`).Scan(&epID); err != nil {
 		t.Fatal(err)
-	}
-	var n int
-	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM api_samples WHERE endpoint_id = $1 AND kind = 'sample'`, epID).Scan(&n)
-	if n != 2 {
-		t.Fatalf("推文接口应有 2 份内置示例（图片、视频），实有 %d", n)
 	}
 
 	repo := extapi.NewRepo(pool)
@@ -688,33 +681,26 @@ func TestSeedSamplesAndCompare(t *testing.T) {
 	_ = json.Unmarshal(photo, &broken)
 	delete(broken, "author")
 	badResp, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": broken}})
-	okID, _ := repo.InsertSample(ctx, epID, "live", "a", nil, okResp, 200, 1, "")
-	badID, _ := repo.InsertSample(ctx, epID, "live", "b", nil, badResp, 200, 1, "")
+	okID, _ := repo.InsertSample(ctx, epID, "a", nil, okResp, 200, 1)
+	badID, _ := repo.InsertSample(ctx, epID, "b", nil, badResp, 200, 1)
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = ANY($1)`, []uuid.UUID{okID, badID}) })
 
 	good, err := ext.GetSample(ctx, okID)
-	if err != nil || good.Diff == nil || good.Diff.MissingCount != 0 || good.Diff.Baseline != 2 {
+	if err != nil || good.Diff == nil || good.Diff.MissingCount != 0 || good.Diff.Baseline != 2 || good.Diff.Closest != "图片推文" {
 		t.Errorf("与示例同结构不该有缺失: %+v %v", good.Diff, err)
 	}
 	bad, _ := ext.GetSample(ctx, badID)
 	if bad.Diff == nil || !slices.Contains(bad.Diff.Missing, "author") {
 		t.Errorf("丢了 author 应被标为缺失: %+v", bad.Diff)
 	}
-	list, _ := ext.ListSamples(ctx, epID)
+	list, examples, _ := ext.ListSamples(ctx, epID)
 	for _, x := range list {
 		if len(x.Response) > 0 {
 			t.Error("列表不应带响应正文")
 		}
 	}
-
-	// 存为示例后，它自己就成了基准的一部分
-	newID, err := ext.PromoteSample(ctx, okID, "图片推文（线上）")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = ext.DeleteSample(ctx, newID) })
-	if deleted, _ := ext.DeleteSample(ctx, okID); deleted {
-		t.Error("线上采样不能手工删除")
+	if len(examples) != 2 {
+		t.Errorf("推文接口应有 2 份示例（图片、视频），实有 %d", len(examples))
 	}
 }
 
@@ -744,10 +730,6 @@ func TestWatchedPaths(t *testing.T) {
 // 两条正常的小红书视频笔记响应（不同笔记）不该互相报缺失：它们差的是直播间、音乐、字幕这类
 // 代码不读的字段（实测差出 20 多个）。
 func TestStructureDiffIgnoresUnreadFields(t *testing.T) {
-	wrap := func(data []byte) json.RawMessage {
-		b, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": json.RawMessage(data)}})
-		return b
-	}
 	pool := testPool(t)
 	ctx := context.Background()
 	adapters := TikHubAdapters()
@@ -758,15 +740,15 @@ func TestStructureDiffIgnoresUnreadFields(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM api_endpoints WHERE slug = 'tikhub_xiaohongshu_app_v2_get_video_note_detail'`).Scan(&epID); err != nil {
 		t.Fatal(err)
 	}
-	base, _ := repo.InsertSample(ctx, epID, "sample", "x", nil, wrap(fixture(t, "xiaohongshu_app_v2_get_video_note_detail")), 200, 0, "test")
-	live, _ := repo.InsertSample(ctx, epID, "live", "y", nil, wrap(fixture(t, "xhs_video_on_normal")), 200, 0, "")
-	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = ANY($1)`, []uuid.UUID{base, live}) })
+	resp, _ := json.Marshal(map[string]any{"status": 200, "body": map[string]any{"code": 200, "data": json.RawMessage(fixture(t, "xhs_video_on_normal"))}})
+	live, _ := repo.InsertSample(ctx, epID, "y", nil, resp, 200, 0)
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = $1`, live) })
 
 	got, err := ext.GetSample(ctx, live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Diff.MissingCount != 0 {
-		t.Errorf("代码不读的字段差异不该算缺失: %v", got.Diff.Missing)
+	if got.Diff.Baseline == 0 || got.Diff.MissingCount != 0 {
+		t.Errorf("代码不读的字段差异不该算缺失: %+v", got.Diff)
 	}
 }

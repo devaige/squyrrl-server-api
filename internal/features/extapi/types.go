@@ -100,6 +100,8 @@ type Catalog interface {
 	// WatchedPaths 是该接口的适配器代码会读取的字段路径，结构比对只拿这些算缺失；
 	// 为空时退回比对全部字段。
 	WatchedPaths(slug string) []string
+	// Examples 是该接口的示例，线上采样的结构比对以它们为基准。
+	Examples(slug string) []Example
 }
 
 // ---- 管理后台入参 ----
@@ -139,51 +141,31 @@ type UpdateEndpointInput struct {
 	Config          *json.RawMessage `json:"config"`
 }
 
-type CreateSampleInput struct {
+// Example 是一份「示例」：接入或补全适配器时核对过的一种响应结构（如图片推文、视频推文）。
+// 实测响应在代码里维护（parser/testdata/tikhub/），随部署生效；后台只读，发现新结构由开发
+// 补进代码（用户决定 2026-10-19）。原先示例存在 api_samples 里、可在后台存为示例，但内置
+// 示例只在接口一份都没有时写一次，之后补进代码的形态到不了线上库。
+type Example struct {
+	Note       string          `json:"note"` // 是哪种结构
 	ResourceID string          `json:"resource_id"`
-	Request    json.RawMessage `json:"request"`
-	Response   json.RawMessage `json:"response"`
-	HTTPStatus int             `json:"http_status"`
-	Note       string          `json:"note"`
+	Data       json.RawMessage `json:"-"` // 业务数据本身，即 TikHub 外壳里的 data
 }
 
-// Sample 是一条请求/响应存档记录。
-//
-//	sample —— 「示例」：核对过的一种响应结构，永久保留。每发现一种新结构存一份。
-//	live   —— 线上采样：archive_live 打开时每次调用自动存，保留最近 LiveSampleRetention、
-//	          每接口最多 LiveSamplesPerEndpoint 条；解析记录里每一步都能点回当次的这一条。
+// Sample 是一条线上采样：archive_live 打开时每次调用自动存一条请求与原始响应，保留最近
+// LiveSampleRetention、每接口最多 LiveSamplesPerEndpoint 条；解析记录里每一步都能点回当次的这一条。
 type Sample struct {
 	ID         uuid.UUID       `json:"id"`
 	EndpointID uuid.UUID       `json:"endpoint_id"`
-	Kind       string          `json:"kind"` // 'sample' | 'live'
 	ResourceID string          `json:"resource_id"`
 	Request    json.RawMessage `json:"request,omitempty"`
 	Response   json.RawMessage `json:"response,omitempty"`
 	HTTPStatus int             `json:"http_status"`
 	LatencyMs  int             `json:"latency_ms"`
-	Note       string          `json:"note"`
 	CreatedAt  time.Time       `json:"created_at"`
 
-	// 仅线上采样：相对于该接口全部示例的结构差异（列表里只有计数，详情里带字段清单）
+	// 相对于该接口示例的结构差异（列表里只有计数，详情里带字段清单）；上游失败的应答没有
 	Diff *StructureDiff `json:"diff,omitempty"`
 	// 仅详情：所属接口
 	EndpointSlug string `json:"endpoint_slug,omitempty"`
 	Provider     string `json:"provider,omitempty"`
-}
-
-// PromoteSampleInput 把一条线上采样存为示例，note 写清是哪种结构（如「视频推文」）。
-type PromoteSampleInput struct {
-	Note string `json:"note" binding:"required"`
-}
-
-type UpdateSampleInput struct {
-	Note string `json:"note"`
-}
-
-// SeedSample 是一份内置示例（接入时核对过的实测响应），首次部署时写进库里。
-type SeedSample struct {
-	ResourceID string
-	Request    json.RawMessage
-	Response   json.RawMessage
-	Note       string
 }
