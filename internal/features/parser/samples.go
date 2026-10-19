@@ -12,8 +12,10 @@ import (
 // 同一批文件有两个用途：测试拿它们验证适配器；它们就是各接口的「示例」，后台线上采样的
 // 结构比对以它们为基准（AdapterSet.Examples）。示例只在这里维护，部署即生效，后台只读：
 // 发现缺失或新增时，把那条线上采样的响应精简后放进 testdata/tikhub/、登记到下面的清单
-// （用户决定 2026-10-19）。失败形态的样本（上游空壳、v1 误报不存在）只用于测试，不进示例 ——
-// 它们几乎没有字段，任何响应和它比都「不缺」，结构比对就失去意义。
+// （用户决定 2026-10-19）。线上采样的原始响应（{"status", "body"}）留在父仓库
+// docs/example/<上游>/<slug>/<参数名>_<参数值>.json，这里只放精简出的 data。
+// 失败形态的样本（上游空壳、v1 误报不存在）只用于测试，不进示例 —— 它们几乎没有字段，
+// 任何响应和它比都「不缺」，结构比对就失去意义。
 //
 //go:embed testdata/tikhub/*.json
 var tikhubFixtures embed.FS
@@ -41,6 +43,7 @@ var builtinSamples = []builtinSample{
 	{"tikhub_douyin_web_fetch_one_video", "douyin_web_fetch_one_video", Target{ResourceID: "7448118827402972455"}, "视频作品"},
 	{"tikhub_douyin_web_fetch_one_video_v2", "douyin_web_fetch_one_video_v2", Target{ResourceID: "7448118827402972455"}, "视频作品"},
 	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_image_post", Target{ResourceID: "7692800900575176625"}, "图文作品（原图是 VVC，另有 jpeg）"},
+	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_video_7698165296368139707", Target{ResourceID: "7698165296368139707"}, "视频作品（带 suggest_words、common_bar_info 等，2026-10-19 线上采样）"},
 
 	{"tikhub_xiaohongshu_app_v2_get_video_note_detail", "xiaohongshu_app_v2_get_video_note_detail", Target{ResourceID: "697c0eee000000000a03c308"}, "视频笔记（返回请求的笔记加推荐）"},
 	{"tikhub_xiaohongshu_app_v2_get_image_note_detail", "xhs_image_on_normal", Target{ResourceID: "6a3e33b2000000001603e982"}, "图文笔记"},
