@@ -274,6 +274,7 @@ var (
 
 // runChain 按价格从低到高尝试各来源，直到拿到可用内容：内置免费来源在前，
 // 付费接口按单价升序（同价看 priority，见 extapi.Repo.ListForProvider）。
+// 某个接口确认作品本身不可见（errHidden）时提前结束：换接口也一样，后面的记成跳过。
 //
 // 每一步都记成一次 Attempt，包括被跳过的 —— 「为什么没走到那个接口」在排查时
 // 和「那个接口为什么失败」一样重要。
@@ -305,11 +306,17 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 	// 同一账户下的接口共用余额，而 eps 里的余额是链开始前读的：链内前面的调用
 	// 花掉的钱要自己扣回去，否则「余额耗尽就跳过」和余额快照都会慢一拍。
 	spent := map[uuid.UUID]int64{}
+	var hidden error // 某个接口已确认作品本身不可见（errHidden）：后面的都跳过
 	for _, ep := range eps {
 		ep.BalanceMicros -= spent[ep.AccountID]
 		epID, accID := ep.ID, ep.AccountID
 		a := Attempt{Source: ep.Slug, EndpointID: &epID, AccountID: &accID, AccountName: ep.AccountName}
 
+		if hidden != nil {
+			a.Outcome, a.ErrorKind, a.Error = AttemptSkipped, extapi.KindUnavailable, "前面的接口已确认作品本身不可见"
+			add(a)
+			continue
+		}
 		ad, ok := s.adapters.callable(ep)
 		if !ok {
 			a.Outcome, a.ErrorKind = AttemptSkipped, extapi.KindNoAdapter
@@ -344,6 +351,9 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 		switch {
 		case errors.Is(err, errUnavailable):
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindUnavailable, err.Error()
+			if errors.Is(err, errHidden) {
+				hidden = err
+			}
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
 		case !usable(res):
@@ -358,6 +368,9 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 
 	if len(attempts) == 0 {
 		return nil, "", nil, errNoSource
+	}
+	if hidden != nil {
+		return nil, "", attempts, hidden // 记录的总原因直接写明作品不可见，而不是「所有来源均失败」
 	}
 	return nil, "", attempts, errChainExhausted
 }

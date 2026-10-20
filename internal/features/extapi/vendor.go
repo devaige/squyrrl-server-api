@@ -33,7 +33,7 @@ const (
 	KindBadResponse   = "bad_response" // 2xx 但不是 JSON、外壳不对或超长；已计费
 	KindEmpty         = "empty"        // 2xx 但没有数据；已计费
 	KindDecode        = "decode"       // 适配器转换失败或结果不可用；已计费
-	KindUnavailable   = "unavailable"  // 2xx 但上游明说作品不可见（审核中、仅作者可见……），不是结构变了；已计费
+	KindUnavailable   = "unavailable"  // 2xx 但上游明说作品不可见（审核中、仅作者可见……），不是结构变了；已计费。确认是作品本身的状态时，其后的接口也以此跳过
 	KindBuiltin       = "builtin"      // 内置免费来源报错
 )
 

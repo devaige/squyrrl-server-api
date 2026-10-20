@@ -25,9 +25,13 @@ const tikhubBase = "https://api.tikhub.io/api/v1/"
 
 var errWrongItem = errors.New("上游返回的不是请求的作品")
 
-// errUnavailable：上游明说这条作品看不到（如抖音的审核中、仅作者可见），不是结构变了，
-// 解析记录里单独归类。兜底链照常往下走 —— 理由同空壳，见 docs/memory.md §6。
+// errUnavailable：上游明说这条作品看不到，不是结构变了，解析记录里单独归类。
+// 原因认不出时兜底链照常往下走 —— 可能只是这个接口看不到（如版权限制）。
 var errUnavailable = errors.New("上游说作品不可见")
+
+// errHidden：不可见是作品本身的状态（审核中、仅作者可见……），哪个接口来取都一样，
+// 兜底链到此为止，不再为后面的接口花钱。
+var errHidden = fmt.Errorf("%w，原因是作品本身的状态", errUnavailable)
 
 func tikhubGet(path string, query map[string]string) extapi.Request {
 	return extapi.Request{URL: tikhubBase + path, Query: query}
@@ -376,8 +380,8 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 	}
 	a := env.AwemeDetail
 	if a == nil {
-		if reason := env.filtered(t.ResourceID); reason != "" {
-			return nil, nil, fmt.Errorf("%w：%s", errUnavailable, reason)
+		if err := env.filtered(t.ResourceID); err != nil {
+			return nil, nil, err
 		}
 		return nil, nil, errors.New("没有 aweme_detail")
 	}
@@ -1517,26 +1521,33 @@ type awemeEnvelope struct {
 	} `json:"filter_list"`
 }
 
-// awemeFilterReasons 给认得的过滤原因附一句说明；没见过的原样记下。
-var awemeFilterReasons = map[string]string{
-	"status_audit_self_see": "审核中，仅作者可见",
-}
+// 实测确认是「作品本身不可见」的过滤原因（errHidden），值是给后台看的说明。只列见过的：
+// 没列的原因可能只是某个接口看不到（版权限制 —— App V3 正是为绕开它才有的），链要继续。
+// App V1 / V2 的 filter_list 只给数字：8 与同一时刻网页版、App V3 对同一条作品给的
+// status_audit_self_see 对得上（实测 2026-10-20，仅此一例）。
+var (
+	awemeHiddenReasons = map[string]string{"status_audit_self_see": "审核中，仅作者可见"}
+	awemeHiddenCodes   = map[flexInt]string{8: "审核中，仅作者可见"}
+)
 
-// filtered 返回上游过滤这条作品的原因，没被过滤时为空。
-func (e awemeEnvelope) filtered(id string) string {
+// filtered 返回上游过滤这条作品的错误，没被过滤时为 nil。
+func (e awemeEnvelope) filtered(id string) error {
 	if f := e.FilterDetail; f != nil && string(f.AwemeID) == id {
-		reason := nonEmpty(f.FilterReason, f.DetailMsg, "filter_detail 没给原因")
-		if gloss, ok := awemeFilterReasons[f.FilterReason]; ok {
-			reason += "（" + gloss + "）"
+		if gloss, ok := awemeHiddenReasons[f.FilterReason]; ok {
+			return fmt.Errorf("%w：%s（%s）", errHidden, f.FilterReason, gloss)
 		}
-		return reason
+		return fmt.Errorf("%w：%s", errUnavailable, nonEmpty(f.FilterReason, f.DetailMsg, "filter_detail 没给原因"))
 	}
 	for _, f := range e.FilterList {
-		if string(f.AwemeID) == id {
-			return fmt.Sprintf("filter_list reason=%d", f.Reason)
+		if string(f.AwemeID) != id {
+			continue
 		}
+		if gloss, ok := awemeHiddenCodes[f.Reason]; ok {
+			return fmt.Errorf("%w：filter_list reason=%d（%s）", errHidden, f.Reason, gloss)
+		}
+		return fmt.Errorf("%w：filter_list reason=%d", errUnavailable, f.Reason)
 	}
-	return ""
+	return nil
 }
 
 type tiktokWebEnvelope struct {

@@ -437,24 +437,36 @@ func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 	}
 }
 
-// 抖音审核中的作品（实测 2026-10-20）：四个接口都只回过滤信息，要报成「不可见」带上原因，
-// 而不是当成结构变了；过滤的是别的作品时仍是普通解码失败。v3 与网页版的 filter_detail 一样。
+// 抖音审核中的作品（实测 2026-10-20）：四个接口都只回过滤信息，要报成「作品本身不可见」
+// 带上原因，而不是当成结构变了；过滤的是别的作品时仍是普通解码失败。v3 与网页版的 filter_detail 一样。
 func TestDouyinFilteredIsUnavailable(t *testing.T) {
 	adapters := TikHubAdapters()
 	cases := []struct{ slug, fixture, want string }{
-		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_filtered_list", "filter_list reason=8"},
-		{"tikhub_douyin_app_v3_fetch_one_video_v2", "douyin_filtered_list", "filter_list reason=8"},
+		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_filtered_list", "filter_list reason=8（审核中，仅作者可见）"},
+		{"tikhub_douyin_app_v3_fetch_one_video_v2", "douyin_filtered_list", "filter_list reason=8（审核中，仅作者可见）"},
 		{"tikhub_douyin_app_v3_fetch_one_video_v3", "douyin_filtered_detail", "status_audit_self_see（审核中，仅作者可见）"},
 		{"tikhub_douyin_web_fetch_one_video", "douyin_filtered_detail", "status_audit_self_see（审核中，仅作者可见）"},
 	}
 	for _, c := range cases {
 		_, err := adapters[c.slug].Decode(fixture(t, c.fixture), target("7698348670932978600", ""))
-		if !errors.Is(err, errUnavailable) || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s / %s 应是带原因 %q 的 errUnavailable，得到 %v", c.slug, c.fixture, c.want, err)
+		if !errors.Is(err, errHidden) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s / %s 应是带原因 %q 的 errHidden，得到 %v", c.slug, c.fixture, c.want, err)
 		}
 		_, err = adapters[c.slug].Decode(fixture(t, c.fixture), target("7000000000000000000", ""))
 		if err == nil || errors.Is(err, errUnavailable) {
 			t.Errorf("%s / %s 过滤的是别的作品，应是普通解码失败，得到 %v", c.slug, c.fixture, err)
+		}
+	}
+
+	// 没见过的原因可能只是这个接口看不到（如版权限制）：报不可见，但链要继续
+	ad := adapters["tikhub_douyin_app_v3_fetch_one_video"]
+	for _, body := range []string{
+		`{"filter_list":[{"aweme_id":"1","reason":3}]}`,
+		`{"aweme_detail":null,"filter_detail":{"aweme_id":"1","filter_reason":"status_copyright"}}`,
+	} {
+		_, err := ad.Decode([]byte(body), target("1", ""))
+		if !errors.Is(err, errUnavailable) || errors.Is(err, errHidden) {
+			t.Errorf("%s 应是 errUnavailable 而非 errHidden，得到 %v", body, err)
 		}
 	}
 }

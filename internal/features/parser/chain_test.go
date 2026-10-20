@@ -52,10 +52,12 @@ func titled(t string) *ParseResult {
 	return &ParseResult{Title: &t, Payload: json.RawMessage(`{}`), SourceData: json.RawMessage(`{}`)}
 }
 
-// fakeTikHub 按路径返回：/ok 正常数据，/empty 外壳正常但转换后不可用，/down 500。
+// fakeTikHub 按路径返回：/ok 正常数据，/empty 外壳正常但转换后不可用，
+// /hidden 抖音审核中作品的实测响应，/down 500。
 func fakeTikHub(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	var hits atomic.Int32
+	hidden := `{"code":200,"data":` + string(fixture(t, "douyin_filtered_list")) + `}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		switch r.URL.Path {
@@ -63,6 +65,8 @@ func fakeTikHub(t *testing.T) (*httptest.Server, *atomic.Int32) {
 			_, _ = w.Write([]byte(`{"code":200,"data":{"desc":"上游正文"}}`))
 		case "/empty":
 			_, _ = w.Write([]byte(`{"code":200,"data":{"desc":""}}`))
+		case "/hidden":
+			_, _ = w.Write([]byte(hidden))
 		default:
 			http.Error(w, `{"detail":"upstream down"}`, http.StatusInternalServerError)
 		}
@@ -342,6 +346,37 @@ func TestChainSkipsDrainedAccount(t *testing.T) {
 	}
 	if a := env.lastLog(t).Attempts[0]; a.Outcome != AttemptSkipped || a.ErrorKind != extapi.KindNoBalance {
 		t.Errorf("应记为余额耗尽跳过: %+v", a)
+	}
+}
+
+// 一个接口确认作品本身不可见（抖音审核中）：后面的接口不再调用、记成跳过，
+// 记录的总原因写明不可见，成本只有那一次调用。
+func TestChainStopsWhenItemHidden(t *testing.T) {
+	srv, hits := fakeTikHub(t)
+	cp := &chainParser{provider: uniqueProvider("hidden")}
+	hidden := testAdapter(cp.provider, srv.URL+"/hidden")
+	hidden.Decode = TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"].Decode
+	env := newChainEnv(t, cp, AdapterSet{"t_hidden": hidden, "t_ok": testAdapter(cp.provider, srv.URL+"/ok")}, 1_000_000)
+	env.addEndpoint(t, "t_hidden", 1_000)
+	env.addEndpoint(t, "t_ok", 2_000)
+	uid := env.user(t, 100)
+
+	_, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/7698348670932978600"})
+	if !errors.Is(err, ErrParseFailed) {
+		t.Fatalf("应返回通用失败，得到 %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("确认不可见后不应再调上游，实调 %d 次", hits.Load())
+	}
+	log := env.lastLog(t)
+	if log.Status != LogFailed || log.CostMicros != 1_000 || !strings.Contains(log.Error, "审核中，仅作者可见") || len(log.Attempts) != 2 {
+		t.Fatalf("记录不对: %+v", log)
+	}
+	if a := log.Attempts[0]; a.Outcome != AttemptFailed || a.ErrorKind != extapi.KindUnavailable {
+		t.Errorf("第一个接口应记为作品不可见: %+v", a)
+	}
+	if a := log.Attempts[1]; a.Source != "t_ok" || a.Outcome != AttemptSkipped || a.ErrorKind != extapi.KindUnavailable || a.CostMicros != 0 {
+		t.Errorf("后面的接口应记为因不可见跳过: %+v", a)
 	}
 }
 
