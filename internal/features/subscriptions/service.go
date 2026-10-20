@@ -2,6 +2,7 @@ package subscriptions
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/google/uuid"
 
@@ -14,6 +15,11 @@ type CreditGranter interface {
 	Grant(ctx context.Context, userID uuid.UUID, delta int64, reason, idemKey string) (*wallet.GrantResponse, error)
 }
 
+// RestrictionReconciler 按用户当前档位重算降级后的受限标记。由 snippet.RestrictionSweeper 实现。
+type RestrictionReconciler interface {
+	ReconcileUser(ctx context.Context, userID uuid.UUID) error
+}
+
 // Service 处理统一的订阅事件：验签与归一化在 handler / parser 侧完成，
 // 这里只负责落库与档位切换。
 //
@@ -24,12 +30,27 @@ type CreditGranter interface {
 // 改 metadata 时同样触发，于是每次都重发一整月额度）；
 // 现在是「一次真实结账发一次币」，且带幂等键。
 type Service struct {
-	repo   *Repo
-	grants CreditGranter
+	repo         *Repo
+	grants       CreditGranter
+	restrictions RestrictionReconciler
 }
 
-func NewService(repo *Repo, grants CreditGranter) *Service {
-	return &Service{repo: repo, grants: grants}
+// restrictions 可以为 nil（测试）：受限标记照样由定时清扫维护，只是慢一轮。
+func NewService(repo *Repo, grants CreditGranter, restrictions RestrictionReconciler) *Service {
+	return &Service{repo: repo, grants: grants, restrictions: restrictions}
+}
+
+// reconcileRestrictions 档位生效后立刻重算受限标记（2026-10-20 用户决策）。
+//
+// 失败只记日志、不让入账失败：钱已经收了、档位已经落库，受限标记最迟在下一轮
+// 定时清扫时纠正；让 webhook 因此报错只会换来渠道的重投。
+func (s *Service) reconcileRestrictions(ctx context.Context, userID uuid.UUID) {
+	if s.restrictions == nil {
+		return
+	}
+	if err := s.restrictions.ReconcileUser(ctx, userID); err != nil {
+		slog.Warn("档位变更后重算受限标记失败，等定时清扫", "user_id", userID, "err", err)
+	}
 }
 
 // ApplyPurchase 把一次性支付落成 credits 流水。
@@ -75,6 +96,9 @@ func (s *Service) Apply(ctx context.Context, e *SubscriptionEvent) error {
 		if err := s.repo.ExpireByProviderID(ctx, e.UserID, e.Provider, e.SupersedesProviderID); err != nil {
 			return err
 		}
+	}
+	if e.Kind == "plan" && e.Status == "active" {
+		s.reconcileRestrictions(ctx, e.UserID)
 	}
 	return nil
 }

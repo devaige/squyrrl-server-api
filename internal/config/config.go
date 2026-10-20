@@ -102,15 +102,6 @@ type Config struct {
 	// 设 0 关闭这一层。
 	ParseRefreshCooldown time.Duration `env:"SQUYRRL_PARSE_REFRESH_COOLDOWN" envDefault:"5m"`
 
-	// GET /me/export 的每用户冷却期。
-	//
-	// 这是整套 API 里单次代价最高的端点：一次全表流式导出，上限是至尊档的
-	// 1000 万条碎片。1 小时不是在限制正常使用 —— 一个人一天导两次已属罕见，
-	// 而这条路径的消费者（降级用户）有 30 天宽限期 —— 它是为了让
-	// 「反复打同一条」不再免费，尤其是「打一半就断开」这种最省事的打法。
-	// 设 0 关闭这一层。
-	ExportCooldown time.Duration `env:"SQUYRRL_EXPORT_COOLDOWN" envDefault:"1h"`
-
 	// ParseCost 是**只有内置免费来源**的平台（Gist / Reddit）的默认解析售价；<=0 = 解析整体不扣费。
 	// 使用默认值，故不在 .env.prod 模板出现。
 	//

@@ -175,6 +175,19 @@ func (s *RestrictionSweeper) candidates(ctx context.Context) ([]uuid.UUID, error
 	return out, rows.Err()
 }
 
+// ReconcileUser 立刻按某个用户当前的档位重算受限标记，不等下一轮清扫。
+//
+// 档位升上去时由订阅入账调用：否则受限标记要等到下一轮（默认 1 小时）才解除，
+// 用户刚付完钱，修改却还在被 402 拒收。解除标记是 UPDATE，会推进 sync_seq，
+// 设备下一次拉取就能拿到解除后的状态。
+func (s *RestrictionSweeper) ReconcileUser(ctx context.Context, userID uuid.UUID) error {
+	marked, cleared, err := s.reconcileUser(ctx, userID)
+	if err == nil && marked+cleared > 0 {
+		slog.Info("档位变更，已重算超额数据", "user_id", userID, "marked", marked, "cleared", cleared)
+	}
+	return err
+}
+
 // reconcileUser 让某个用户的受限标记与他当前档位一致。
 func (s *RestrictionSweeper) reconcileUser(ctx context.Context, userID uuid.UUID) (marked, cleared int, err error) {
 	plan, err := s.plans.ActivePlan(ctx, userID)

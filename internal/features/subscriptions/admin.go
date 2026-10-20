@@ -219,7 +219,14 @@ func (s *Service) SetAdminPlan(ctx context.Context, userID uuid.UUID, tier strin
 	if !entitlement.Known(tier) {
 		return ErrUnknownTier
 	}
-	return s.repo.SetAdminPlan(ctx, userID, tier)
+	if err := s.repo.SetAdminPlan(ctx, userID, tier); err != nil {
+		return err
+	}
+	// 撤掉手动档位（free）是降级，受限标记交给定时清扫，与渠道到期一致
+	if tier != "free" {
+		s.reconcileRestrictions(ctx, userID)
+	}
+	return nil
 }
 
 // GrantAdminStorage 手动追加一份存储。认目录里的全部档位，

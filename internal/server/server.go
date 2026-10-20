@@ -115,7 +115,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, st *storage.Client) *Server {
 
 	tgSvc := tg.NewService(tg.NewRepo(pool), snipSvc, quotaSvc, cfg.TGBotUsername)
 	passkeySvc := auth.NewPasskeyService(wa, auth.NewPasskeySessionStore(), authSvc)
-	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc)
+	// 档位升上去时立刻重算受限标记；定时清扫（main.go）照常兜底
+	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc,
+		snippet.NewRestrictionSweeper(pool, walletSvc, 0))
 
 	// 价目表解析失败只让购买入口不可用，不让进程起不来：
 	// 一个填错的环境变量不该把收款问题放大成一次全站故障。
@@ -201,11 +203,6 @@ func (s *Server) routes() {
 	meGroup := api.Group("/me")
 	walletHandler := wallet.NewHandler(s.walletSvc, s.quotaSvc)
 	walletHandler.RegisterUser(meGroup)
-
-	// GET /me/export：整批导出云端数据（ADR-075 降级生命周期的出口）。
-	// 挂在 /me 而不是 /snippets：它导的是「我的全部数据」而不是碎片列表的一种查询，
-	// 且将来页面、标签、附件清单都会进同一份文件。
-	snippet.NewExportHandler(snippet.NewExporter(s.pool), s.cfg.ExportCooldown).RegisterUser(meGroup)
 
 	// TG 绑定归属于「我的账户设置」，故挂 /me/tg 而非顶层 /tg：
 	// 兑换码、列出已绑 TG 号、解绑，都是对当前登录用户自身的操作。

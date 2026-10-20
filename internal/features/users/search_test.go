@@ -77,7 +77,7 @@ func TestSearch(t *testing.T) {
 	if _, err := walletSvc.Grant(ctx, alice, 1234, "test", ""); err != nil {
 		t.Fatalf("发币失败: %v", err)
 	}
-	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc)
+	subSvc := subscriptions.NewService(subscriptions.NewRepo(pool), walletSvc, nil)
 	if err := subSvc.SetAdminPlan(ctx, underscore, "premium"); err != nil {
 		t.Fatalf("设置手动档位失败: %v", err)
 	}

@@ -95,7 +95,7 @@ func newFixture(t *testing.T) fixture {
 	walletSvc := wallet.NewService(wallet.NewRepo(pool))
 	return fixture{
 		pool:    pool,
-		svc:     NewService(NewRepo(pool), walletSvc),
+		svc:     NewService(NewRepo(pool), walletSvc, nil),
 		plans:   wallet.NewRepo(pool),
 		storage: quota.NewService(pool, walletSvc),
 	}
@@ -333,5 +333,46 @@ func TestAdminStorage(t *testing.T) {
 	}
 	if err := f.svc.RevokeAdmin(ctx, u, rowID); !errors.Is(err, ErrNotAdminGrant) {
 		t.Fatalf("撤销付费行 err = %v，期望 ErrNotAdminGrant", err)
+	}
+}
+
+// recordingReconciler 记下被要求重算受限标记的用户。
+type recordingReconciler struct{ users []uuid.UUID }
+
+func (r *recordingReconciler) ReconcileUser(_ context.Context, userID uuid.UUID) error {
+	r.users = append(r.users, userID)
+	return nil
+}
+
+// 档位生效就立刻重算受限标记，不等定时清扫；存储与降级不触发。
+func TestPlanActivationReconcilesRestrictions(t *testing.T) {
+	f := newFixture(t)
+	rec := &recordingReconciler{}
+	svc := NewService(NewRepo(f.pool), wallet.NewService(f.plans), rec)
+	ctx := context.Background()
+	u := seedUser(t, f.pool)
+
+	if err := svc.Apply(ctx, event(u, ProviderGoogle, "tok_"+uuid.NewString(), "storage", "s40", intp(40))); err != nil {
+		t.Fatalf("storage 落库失败: %v", err)
+	}
+	if len(rec.users) != 0 {
+		t.Fatalf("买存储不该重算受限标记，得到 %v", rec.users)
+	}
+	if err := svc.Apply(ctx, event(u, ProviderStripe, "sub_"+uuid.NewString(), "plan", "basic", nil)); err != nil {
+		t.Fatalf("plan 落库失败: %v", err)
+	}
+	if len(rec.users) != 1 || rec.users[0] != u {
+		t.Fatalf("档位生效后应重算一次，得到 %v", rec.users)
+	}
+
+	other := seedUser(t, f.pool)
+	if err := svc.SetAdminPlan(ctx, other, "premium"); err != nil {
+		t.Fatalf("手动设档失败: %v", err)
+	}
+	if err := svc.SetAdminPlan(ctx, other, "free"); err != nil {
+		t.Fatalf("撤掉手动档位失败: %v", err)
+	}
+	if len(rec.users) != 2 || rec.users[1] != other {
+		t.Fatalf("手动升档重算一次、撤档不重算，得到 %v", rec.users)
 	}
 }
