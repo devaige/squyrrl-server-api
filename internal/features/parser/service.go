@@ -342,6 +342,8 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 		}
 		res, err := ad.Decode(call.Data, t)
 		switch {
+		case errors.Is(err, errUnavailable):
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindUnavailable, err.Error()
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
 		case !usable(res):

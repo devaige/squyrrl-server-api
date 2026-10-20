@@ -25,6 +25,10 @@ const tikhubBase = "https://api.tikhub.io/api/v1/"
 
 var errWrongItem = errors.New("上游返回的不是请求的作品")
 
+// errUnavailable：上游明说这条作品看不到（如抖音的审核中、仅作者可见），不是结构变了，
+// 解析记录里单独归类。兜底链照常往下走 —— 理由同空壳，见 docs/memory.md §6。
+var errUnavailable = errors.New("上游说作品不可见")
+
 func tikhubGet(path string, query map[string]string) extapi.Request {
 	return extapi.Request{URL: tikhubBase + path, Query: query}
 }
@@ -372,6 +376,9 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 	}
 	a := env.AwemeDetail
 	if a == nil {
+		if reason := env.filtered(t.ResourceID); reason != "" {
+			return nil, nil, fmt.Errorf("%w：%s", errUnavailable, reason)
+		}
 		return nil, nil, errors.New("没有 aweme_detail")
 	}
 	if string(a.AwemeID) != t.ResourceID {
@@ -1497,6 +1504,39 @@ func profileURL(prefix, id string) string {
 
 type awemeEnvelope struct {
 	AwemeDetail *aweme `json:"aweme_detail"`
+	// 作品被过滤时没有 aweme_detail，原因在下面两处之一（实测 2026-10-20，抖音审核中的作品）：
+	// 网页版与 App V3 给 filter_detail，App V1 / V2 给 filter_list（只有数字原因）。
+	FilterDetail *struct {
+		AwemeID      flexString `json:"aweme_id"`
+		FilterReason string     `json:"filter_reason"`
+		DetailMsg    string     `json:"detail_msg"`
+	} `json:"filter_detail"`
+	FilterList []struct {
+		AwemeID flexString `json:"aweme_id"`
+		Reason  flexInt    `json:"reason"`
+	} `json:"filter_list"`
+}
+
+// awemeFilterReasons 给认得的过滤原因附一句说明；没见过的原样记下。
+var awemeFilterReasons = map[string]string{
+	"status_audit_self_see": "审核中，仅作者可见",
+}
+
+// filtered 返回上游过滤这条作品的原因，没被过滤时为空。
+func (e awemeEnvelope) filtered(id string) string {
+	if f := e.FilterDetail; f != nil && string(f.AwemeID) == id {
+		reason := nonEmpty(f.FilterReason, f.DetailMsg, "filter_detail 没给原因")
+		if gloss, ok := awemeFilterReasons[f.FilterReason]; ok {
+			reason += "（" + gloss + "）"
+		}
+		return reason
+	}
+	for _, f := range e.FilterList {
+		if string(f.AwemeID) == id {
+			return fmt.Sprintf("filter_list reason=%d", f.Reason)
+		}
+	}
+	return ""
 }
 
 type tiktokWebEnvelope struct {

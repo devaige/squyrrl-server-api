@@ -437,6 +437,28 @@ func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 	}
 }
 
+// 抖音审核中的作品（实测 2026-10-20）：四个接口都只回过滤信息，要报成「不可见」带上原因，
+// 而不是当成结构变了；过滤的是别的作品时仍是普通解码失败。v3 与网页版的 filter_detail 一样。
+func TestDouyinFilteredIsUnavailable(t *testing.T) {
+	adapters := TikHubAdapters()
+	cases := []struct{ slug, fixture, want string }{
+		{"tikhub_douyin_app_v3_fetch_one_video", "douyin_filtered_list", "filter_list reason=8"},
+		{"tikhub_douyin_app_v3_fetch_one_video_v2", "douyin_filtered_list", "filter_list reason=8"},
+		{"tikhub_douyin_app_v3_fetch_one_video_v3", "douyin_filtered_detail", "status_audit_self_see（审核中，仅作者可见）"},
+		{"tikhub_douyin_web_fetch_one_video", "douyin_filtered_detail", "status_audit_self_see（审核中，仅作者可见）"},
+	}
+	for _, c := range cases {
+		_, err := adapters[c.slug].Decode(fixture(t, c.fixture), target("7698348670932978600", ""))
+		if !errors.Is(err, errUnavailable) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s / %s 应是带原因 %q 的 errUnavailable，得到 %v", c.slug, c.fixture, c.want, err)
+		}
+		_, err = adapters[c.slug].Decode(fixture(t, c.fixture), target("7000000000000000000", ""))
+		if err == nil || errors.Is(err, errUnavailable) {
+			t.Errorf("%s / %s 过滤的是别的作品，应是普通解码失败，得到 %v", c.slug, c.fixture, err)
+		}
+	}
+}
+
 // 小红书视频接口只接分享链接里标明 type=video 的；B 站网页接口只认 BV 号。
 func TestAdapterAccept(t *testing.T) {
 	a := TikHubAdapters()
