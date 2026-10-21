@@ -19,6 +19,7 @@ type platform struct {
 	canonical []*regexp.Regexp       // 第 1 个捕获组是作品 ID
 	prefix    []string               // 可选，与 canonical 一一对应：一个平台有几种 ID 空间时（知乎回答 / 文章 / 想法）给 ID 加类型前缀
 	short     []*regexp.Regexp       // 分享短链，需要先跟跳转
+	codes     []*regexp.Regexp       // 分享口令（没有链接），第 1 个捕获组是码，要先花一次上游调用换成作品链接
 	normalize func(id string) string // 可选：把链接里的 ID 规整成接口要的形式
 	extract   func(uri string) (string, bool)
 
@@ -78,9 +79,12 @@ func (p *platform) MatchPatterns() []string {
 
 func (p *platform) ShortLinkPatterns() []*regexp.Regexp { return p.short }
 
+func (p *platform) ShareCodePatterns() []*regexp.Regexp { return p.codes }
+
 var (
 	_ ManifestProvider = (*platform)(nil)
 	_ ShortLinker      = (*platform)(nil)
+	_ ShareCoder       = (*platform)(nil)
 )
 
 func res(patterns ...string) []*regexp.Regexp {
@@ -134,7 +138,23 @@ func NewUpstreamPlatforms() []Parser {
 			`(?:^|[/.])douyin\.com/[^#]*[?&]modal_id=(\d+)`,
 		), short: res(
 			`(?:^|//)v\.douyin\.com/[A-Za-z0-9_-]+`,
-		)},
+		),
+			// 文章只能「复制口令」：…【标题】长按复制打开抖音，即可阅读文章 ︽︽cz9zRIbcJa9︽︽。
+			// 码两边的符号每次分享都可能不同（实测 ︽︽…︽︽、➝➝…※※、ŠŠ…ŠŠ），只认「两边是非字母数字、
+			// 位于末尾的 8–16 位字母数字」。要求出现「文章」：别的口令（主页之类）没有内容可存，
+			// 认成口令只会让一条本该存成文字的内容变成一次失败的解析。
+			codes: res(
+				`长按复制打开抖音[^\n]*文章[^\n]*[^A-Za-z0-9]([A-Za-z0-9]{8,16})[^\sA-Za-z0-9]+\s*$`,
+			),
+			// 口令要先多调一次上游换成作品，按两倍收（用户决定 2026-10-21）
+			priceFactor: func(t Target) int64 {
+				if t.Code != "" {
+					return 2
+				}
+				return 1
+			},
+			priceNote: "分享口令（文章只能复制口令）按 2 倍计费",
+		},
 		&platform{id: PlatformXiaohongshu, canonical: res(
 			`(?:^|[/.])xiaohongshu\.com/(?:explore|discovery/item|user/profile/[0-9a-f]{24})/([0-9a-f]{24})`,
 		), short: res(

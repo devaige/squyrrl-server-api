@@ -33,13 +33,18 @@ type Adapter struct {
 	// 视同失败、继续试下一个来源（这次调用的钱已经花了）。
 	// 上游可能返回别的作品（推荐流、ID 映射错），能核对作品 ID 的必须核对。
 	Decode func(data []byte, t Target) (*ParseResult, error)
+
+	// Resolve 非空时这个接口不取内容，只把分享口令换成作品链接（见 ShareCoder），Decode 为空。
+	// 它不进兜底链、不抬售价，也不让平台进解析清单；只决定平台的口令规则下不下发。
+	Resolve func(data []byte, t Target) (string, error)
 }
 
 // Target 是一次解析的对象。
 type Target struct {
-	URI        string // 用户提交的原始链接，可能是分享短链；「按分享链接取」的接口用它
-	Resolved   string // 跟完短链跳转后的作品链接；本来就不是短链时与 URI 相同
+	URI        string // 用户提交的原始链接，可能是分享短链；「按分享链接取」的接口用它。提交的是口令时是口令原文
+	Resolved   string // 跟完短链跳转、或用口令换来的作品链接；本来就是作品链接时与 URI 相同
 	ResourceID string // 平台内的作品 ID，也是缓存键
+	Code       string // 提交的是口令时，口令里的码；否则为空
 }
 
 // AdapterSet 是按 slug 索引的适配器目录，实现 extapi.Catalog 供后台建接口时校验。
@@ -79,6 +84,18 @@ func (s AdapterSet) callable(ep extapi.Endpoint) (Adapter, bool) {
 		return Adapter{}, false
 	}
 	return a, true
+}
+
+// source 是能取内容的接口（不是换口令的）。
+func (s AdapterSet) source(ep extapi.Endpoint) (Adapter, bool) {
+	a, ok := s.callable(ep)
+	return a, ok && a.Resolve == nil
+}
+
+// isResolver 判断一个接口是不是换口令的。没有适配器的接口不算：它在兜底链里照常记一次跳过。
+func (s AdapterSet) isResolver(ep extapi.Endpoint) bool {
+	a, ok := s[ep.Slug]
+	return ok && a.Resolve != nil
 }
 
 // DefaultAdapters 是生产环境注册的全部适配器。新增上游时把它的目录并进来。

@@ -89,6 +89,17 @@ func TikHubAdapters() AdapterSet {
 			byID("douyin/web/fetch_one_video", "aweme_id"), decodeAwemeDouyin),
 		"tikhub_douyin_web_fetch_one_video_v2": tikhub(PlatformDouyin, "单个作品（网页 V2）",
 			byID("douyin/web/fetch_one_video_v2", "aweme_id"), decodeAwemeDouyin),
+		"tikhub_douyin_app_v3_fetch_share_info_by_share_code": {
+			Provider: PlatformDouyin,
+			Vendor:   extapi.VendorTikHub,
+			Note:     "分享口令换作品（文章只能复制口令）",
+			Shape:    douyinShareInfo{},
+			Request: func(t Target) extapi.Request {
+				return tikhubGet("douyin/app/v3/fetch_share_info_by_share_code",
+					map[string]string{"share_code": douyinShareText(t.URI, t.Code)})
+			},
+			Resolve: decodeDouyinShareInfo,
+		},
 
 		// ---- 小红书：视频接口在前（priority 100）、图文接口在后（110），按链接里的 type 分流：
 		//   type=video → 视频接口；type=normal → 只走图文（视频接口拿图文笔记 ID 会返回别人的视频笔记）；
@@ -166,7 +177,9 @@ func TikHubAdapters() AdapterSet {
 			}, decodeWechatArticle),
 	}
 	for slug, a := range set {
-		a.Shape = tikhubShapes[slug]
+		if shape, ok := tikhubShapes[slug]; ok {
+			a.Shape = shape
+		}
 		set[slug] = a
 	}
 	maps.Copy(set, tikhubBatch2()) // 第二批的适配器自带 Shape
@@ -371,6 +384,8 @@ type aweme struct {
 		Collect flexInt `json:"collect_count"`
 		Play    flexInt `json:"play_count"`
 	} `json:"statistics"`
+	AwemeType   flexInt       `json:"aweme_type"`
+	ArticleInfo *awemeArticle `json:"article_info"` // 只有抖音文章有
 }
 
 func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
@@ -399,6 +414,12 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 	}
 	if a.Statistics.Play > 0 {
 		p.Stats.Views = i64(int64(a.Statistics.Play))
+	}
+	if a.AwemeType == awemeTypeArticle || a.ArticleInfo != nil {
+		if err := a.ArticleInfo.fill(p); err != nil {
+			return nil, nil, err
+		}
+		return a, p, nil
 	}
 	for _, img := range a.Images {
 		// 无水印图只有客户端解不了的格式时，带水印的也比一张 Android 上打不开的图强（同 Lemon8）
@@ -542,12 +563,158 @@ func decodeAwemeDouyin(data []byte, t Target) (*post, error) {
 	if a.Author.SecUID != "" {
 		p.Author.URL = "https://www.douyin.com/user/" + a.Author.SecUID
 	}
-	kind := "video"
-	if len(p.Images) > 0 {
-		kind = "note"
+	switch {
+	case p.Kind == "article":
+		// 文章在网页版没有自己的页面（/article/<id> 跳回首页），用抖音给它的 share_url（去掉参数）
+		p.URL = "https://www.iesdouyin.com/share/video/" + t.ResourceID + "/"
+	case len(p.Images) > 0:
+		p.URL = "https://www.douyin.com/note/" + t.ResourceID
+	default:
+		p.URL = "https://www.douyin.com/video/" + t.ResourceID
 	}
-	p.URL = "https://www.douyin.com/" + kind + "/" + t.ResourceID
 	return p, nil
+}
+
+// ======================== 抖音文章 ========================
+
+// awemeTypeArticle 是抖音文章的 aweme_type（实测 2026-10-21，作品 7698925399581804456）。
+// 文章没有视频：video.play_addr 是背景音乐（audio/mp4），按视频存下来就是一段配乐。
+const awemeTypeArticle = 163
+
+type awemeArticle struct {
+	ArticleTitle   string `json:"article_title"`
+	ArticleContent string `json:"article_content"` // JSON 字符串：{"long_article_abstract": 摘要, "markdown": 全文}
+	FeData         string `json:"fe_data"`         // JSON 字符串：image_list 是每张插图的各档地址
+}
+
+type articleContent struct {
+	Abstract string `json:"long_article_abstract"`
+	Markdown string `json:"markdown"`
+}
+
+// articleFeData 的插图各档（同一张图 1080×760 时实测）：origin_image_url 是原图；high 是 1000 宽，
+// markdown 正文里引用的是 800 宽；另有 ai_high（AI 增强过的）、resize、same。全部只有 HEIC，
+// 换扩展名或去掉签名都是 403，所以只能照给 HEIC（displayURL：苹果端能显示）。
+type articleFeData struct {
+	ImageList []struct {
+		OriginImageURL string `json:"origin_image_url"`
+		HighImageURL   string `json:"high_image_url"`
+		MarkdownURL    string `json:"markdown_url"`
+	} `json:"image_list"`
+}
+
+var (
+	mdImage     = regexp.MustCompile(`!\[[^\]]*\]\((\S+)([^)]*)\)`) // ![](地址 width=1080 height=760)
+	mdImgWidth  = regexp.MustCompile(`width=(\d+)`)
+	mdImgHeight = regexp.MustCompile(`height=(\d+)`)
+	mdHeading   = regexp.MustCompile(`(?m)^#{1,6}\s+`)
+	mdEmphasis  = regexp.MustCompile(`\*\*|__`)
+)
+
+// fill 把文章写进 p：标题、markdown 转出的纯文本、按正文顺序的插图，没有视频。
+// 正文取不出来就是解码失败（兜底链换下一个接口），不退回 desc —— 那只是作品的配文。
+func (ai *awemeArticle) fill(p *post) error {
+	if ai == nil || ai.ArticleContent == "" {
+		return errors.New("文章没有正文")
+	}
+	var c articleContent
+	if err := json.Unmarshal([]byte(ai.ArticleContent), &c); err != nil {
+		return fmt.Errorf("article_content：%w", err)
+	}
+	md := nonEmpty(c.Markdown, c.Abstract)
+	if strings.TrimSpace(md) == "" {
+		return errors.New("文章没有正文")
+	}
+	p.Kind = "article"
+	p.Title = ai.ArticleTitle
+	p.Text = markdownText(md)
+
+	// 正文里的图是 800 宽的一档，换成 fe_data 里同一张图的原图；对不上就用正文里那张
+	var fe articleFeData
+	if ai.FeData != "" {
+		_ = json.Unmarshal([]byte(ai.FeData), &fe) // 取不到原图只是图小一点，不算失败
+	}
+	best := map[string]string{}
+	for _, img := range fe.ImageList {
+		u := displayURL([]string{img.OriginImageURL, img.HighImageURL, img.MarkdownURL})
+		for _, v := range []string{img.OriginImageURL, img.HighImageURL, img.MarkdownURL} {
+			best[articleImageKey(v)] = u
+		}
+	}
+	for _, m := range mdImage.FindAllStringSubmatch(md, -1) {
+		u := m[1]
+		if b := best[articleImageKey(u)]; b != "" {
+			u = b
+		}
+		img := postImage{URL: u}
+		if w := mdImgWidth.FindStringSubmatch(m[2]); w != nil {
+			img.Width, _ = strconv.Atoi(w[1])
+		}
+		if h := mdImgHeight.FindStringSubmatch(m[2]); h != nil {
+			img.Height, _ = strconv.Atoi(h[1])
+		}
+		p.Images = append(p.Images, img)
+	}
+	return nil
+}
+
+// articleImageKey 是插图在图床上的身份：各档地址的域名、处理模板（~ 之后）与签名都不同，
+// 路径里 ~ 之前的部分相同。
+func articleImageKey(u string) string {
+	pu, err := url.Parse(u)
+	if err != nil || pu.Path == "" {
+		return ""
+	}
+	key, _, _ := strings.Cut(pu.Path, "~")
+	return key
+}
+
+// markdownText 把文章的 markdown 转成纯文本：插图另作附件，从正文里去掉；标题、粗体记号去掉；
+// <br/> 与空行按 htmlText 收成一段一行。
+func markdownText(md string) string {
+	md = mdImage.ReplaceAllString(md, "")
+	md = mdHeading.ReplaceAllString(md, "")
+	md = mdEmphasis.ReplaceAllString(md, "")
+	return htmlText(md)
+}
+
+// ---- 分享口令 ----
+
+// douyinShareInfo 是换口令接口的返回（实测 2026-10-21）。文章口令的 share_scene 是 long_article，
+// 文章 ID 就是作品 ID（aweme_id），单作品接口直接能取到正文。
+type douyinShareInfo struct {
+	StatusCode flexInt `json:"status_code"`
+	ShareScene string  `json:"share_scene"`
+	ExtraInfo  struct {
+		ObjectID flexString `json:"object_id"`
+	} `json:"extra_info"`
+	SchemaDetail struct {
+		LongArticle *struct {
+			ArticleID flexString `json:"article_id"`
+		} `json:"long_article"`
+	} `json:"schema_detail"`
+}
+
+var digitsOnly = regexp.MustCompile(`^\d+$`)
+
+// decodeDouyinShareInfo 取出文章 ID，换成作品链接。只认见过的文章口令：别的口令（主页、直播间……）
+// 没有样本，object_id 不一定是作品 ID，拿去取作品只会白花一次钱。
+func decodeDouyinShareInfo(data []byte, _ Target) (string, error) {
+	var s douyinShareInfo
+	if err := json.Unmarshal(data, &s); err != nil {
+		return "", err
+	}
+	if s.ShareScene != "long_article" {
+		return "", fmt.Errorf("口令没有换到文章（share_scene=%q，status_code=%d）", s.ShareScene, s.StatusCode)
+	}
+	id := string(s.ExtraInfo.ObjectID)
+	if la := s.SchemaDetail.LongArticle; la != nil {
+		id = nonEmpty(string(la.ArticleID), id)
+	}
+	if !digitsOnly.MatchString(id) {
+		return "", fmt.Errorf("口令没有换到文章 ID（%q）", id)
+	}
+	return "https://www.iesdouyin.com/share/video/" + id + "/", nil
 }
 
 type tiktokWebItem struct {

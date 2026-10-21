@@ -72,11 +72,12 @@ func (r *PriceRepo) Delete(ctx context.Context, provider string) error {
 	return err
 }
 
-// maxUnitPrice 取一组接口里可调用者的最高单价。
+// maxUnitPrice 取一组接口里可调用的取内容接口的最高单价。换口令的接口不算：
+// 口令多出的那次调用由平台的倍价承担（PriceFactorer）。
 func (s AdapterSet) maxUnitPrice(eps []extapi.Endpoint) int64 {
 	var top int64
 	for _, ep := range eps {
-		if _, ok := s.callable(ep); ok && ep.UnitPriceMicros > top {
+		if _, ok := s.source(ep); ok && ep.UnitPriceMicros > top {
 			top = ep.UnitPriceMicros
 		}
 	}

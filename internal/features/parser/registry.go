@@ -39,9 +39,10 @@ func (r *Registry) Providers() []string {
 // Parsers 按注册顺序返回全部平台（后台定价页按这个顺序列）。
 func (r *Registry) Parsers() []Parser { return r.parsers }
 
-// Manifest 汇总实现了 ManifestProvider、且 include 认可的平台的匹配规则，供客户端本地判断。
-// include 为 nil 表示全部。顺序沿用注册顺序（server.go 里固定），保证 Version 哈希稳定可复现。
-func (r *Registry) Manifest(include func(Parser) bool) Manifest {
+// Manifest 汇总实现了 ManifestProvider、且 include 认可的平台的匹配规则，供客户端本地判断；
+// 平台的口令规则只在 codes 认可时带上。include / codes 为 nil 表示全部。
+// 顺序沿用注册顺序（server.go 里固定），保证 Version 哈希稳定可复现。
+func (r *Registry) Manifest(include, codes func(Parser) bool) Manifest {
 	entries := make([]ManifestEntry, 0, len(r.parsers))
 	for _, p := range r.parsers {
 		mp, ok := p.(ManifestProvider)
@@ -52,7 +53,13 @@ func (r *Registry) Manifest(include func(Parser) bool) Manifest {
 		if len(patterns) == 0 {
 			continue
 		}
-		entries = append(entries, ManifestEntry{ID: p.Provider(), Patterns: patterns})
+		e := ManifestEntry{ID: p.Provider(), Patterns: patterns}
+		if sc, ok := p.(ShareCoder); ok && (codes == nil || codes(p)) {
+			for _, re := range sc.ShareCodePatterns() {
+				e.Codes = append(e.Codes, re.String())
+			}
+		}
+		entries = append(entries, e)
 	}
 	return Manifest{Version: manifestVersion(entries), Providers: entries}
 }

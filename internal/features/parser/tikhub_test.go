@@ -378,7 +378,11 @@ func TestBuiltinSamples(t *testing.T) {
 			t.Errorf("%s 缺样本文件 %s", b.slug, b.file)
 			continue
 		}
-		if res, err := ad.Decode(data, b.fullTarget()); err != nil || !usable(res) {
+		if ad.Resolve != nil {
+			if _, err := ad.Resolve(data, b.fullTarget()); err != nil {
+				t.Errorf("%s / %s 换不出链接: %v", b.slug, b.file, err)
+			}
+		} else if res, err := ad.Decode(data, b.fullTarget()); err != nil || !usable(res) {
 			t.Errorf("%s / %s 解码失败: %v", b.slug, b.file, err)
 		}
 		covered[b.slug] = true

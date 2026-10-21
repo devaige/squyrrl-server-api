@@ -48,7 +48,7 @@ func TestManifestPatternsMatchProviderBehavior(t *testing.T) {
 		"gist":    "https://gist.github.com/octocat/6cff45a4a3b1a3b1c0ff",
 		"reddit":  "https://www.reddit.com/r/golang/comments/abc123/title",
 	}
-	m := testRegistry().Manifest(nil)
+	m := testRegistry().Manifest(nil, nil)
 	for _, e := range m.Providers {
 		uri, ok := cases[e.ID]
 		if !ok {
@@ -92,8 +92,8 @@ func TestManifestObfuscationRoundTrip(t *testing.T) {
 
 // 版本号是内容哈希：同内容稳定、非空。
 func TestManifestVersionStable(t *testing.T) {
-	v1 := testRegistry().Manifest(nil).Version
-	v2 := testRegistry().Manifest(nil).Version
+	v1 := testRegistry().Manifest(nil, nil).Version
+	v2 := testRegistry().Manifest(nil, nil).Version
 	if v1 == "" {
 		t.Fatal("version 不应为空")
 	}

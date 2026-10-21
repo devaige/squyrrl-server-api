@@ -878,15 +878,19 @@ paths:
         它**不改变计价**（见 `credits_charged`）。冷却窗口内（按资源计，
         `SQUYRRL_PARSE_REFRESH_COOLDOWN`，默认 5 分钟）的重复强制刷新会被
         静默降级为一次普通读 —— 不报错，返回的正是刚刷新过的那一版。
+
+        **口令**：没有链接的分享（抖音文章只能「复制口令」）用 `share_code` 提交原文，
+        与 `uri` 二选一；能认的口令规则在清单的 `codes` 里。服务端先付费把口令换成作品，
+        再照常解析，售价按平台倍数（抖音口令 2 倍）。认不出的口令回 404，换不出来回 422，都不扣费。
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [uri]
               properties:
-                uri: { type: string, format: uri }
+                uri: { type: string, format: uri, description: 与 share_code 二选一 }
+                share_code: { type: string, maxLength: 2000, description: 分享口令原文，与 uri 二选一 }
                 force:
                   type: boolean
                   default: false

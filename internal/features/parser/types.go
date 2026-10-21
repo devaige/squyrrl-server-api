@@ -62,6 +62,10 @@ type ManifestProvider interface {
 type ManifestEntry struct {
 	ID       string   `json:"id"`
 	Patterns []string `json:"patterns"`
+
+	// Codes 是分享口令的正则（见 ShareCoder），与 Patterns 分开：Patterns 只拿来匹配链接，
+	// 口令是整段文字，混进去会让客户端拿链接正则去扫用户写的笔记。只在平台有换口令的接口时下发。
+	Codes []string `json:"codes,omitempty"`
 }
 
 // Manifest 是导出的「受支持解析」清单。Version 用内容哈希而非手工计数器：
@@ -164,7 +168,10 @@ type ParseResponse struct {
 }
 
 type ParseInput struct {
-	URI string `json:"uri" binding:"required,url"`
+	URI string `json:"uri" binding:"required_without=ShareCode,omitempty,url"`
+
+	// ShareCode 是没有链接的分享口令原文（抖音文章只能「复制口令」，见 ShareCoder），与 URI 二选一。
+	ShareCode string `json:"share_code,omitempty" binding:"max=2000"`
 
 	// Force 跳过缓存，强制向上游重取一次。
 	//

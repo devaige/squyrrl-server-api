@@ -90,29 +90,40 @@ func NewService(d Deps) *Service {
 //   - 先看余额够不够，够才干活；拿到内容（含命中缓存）才扣；整条链失败分文不取。
 //
 // in.Force 跳过缓存读、直接重取一次（用户侧的「强制刷新」），不改变价格。
+//
+// 提交的是口令（in.ShareCode）时，先认平台、过余额预检，再花一次上游调用把口令换成作品链接，
+// 之后与普通链接一样；那次调用记在这笔解析记录的最前面（resolveShareCode）。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*ParseResponse, error) {
 	start := time.Now()
 	t := Target{URI: in.URI, Resolved: in.URI}
 
-	// 分享短链先跟跳转拿到作品链接（免费，不碰上游），缓存键才能是作品 ID
-	if sp, ok := s.registry.FindShortLink(in.URI); ok {
-		resolved, err := s.resolver.Resolve(ctx, in.URI, func(u string) bool {
-			_, ok := sp.Match(u)
-			return ok
-		})
-		if err != nil {
-			s.writeLog(ctx, &LogEntry{Provider: sp.Provider(), ResourceID: truncateRunes(in.URI, 200),
-				Status: LogFailed, Error: err.Error()}, start)
-			return nil, ErrParseFailed
+	var p Parser
+	if in.ShareCode != "" {
+		var code string
+		var ok bool
+		if p, code, ok = s.registry.FindShareCode(in.ShareCode); !ok {
+			return nil, ErrNoParser
 		}
-		t.Resolved = resolved
+		t = Target{URI: in.ShareCode, Code: code}
+	} else {
+		// 分享短链先跟跳转拿到作品链接（免费，不碰上游），缓存键才能是作品 ID
+		if sp, ok := s.registry.FindShortLink(in.URI); ok {
+			resolved, err := s.resolver.Resolve(ctx, in.URI, func(u string) bool {
+				_, ok := sp.Match(u)
+				return ok
+			})
+			if err != nil {
+				s.writeLog(ctx, &LogEntry{Provider: sp.Provider(), ResourceID: truncateRunes(in.URI, 200),
+					Status: LogFailed, Error: err.Error()}, start)
+				return nil, ErrParseFailed
+			}
+			t.Resolved = resolved
+		}
+		var ok bool
+		if p, t.ResourceID, ok = s.registry.Find(t.Resolved); !ok {
+			return nil, ErrNoParser // 无法解析的 URI 不产生费用
+		}
 	}
-
-	p, resourceID, ok := s.registry.Find(t.Resolved)
-	if !ok {
-		return nil, ErrNoParser // 无法解析的 URI 不产生费用
-	}
-	t.ResourceID = resourceID
 
 	eps, err := s.endpointsFor(ctx, p.Provider())
 	if err != nil {
@@ -135,7 +146,26 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 		}
 	}
 
-	entry := &LogEntry{Provider: p.Provider(), ResourceID: resourceID, Forced: in.Force}
+	var pre []Attempt // 换口令的调用：它属于这个请求自己，缓存命中、搭车合并都照记
+	if t.Code != "" {
+		resolved, attempts, err := s.resolveShareCode(ctx, p, eps, t)
+		if errors.Is(err, errNoResolver) {
+			return nil, ErrNoParser
+		}
+		if err != nil {
+			s.writeLog(ctx, &LogEntry{Provider: p.Provider(), ResourceID: "口令:" + t.Code, Status: LogFailed,
+				Error: err.Error(), Attempts: attempts, CostMicros: attemptsCost(attempts)}, start)
+			return nil, ErrParseFailed
+		}
+		t.Resolved = resolved
+		t.ResourceID, _ = p.Match(resolved)
+		pre = attempts
+		eps = deductSpent(eps, attempts)
+	}
+	resourceID := t.ResourceID
+
+	entry := &LogEntry{Provider: p.Provider(), ResourceID: resourceID, Forced: in.Force,
+		Attempts: pre, CostMicros: attemptsCost(pre)}
 	resp := &ParseResponse{Provider: p.Provider(), ResourceID: resourceID}
 
 	// 强制刷新在冷却期内被降级为一次普通读，而不是被拒绝：见 Service.refresh 的说明。
@@ -155,10 +185,8 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 	entry.Shared = !out.leader
 	if out.leader {
 		// 并发合并时只有真正发起调用的那个请求承担成本，否则同一笔钱会被记 N 次
-		entry.Attempts = out.attempts
-		for _, a := range out.attempts {
-			entry.CostMicros += a.CostMicros
-		}
+		entry.Attempts = joinAttempts(pre, out.attempts)
+		entry.CostMicros += attemptsCost(out.attempts)
 	}
 	if out.err != nil {
 		entry.Status = LogFailed
@@ -308,6 +336,9 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 	spent := map[uuid.UUID]int64{}
 	var hidden error // 某个接口已确认作品本身不可见（errHidden）：后面的都跳过
 	for _, ep := range eps {
+		if s.adapters.isResolver(ep) {
+			continue // 换口令的接口不取内容，口令那一步已经用过它（resolveShareCode）
+		}
 		ep.BalanceMicros -= spent[ep.AccountID]
 		epID, accID := ep.ID, ep.AccountID
 		a := Attempt{Source: ep.Slug, EndpointID: &epID, AccountID: &accID, AccountName: ep.AccountName}
@@ -410,23 +441,28 @@ func (s *Service) price(ctx context.Context, provider string, eps []extapi.Endpo
 }
 
 // Manifest 导出此刻真有来源的平台的匹配规则，供 /uris/manifest 下发。
+// 口令规则另要平台有能用的换口令接口：没有它，客户端交上来的口令注定解析不了。
 func (s *Service) Manifest(ctx context.Context) (Manifest, error) {
-	paid := map[string]bool{}
+	paid, resolvers := map[string]bool{}, map[string]bool{}
 	if s.extapi != nil {
 		eps, err := s.extapi.ListEnabled(ctx)
 		if err != nil {
 			return Manifest{}, err
 		}
 		for _, ep := range eps {
-			if _, ok := s.adapters.callable(ep); ok {
-				paid[ep.Provider] = true
+			if a, ok := s.adapters.callable(ep); ok {
+				if a.Resolve != nil {
+					resolvers[ep.Provider] = true
+				} else {
+					paid[ep.Provider] = true
+				}
 			}
 		}
 	}
 	return s.registry.Manifest(func(p Parser) bool {
 		_, builtin := p.(BuiltinParser)
 		return builtin || paid[p.Provider()]
-	}), nil
+	}, func(p Parser) bool { return resolvers[p.Provider()] }), nil
 }
 
 // ---- 管理后台 ----
@@ -459,7 +495,7 @@ func (s *Service) Prices(ctx context.Context) ([]PriceInfo, error) {
 		info := PriceInfo{Provider: p.Provider(), MaxUnitPriceMicros: s.adapters.maxUnitPrice(list)}
 		_, info.HasBuiltin = p.(BuiltinParser)
 		for _, ep := range list {
-			if _, ok := s.adapters.callable(ep); ok {
+			if _, ok := s.adapters.source(ep); ok {
 				info.Endpoints++
 			}
 		}
