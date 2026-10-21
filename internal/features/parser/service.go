@@ -91,6 +91,9 @@ func NewService(d Deps) *Service {
 //
 // in.Force 跳过缓存读、直接重取一次（用户侧的「强制刷新」），不改变价格。
 //
+// 上游确认作品本身不可见（errHidden）时记下来（parse_hidden），之后同一作品的普通请求直接回
+// ErrItemHidden、不调上游：失败不收用户的钱，上游却每次照收。强制刷新不受它挡。
+//
 // 提交的是口令（in.ShareCode）时，先认平台、过余额预检，再花一次上游调用把口令换成作品链接，
 // 之后与普通链接一样；那次调用记在这笔解析记录的最前面（resolveShareCode）。
 func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*ParseResponse, error) {
@@ -169,8 +172,18 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 	resp := &ParseResponse{Provider: p.Provider(), ResourceID: resourceID}
 
 	// 强制刷新在冷却期内被降级为一次普通读，而不是被拒绝：见 Service.refresh 的说明。
+	// 不可见记录同样只挡普通读：强制刷新是用户主动要求重取，照常放行。
 	bypassCache := in.Force && s.refresh.Allow(p.Provider()+"\x00"+resourceID)
 	if !bypassCache {
+		// 先看不可见记录再看缓存：两者并存只可能是记录写在缓存之后（重取到内容会删掉记录），以新的为准。
+		if reason, hidden, err := s.cache.Hidden(ctx, p.Provider(), resourceID); err != nil {
+			slog.Warn("parse_hidden 读取失败", "err", err)
+		} else if hidden {
+			entry.Status = LogFailed
+			entry.Error = "已确认作品本身不可见，未调上游：" + reason
+			s.writeLog(ctx, entry, start)
+			return nil, ErrItemHidden
+		}
 		if cached, version, hit, err := s.cache.Get(ctx, p.Provider(), resourceID); err != nil {
 			slog.Warn("parse_cache 读取失败", "err", err)
 		} else if hit {
@@ -192,6 +205,9 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 		entry.Status = LogFailed
 		entry.Error = out.err.Error()
 		s.writeLog(ctx, entry, start)
+		if errors.Is(out.err, errHidden) {
+			return nil, ErrItemHidden
+		}
 		return nil, ErrParseFailed
 	}
 	resp.Snippet, resp.Version = out.snip, out.version
@@ -265,6 +281,12 @@ func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoi
 
 		res, source, attempts, err := s.runChain(fctx, p, eps, t)
 		if err != nil {
+			// 作品本身不可见是一个付过钱的结论：记下来，之后的普通请求不必再为它付一次
+			if errors.Is(err, errHidden) {
+				if err := s.cache.PutHidden(fctx, p.Provider(), t.ResourceID, err.Error()); err != nil {
+					slog.Warn("parse_hidden 写入失败", "err", err)
+				}
+			}
 			return fetchOutcome{attempts: attempts, err: err}, nil
 		}
 
@@ -287,6 +309,10 @@ func (s *Service) fetchShared(ctx context.Context, p Parser, eps []extapi.Endpoi
 		if err := s.cache.Put(fctx, p.Provider(), t.ResourceID, res.Version, snip, res.CacheTTL); err != nil {
 			// 缓存失败不影响返回结果
 			slog.Warn("parse_cache 写入失败", "err", err)
+		}
+		// 取到了内容（强制刷新时可能是之前被确认不可见的作品）：作品又能看了，记录作废
+		if err := s.cache.ClearHidden(fctx, p.Provider(), t.ResourceID); err != nil {
+			slog.Warn("parse_hidden 删除失败", "err", err)
 		}
 		return fetchOutcome{snip: snip, version: res.Version, source: source, attempts: attempts}, nil
 	})

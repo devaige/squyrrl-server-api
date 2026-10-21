@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -14,6 +15,11 @@ var (
 	// ErrParseFailed 是回给用户的唯一失败原因。具体哪个来源、为什么失败只进解析记录：
 	// 报错原文里有上游的名字，而用户不该从任何地方看出解析是谁做的（ADR-080）。
 	ErrParseFailed = errors.New("parse failed")
+
+	// ErrItemHidden 是唯一另说的失败：上游确认作品本身不可见（审核中、仅作者可见，实测几乎都是
+	// 被平台下架）。这是作品自己的状态，说出来不暴露解析是谁做的；客户端据此提示用户，
+	// 而不是让人反复重试。它仍是一种 ErrParseFailed。
+	ErrItemHidden = fmt.Errorf("%w: item hidden", ErrParseFailed)
 )
 
 // Parser 是一个**平台**：它认得哪些链接归自己、资源 ID 是什么、产物是什么类型。

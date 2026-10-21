@@ -20,6 +20,7 @@ import (
 const VersionsPerResource = 10
 
 // Cache 封装对 parse_cache 表的存取。同 URI 跨用户复用解析结果。
+// 「作品本身不可见」这个结论（parse_hidden）也在这里：它是同一张缓存的反面。
 //
 // 保留期由 Cache 自己持有而不是由 Service 逐次传入：写入 TTL 和清理过期行
 // 是同一个策略的两半，分给两个类型持有，迟早会出现「写 30 天、清 7 天」
@@ -108,6 +109,42 @@ func (c *Cache) Put(ctx context.Context, provider, resourceID, version string, s
 				END,
 			    expires_at = EXCLUDED.expires_at`,
 		provider, resourceID, version, raw, expires)
+	return err
+}
+
+// Hidden 返回该资源是否已被确认作品本身不可见，以及确认时的原因。
+//
+// 没有过期：这种状态实测几乎都是作品被平台下架，不会自己恢复（见 migration 000034）。
+// 唯一的出口是强制刷新重取到了内容（ClearHidden）。
+func (c *Cache) Hidden(ctx context.Context, provider, resourceID string) (string, bool, error) {
+	var reason string
+	err := c.pool.QueryRow(ctx, `
+		SELECT reason FROM parse_hidden WHERE provider = $1 AND provider_resource_id = $2`,
+		provider, resourceID).Scan(&reason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return reason, true, nil
+}
+
+// PutHidden 记下（或再次确认）该资源本身不可见。
+func (c *Cache) PutHidden(ctx context.Context, provider, resourceID, reason string) error {
+	_, err := c.pool.Exec(ctx, `
+		INSERT INTO parse_hidden (provider, provider_resource_id, reason) VALUES ($1, $2, $3)
+		ON CONFLICT (provider, provider_resource_id) DO UPDATE
+			SET reason = EXCLUDED.reason, confirmed_at = now()`,
+		provider, resourceID, reason)
+	return err
+}
+
+// ClearHidden 删掉不可见记录：重取到了内容，说明作品又能看了。没有记录时什么也不做。
+func (c *Cache) ClearHidden(ctx context.Context, provider, resourceID string) error {
+	_, err := c.pool.Exec(ctx, `
+		DELETE FROM parse_hidden WHERE provider = $1 AND provider_resource_id = $2`,
+		provider, resourceID)
 	return err
 }
 

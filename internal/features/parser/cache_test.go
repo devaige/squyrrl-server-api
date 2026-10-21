@@ -49,6 +49,9 @@ func newTestCache(t *testing.T, pool *pgxpool.Pool, provider string) *Cache {
 		if _, err := pool.Exec(ctx, `DELETE FROM parse_cache WHERE provider = $1`, provider); err != nil {
 			t.Logf("清理测试缓存失败: %v", err)
 		}
+		if _, err := pool.Exec(ctx, `DELETE FROM parse_hidden WHERE provider = $1`, provider); err != nil {
+			t.Logf("清理不可见记录失败: %v", err)
+		}
 	}
 	clean()
 	t.Cleanup(clean)

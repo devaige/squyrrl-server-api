@@ -82,6 +82,10 @@ func (h *Handler) parse(c *gin.Context) {
 		switch {
 		case errors.Is(err, ErrNoParser):
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrItemHidden):
+			// 必须排在 ErrParseFailed 之前（它包着后者）。作品本身不可见是作品的状态，不是「谁来解析」，
+			// 可以告诉用户；客户端据 reason 提示作品已下架，而不是让用户反复重试。
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": ErrParseFailed.Error(), "reason": "hidden"})
 		case errors.Is(err, ErrParseFailed):
 			// 只回一句通用原因：具体是哪个来源、为什么失败在解析记录里，不能让用户看到。
 			//

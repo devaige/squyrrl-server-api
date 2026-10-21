@@ -921,12 +921,20 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: >-
-            所有来源都没拿到内容，未扣费。响应体恒为 `{"error":"parse failed"}` ——
-            具体原因只进后台的解析记录，不暴露给客户端。不用 502：Cloudflare 会替换源站的
+            所有来源都没拿到内容，未扣费。响应体是 `{"error":"parse failed"}` ——
+            具体原因只进后台的解析记录，不暴露给客户端。唯一例外是上游确认作品本身不可见
+            （审核中、仅作者可见，实测几乎都是被平台下架）：多带 `"reason":"hidden"`。
+            这个结论按作品永久记下（migration 000034），之后同一作品的普通请求直接回它、
+            不调上游；`force=true` 照常重取，取到内容即作废记录。不用 502：Cloudflare 会替换源站的
             502 / 504 响应体，且客户端把大陆入口的 502 / 504 当作入口故障去换入口。
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      reason: { type: string, enum: [hidden], description: 仅作品本身不可见时出现 }
 
   # ---------------------------------------------------------------- Telegram Binding
   # 绑定载体是 Telegram deep link（2026-09-06）：App 为已登录用户签发一枚令牌，

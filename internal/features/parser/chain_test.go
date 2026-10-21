@@ -362,8 +362,8 @@ func TestChainStopsWhenItemHidden(t *testing.T) {
 	uid := env.user(t, 100)
 
 	_, err := env.service(10).Parse(context.Background(), uid, ParseInput{URI: "https://" + cp.provider + ".test/7698348670932978600"})
-	if !errors.Is(err, ErrParseFailed) {
-		t.Fatalf("应返回通用失败，得到 %v", err)
+	if !errors.Is(err, ErrItemHidden) {
+		t.Fatalf("应返回作品不可见，得到 %v", err)
 	}
 	if hits.Load() != 1 {
 		t.Errorf("确认不可见后不应再调上游，实调 %d 次", hits.Load())
@@ -377,6 +377,73 @@ func TestChainStopsWhenItemHidden(t *testing.T) {
 	}
 	if a := log.Attempts[1]; a.Source != "t_ok" || a.Outcome != AttemptSkipped || a.ErrorKind != extapi.KindUnavailable || a.CostMicros != 0 {
 		t.Errorf("后面的接口应记为因不可见跳过: %+v", a)
+	}
+}
+
+// 确认不可见之后，同一作品的普通请求（换个用户也一样）不再调上游、不扣费；
+// 强制刷新照常重取，取到内容就删掉记录，之后的普通请求回到缓存。
+func TestHiddenItemRemembered(t *testing.T) {
+	srv, hits := fakeTikHub(t)
+	cp := &chainParser{provider: uniqueProvider("gone")}
+	var visible atomic.Bool // 作品是否又能看了：决定假上游回哪一份
+	ok, hiddenDecode := testAdapter(cp.provider, srv.URL+"/ok"), TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"].Decode
+	flip := Adapter{
+		Provider: cp.provider, Vendor: extapi.VendorTikHub,
+		Request: func(tg Target) extapi.Request {
+			if visible.Load() {
+				return ok.Request(tg)
+			}
+			return extapi.Request{URL: srv.URL + "/hidden"}
+		},
+		Decode: func(data []byte, tg Target) (*ParseResult, error) {
+			if visible.Load() {
+				return ok.Decode(data, tg)
+			}
+			return hiddenDecode(data, tg)
+		},
+	}
+	env := newChainEnv(t, cp, AdapterSet{"t_flip": flip}, 1_000_000)
+	env.addEndpoint(t, "t_flip", 1_000)
+	svc := env.service(10)
+	a, b := env.user(t, 100), env.user(t, 100)
+	ctx := context.Background()
+	uri := "https://" + cp.provider + ".test/7698348670932978600"
+
+	if _, err := svc.Parse(ctx, a, ParseInput{URI: uri}); !errors.Is(err, ErrItemHidden) {
+		t.Fatalf("首次应确认不可见，得到 %v", err)
+	}
+	if _, err := svc.Parse(ctx, b, ParseInput{URI: uri}); !errors.Is(err, ErrItemHidden) {
+		t.Fatalf("记下之后应直接回不可见，得到 %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("记下之后不应再调上游，实调 %d 次", hits.Load())
+	}
+	log := env.lastLog(t)
+	if log.Status != LogFailed || log.CostMicros != 0 || len(log.Attempts) != 0 || !strings.Contains(log.Error, "未调上游") {
+		t.Fatalf("命中记录的那笔应是无成本、无尝试的失败: %+v", log)
+	}
+
+	// 强制刷新不受记录挡：仍不可见就再确认一次
+	if _, err := svc.Parse(ctx, b, ParseInput{URI: uri, Force: true}); !errors.Is(err, ErrItemHidden) || hits.Load() != 2 {
+		t.Fatalf("强制刷新应照常重取：err=%v hits=%d", err, hits.Load())
+	}
+
+	visible.Store(true)
+	if _, err := svc.Parse(ctx, b, ParseInput{URI: uri, Force: true}); err != nil || hits.Load() != 3 {
+		t.Fatalf("作品恢复后强制刷新应取到内容：err=%v hits=%d", err, hits.Load())
+	}
+	if _, hidden, err := env.cache.Hidden(ctx, cp.provider, "7698348670932978600"); err != nil || hidden {
+		t.Fatalf("取到内容后记录应删除：hidden=%v err=%v", hidden, err)
+	}
+	resp, err := svc.Parse(ctx, a, ParseInput{URI: uri})
+	if err != nil || !resp.Cached || hits.Load() != 3 {
+		t.Fatalf("之后的普通请求应命中缓存：err=%v resp=%+v hits=%d", err, resp, hits.Load())
+	}
+	if got := env.balance(t, a); got != 80 {
+		t.Errorf("只有取到内容的那次扣费，a 余额应为 80，实为 %d", got)
+	}
+	if got := env.balance(t, b); got != 80 {
+		t.Errorf("只有取到内容的那次扣费，b 余额应为 80，实为 %d", got)
 	}
 }
 
