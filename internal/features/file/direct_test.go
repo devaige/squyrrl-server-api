@@ -238,10 +238,10 @@ func TestValidateThumb(t *testing.T) {
 		// 视频的缩略图是解析拿到的封面
 		{"视频可以带", "video/mp4", blob, 20 * 1024, hash, nil},
 		{"图片视频以外不许带", "application/pdf", blob, 20 * 1024, hash, ErrThumbMime},
-		{"超过 64 KiB 上限", "image/png", blob, MaxThumbBytes + 1, hash, ErrThumbTooLarge},
-		{"恰好 64 KiB 可以", "image/png", blob, MaxThumbBytes, hash, nil},
+		{"超过 256 KiB 上限", "image/png", blob, MaxThumbBytes + 1, hash, ErrThumbTooLarge},
+		{"恰好 256 KiB 可以", "image/png", blob, MaxThumbBytes, hash, nil},
 		// 这条是把「不计配额的字节」框死的不变式，不是手滑校验：
-		// 允许缩略图 ≥ 本体，一个 1 字节的本体就能拖 64 KiB 未计费字节进 R2。
+		// 允许缩略图 ≥ 本体，一个 1 字节的本体就能拖 256 KiB 未计费字节进 R2。
 		{"不得大于等于本体", "image/jpeg", 1024, 1024, hash, ErrThumbTooLarge},
 		{"比本体小一个字节也行", "image/jpeg", 1024, 1023, hash, nil},
 		{"声明了却给 0 大小", "image/jpeg", blob, 0, hash, ErrThumbTooLarge},
@@ -302,8 +302,8 @@ func TestValidateUpstreamThumb(t *testing.T) {
 		thumbSize int64
 		want      error
 	}{
-		// TG 照片中间档常见 60–150 KB：客户端那道 64 KiB 的线在这里必须放过它
-		{"超过客户端上限也可以", blob, MaxThumbBytes + 1, nil},
+		// TG 照片中间档常见 60–150 KB
+		{"150 KB 的中间档可以", blob, 150 * 1024, nil},
 		{"恰好 256 KiB 可以", blob, MaxUpstreamThumbBytes, nil},
 		{"超过 256 KiB", blob, MaxUpstreamThumbBytes + 1, ErrThumbTooLarge},
 		// 与 validateThumb 同一条不变式：放宽上限不能放宽这一条

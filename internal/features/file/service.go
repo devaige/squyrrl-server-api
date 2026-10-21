@@ -474,9 +474,9 @@ func (s *Service) RenewIntent(ctx context.Context, userID, intentID uuid.UUID) (
 //   - 必须严格小于本体 —— 这条才是真正把「未计费面积」框死的那一条。
 //
 // 为什么不把缩略图计进配额：那要给 files 加一列 thumb_size_bytes、让 quota.Storage()
-// 多一次 SUM，再让降级生命周期与 file GC 各自重新考虑一遍它 —— 换来的精度是千分之几
-// （4 MB 照片配 20 KB 缩略图）。改用「缩略图必须比本体小」这条不变式之后，未计费字节
-// 恒不超过已计费字节：最坏情况 R2 实际占用是配额的 2 倍，现实中是 1.005 倍。
+// 多一次 SUM，再让降级生命周期与 file GC 各自重新考虑一遍它 —— 换来的精度是百分之几
+// （4 MB 照片配 100 KB 上下的缩略图）。改用「缩略图必须比本体小」这条不变式之后，未计费字节
+// 恒不超过已计费字节：最坏情况 R2 实际占用是配额的 2 倍，现实中约 1.03 倍。
 // 一条 if 换掉一整条会随时间分叉的核算路径。
 func validateThumb(mime string, size, thumbSize int64, thumbHash []byte) error {
 	if len(thumbHash) == 0 {
