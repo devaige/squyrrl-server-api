@@ -325,6 +325,64 @@ func TestAwemePicksDisplayableImage(t *testing.T) {
 	}
 }
 
+// 抖音实况图文（2026-10-22 线上采样，作品 7699378552240020323）：一张图，url_list 是 heic、jpeg，
+// images[].video 是 4.9 秒的 720p h264 动效；作品的 video.play_addr 是背景音乐。
+func TestAwemeLivePhoto(t *testing.T) {
+	res, p := decodeWith(t, "tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_live_photo", target("7699378552240020323", ""))
+	checkSample(t, res, p, sampleWant{kind: "image", urlPrefix: "https://www.douyin.com/note/7699378552240020323", minImages: 1})
+	if p.Video != nil {
+		t.Errorf("实况图文不该有作品级视频（play_addr 是背景音乐）: %+v", p.Video)
+	}
+	if len(p.Images) != 1 {
+		t.Fatalf("应有 1 张图，得到 %d", len(p.Images))
+	}
+	im := p.Images[0]
+	if !strings.Contains(im.URL, ".jpeg?") || strings.Contains(im.URL, "water") {
+		t.Errorf("实况图的静图应取无水印 jpeg，得到 %s", im.URL)
+	}
+	live := im.Live
+	if live == nil || !strings.HasPrefix(live.URL, "https://") || live.Width != 720 || live.Height != 1280 || live.DurationMs != 4900 {
+		t.Fatalf("应带 720×1280、4.9 秒的动效，得到 %+v", live)
+	}
+	var roles []string
+	for _, a := range res.Assets {
+		roles = append(roles, a.Role)
+	}
+	if strings.Join(roles, ",") != "image,motion" {
+		t.Fatalf("动效应紧跟在静图后面，得到 %v", roles)
+	}
+	if m := res.Assets[1]; m.URL != live.URL || m.Mime != "video/mp4" {
+		t.Errorf("动效文件不对: %+v", m)
+	}
+
+	ad := TikHubAdapters()["tikhub_douyin_app_v3_fetch_one_video"]
+	images := func(img string) []postImage {
+		t.Helper()
+		res, err := ad.Decode([]byte(`{"aweme_detail":{"aweme_id":"1","desc":"d","images":[`+img+`]}}`), target("1", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p decodedPost
+		if err := json.Unmarshal(res.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		return p.Images
+	}
+	const heic = `"https://p3-sign.douyinpic.com/a~tplv-dy-aweme-images-v2:1440:2560:q80.heic?x-expires=1"`
+	const webp = `"https://p3-sign.douyinpic.com/a~tplv-dy-aweme-images-v2:1440:2560:q80.webp?x-expires=1"`
+	const jpeg = `"https://p3-sign.douyinpic.com/a~tplv-dy-aweme-images-v2:1440:2560:q80.jpeg?x-expires=1"`
+	const clip = `{"play_addr":{"url_list":["https://v.zjcdn.com/clip/?a=1"],"width":720,"height":1280,"url_key":"v0_h264_720p_598662"},"duration":3000}`
+	if im := images(`{"url_list":[` + heic + `,` + webp + `,` + jpeg + `],"clip_type":5,"live_photo_type":1,"video":` + clip + `}`); len(im) != 1 || im[0].Live == nil || !strings.Contains(im[0].URL, ".jpeg?") {
+		t.Errorf("有 jpeg 时静图换成 jpeg 并带动效，得到 %+v", im)
+	}
+	if im := images(`{"url_list":[` + heic + `,` + webp + `],"clip_type":5,"live_photo_type":1,"video":` + clip + `}`); len(im) != 1 || im[0].Live != nil || !strings.Contains(im[0].URL, ".webp?") {
+		t.Errorf("没有 jpeg 静图就只存静图，得到 %+v", im)
+	}
+	if im := images(`{"url_list":[` + jpeg + `],"video":` + clip + `}`); len(im) != 1 || im[0].Live != nil {
+		t.Errorf("没标明是实况的图不带动效，得到 %+v", im)
+	}
+}
+
 func TestImageRank(t *testing.T) {
 	for u, want := range map[string]int{
 		"https://p3.douyinpic.com/a~tplv-dy-aweme-images-ds-rs-v1:1920:1146:q80.jpeg?x=1":                                    0,

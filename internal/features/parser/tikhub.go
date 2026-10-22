@@ -353,24 +353,15 @@ type aweme struct {
 		UID         flexString `json:"uid"`
 		AvatarThumb urlList    `json:"avatar_thumb"`
 	} `json:"author"`
-	Video struct {
-		Cover    urlList `json:"cover"`
-		PlayAddr urlList `json:"play_addr"` // 默认档，常常不是最清晰的（App 给 720p，同一作品 bit_rate 里有 1080p / 4K）
-		// 抖音另给的单一编码档：bit_rate 只有 ByteVC2 时，能放的高清档在 play_addr_265 里（实测）
-		PlayAddrH264 urlList `json:"play_addr_h264"`
-		PlayAddr265  urlList `json:"play_addr_265"`
-		BitRate      []struct {
-			BitRate   int64    `json:"bit_rate"`
-			IsBytevc1 *flexInt `json:"is_bytevc1"` // 编码：0 h264 / 1 ByteVC1 / 2 ByteVC2，url_key 认不出时用
-			PlayAddr  urlList  `json:"play_addr"`
-		} `json:"bit_rate"`
-		Duration int64 `json:"duration"` // 毫秒
-		Width    int   `json:"width"`
-		Height   int   `json:"height"`
-	} `json:"video"`
+	Video  awemeVideo `json:"video"`
 	Images []struct { // 抖音图文
 		urlList
 		DownloadURLList []string `json:"download_url_list"` // 带水印
+		// 实况图片的那段动效（作品 is_live_photo=1，图的 clip_type=5、live_photo_type=1，
+		// 实测 2026-10-22，作品 7699378552240020323）：几秒的 h264 mp4，与静图同比例
+		Video         *awemeVideo `json:"video"`
+		ClipType      flexInt     `json:"clip_type"`
+		LivePhotoType flexInt     `json:"live_photo_type"`
 	} `json:"images"`
 	ImagePostInfo *struct {
 		Images []struct {
@@ -386,6 +377,65 @@ type aweme struct {
 	} `json:"statistics"`
 	AwemeType   flexInt       `json:"aweme_type"`
 	ArticleInfo *awemeArticle `json:"article_info"` // 只有抖音文章有
+}
+
+// awemeClipLivePhoto 是实况图片的 images[].clip_type（实测 2026-10-22；普通图文的图没有这个字段）。
+const awemeClipLivePhoto = 5
+
+// awemeVideo 是抖音 / TikTok 的一段视频：作品本身的 video，或实况图片的 images[].video。
+type awemeVideo struct {
+	Cover    urlList `json:"cover"`
+	PlayAddr urlList `json:"play_addr"` // 默认档，常常不是最清晰的（App 给 720p，同一作品 bit_rate 里有 1080p / 4K）
+	// 抖音另给的单一编码档：bit_rate 只有 ByteVC2 时，能放的高清档在 play_addr_265 里（实测）
+	PlayAddrH264 urlList `json:"play_addr_h264"`
+	PlayAddr265  urlList `json:"play_addr_265"`
+	BitRate      []struct {
+		BitRate   int64    `json:"bit_rate"`
+		IsBytevc1 *flexInt `json:"is_bytevc1"` // 编码：0 h264 / 1 ByteVC1 / 2 ByteVC2，url_key 认不出时用
+		PlayAddr  urlList  `json:"play_addr"`
+	} `json:"bit_rate"`
+	Duration int64 `json:"duration"` // 毫秒
+	Width    int   `json:"width"`
+	Height   int   `json:"height"`
+}
+
+// best 挑一路码流：默认档、单一编码档与 bit_rate 各档一起比，编码能放的优先，
+// 同档取分辨率最高、码率高的。一路都没有时 URL 为空，尺寸取 video 自己的。
+func (v *awemeVideo) best() *postVideo {
+	var pick streamPick
+	for _, pa := range []urlList{v.PlayAddr, v.PlayAddrH264, v.PlayAddr265} {
+		w, h := pa.Width, pa.Height
+		if w == 0 {
+			w, h = v.Width, v.Height
+		}
+		codec, rate := parseURLKey(pa.URLKey)
+		pick.offer(firstURL(pa.URLList), w, h, rate, codec)
+	}
+	for _, b := range v.BitRate {
+		codec, _ := parseURLKey(b.PlayAddr.URLKey)
+		if codec == "" && b.IsBytevc1 != nil {
+			codec = bytevcCodec(int(*b.IsBytevc1))
+		}
+		pick.offer(firstURL(b.PlayAddr.URLList), b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate, codec)
+	}
+	pv := &postVideo{URL: pick.URL, DurationMs: v.Duration, Width: pick.W, Height: pick.H}
+	if pv.URL == "" {
+		pv.Width, pv.Height = v.Width, v.Height
+	}
+	return pv
+}
+
+// jpegURL 取第一个 JPEG 地址。实况图片的静图只认 JPEG：客户端把动效接在它后面，
+// 存成一张实况照片（Motion Photo，见客户端 motion_photo.dart），这种格式的静图得是 JPEG。
+func jpegURL(urls []string) string {
+	for _, u := range urls {
+		path, _, _ := strings.Cut(u, "?")
+		path = strings.ToLower(path)
+		if strings.HasSuffix(path, ".jpeg") || strings.HasSuffix(path, ".jpg") {
+			return u
+		}
+	}
+	return ""
 }
 
 func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
@@ -423,9 +473,19 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 	}
 	for _, img := range a.Images {
 		// 无水印图只有客户端解不了的格式时，带水印的也比一张 Android 上打不开的图强（同 Lemon8）
-		if u := displayURL(img.URLList, img.DownloadURLList); u != "" {
-			p.Images = append(p.Images, postImage{URL: u, Width: img.Width, Height: img.Height})
+		u := displayURL(img.URLList, img.DownloadURLList)
+		if u == "" {
+			continue
 		}
+		im := postImage{URL: u, Width: img.Width, Height: img.Height}
+		// 实况图片：静图换成无水印的 JPEG 并带上动效；没有这样的静图就只存静图。
+		// 只认标明是实况的：图文里别的带 video 的图（混排的视频）没见过样本，不往 JPEG 里塞
+		if img.Video != nil && (img.LivePhotoType > 0 || img.ClipType == awemeClipLivePhoto) {
+			if live, still := img.Video.best(), jpegURL(img.URLList); live.URL != "" && still != "" {
+				im.URL, im.Live = still, live
+			}
+		}
+		p.Images = append(p.Images, im)
 	}
 	if a.ImagePostInfo != nil {
 		for _, img := range a.ImagePostInfo.Images {
@@ -435,28 +495,7 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 		}
 	}
 	if len(p.Images) == 0 {
-		// 默认档、单一编码档与 bit_rate 各档一起比：编码能放的优先，同档取分辨率最高、码率高的
-		var pick streamPick
-		for _, pa := range []urlList{a.Video.PlayAddr, a.Video.PlayAddrH264, a.Video.PlayAddr265} {
-			w, h := pa.Width, pa.Height
-			if w == 0 {
-				w, h = a.Video.Width, a.Video.Height
-			}
-			codec, rate := parseURLKey(pa.URLKey)
-			pick.offer(firstURL(pa.URLList), w, h, rate, codec)
-		}
-		for _, b := range a.Video.BitRate {
-			codec, _ := parseURLKey(b.PlayAddr.URLKey)
-			if codec == "" && b.IsBytevc1 != nil {
-				codec = bytevcCodec(int(*b.IsBytevc1))
-			}
-			pick.offer(firstURL(b.PlayAddr.URLList), b.PlayAddr.Width, b.PlayAddr.Height, b.BitRate, codec)
-		}
-		v := &postVideo{URL: pick.URL, DurationMs: a.Video.Duration, Width: pick.W, Height: pick.H}
-		if v.URL == "" {
-			v.Width, v.Height = a.Video.Width, a.Video.Height
-		}
-		p.Video = v
+		p.Video = a.Video.best()
 	}
 	return a, p, nil
 }

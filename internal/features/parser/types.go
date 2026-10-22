@@ -91,7 +91,7 @@ type Manifest struct {
 // payload 里的原始地址保留不动（供富渲染/兜底），Assets 是并存的「下载指令」。
 type Asset struct {
 	URL  string `json:"url"`
-	Role string `json:"role,omitempty"` // thumbnail | image | media —— 客户端排序/alt 的语义提示
+	Role string `json:"role,omitempty"` // thumbnail | image | media | motion（紧跟其静图的实况动效）—— 客户端排序/配对的语义提示
 	Mime string `json:"mime,omitempty"` // 尽力而为的提示；客户端下载后仍会按响应/字节自行判定
 	Alt  string `json:"alt,omitempty"`
 }
