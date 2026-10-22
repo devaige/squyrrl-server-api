@@ -557,6 +557,7 @@ func TestPlatformMatch(t *testing.T) {
 	shorts := map[string]string{
 		"https://v.douyin.com/L4FJNR3/":      PlatformDouyin,
 		"http://xhslink.com/o/8GqargIxrko":   PlatformXiaohongshu,
+		"https://xhslink.cn/o/4nWBpYQv7zz":   PlatformXiaohongshu,
 		"https://v.kuaishou.com/cNYP0Z":      PlatformKuaishou,
 		"https://www.kuaishou.com/f/X-f2k5K": PlatformKuaishou,
 		"https://b23.tv/abc123":              PlatformBilibili,

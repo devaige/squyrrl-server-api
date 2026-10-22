@@ -158,7 +158,8 @@ func NewUpstreamPlatforms() []Parser {
 		&platform{id: PlatformXiaohongshu, canonical: res(
 			`(?:^|[/.])xiaohongshu\.com/(?:explore|discovery/item|user/profile/[0-9a-f]{24})/([0-9a-f]{24})`,
 		), short: res(
-			`(?:^|//)xhslink\.com/[A-Za-z0-9/]+`,
+			// App 复制出的短链也有 xhslink.cn，第一跳同样是带 type + xsec_token 的笔记链接（实测 2026-10-22）
+			`(?:^|//)xhslink\.(?:com|cn)/[A-Za-z0-9/]+`,
 		),
 			// App 分享的链接带 type（normal / video），一次调用就够；网页端复制的没有 type，
 			// 要先试视频接口、不是再走图文接口，最多两次调用 —— 按两倍收，保证这种链接也有毛利
