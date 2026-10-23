@@ -172,7 +172,9 @@ func TikHubAdapters() AdapterSet {
 		// ---- 公众号文章 ----
 		"tikhub_wechat_mp_v2_fetch_article_detail": tikhub(PlatformWechatMP, "公众号文章",
 			func(t Target) extapi.Request {
-				body, _ := json.Marshal(map[string]any{"url": t.Resolved, "raw": false})
+				// raw=false 只是精简投影，content 两种都一样；图片消息 gUS-ZZFZ-dxS67ylZ1j1Tw 用 false
+				// 得到 400「请求失败」，用 true 正常返回（2026-10-22）
+				body, _ := json.Marshal(map[string]any{"url": t.Resolved, "raw": true})
 				return extapi.Request{Method: "POST", URL: tikhubBase + "wechat_mp/v2/fetch_article_detail", Body: body}
 			}, decodeWechatArticle),
 	}
@@ -1661,14 +1663,18 @@ func decodeWechatArticle(data []byte, t Target) (*post, error) {
 	if c == nil || c.Title == "" {
 		return nil, errors.New("没有文章内容")
 	}
-	text := c.ContentText
+	kind, text := "article", c.ContentText
+	if c.ItemShowType == wechatImageMessage {
+		// 图片消息没有 HTML 正文，文字就是 desc；content_text 是它去掉换行后的版本
+		kind, text = "", c.Desc // 按图片定 kind，封面不再单独下载
+	}
 	if text == "" {
 		text = c.Desc
 	}
 	p := &post{
 		ID:        t.ResourceID,
 		URL:       t.Resolved,
-		Kind:      "article",
+		Kind:      kind,
 		Title:     c.Title,
 		Text:      text,
 		CreatedAt: unixRFC3339(int64(c.OriCreate)),
@@ -1823,8 +1829,12 @@ type ksWebEnvelope struct {
 	Photo  *ksWebPhoto `json:"photo"`
 }
 
+// wechatImageMessage 是公众号「图片消息」的 item_show_type：几张图加一段文字，没有 HTML 正文。
+const wechatImageMessage = 8
+
 type wechatEnvelope struct {
 	Content *struct {
+		ItemShowType int     `json:"item_show_type"`
 		Title        string  `json:"title"`
 		Desc         string  `json:"desc"`
 		NickName     string  `json:"nick_name"`

@@ -74,7 +74,9 @@ var builtinSamples = []builtinSample{
 	{"tikhub_kuaishou_web_fetch_one_video_v2", "kuaishou_web_fetch_one_video_v2", Target{ResourceID: "3xtdqvdnqd3psuc"}, "视频作品"},
 
 	{"tikhub_wechat_mp_v2_fetch_article_detail", "wechat_mp_v2_fetch_article_detail",
-		Target{URI: "https://mp.weixin.qq.com/s/TSNQKkRpN1qbKsT7BvzqIw", Resolved: "https://mp.weixin.qq.com/s/TSNQKkRpN1qbKsT7BvzqIw", ResourceID: "s:TSNQKkRpN1qbKsT7BvzqIw"}, "文章"},
+		Target{URI: "https://mp.weixin.qq.com/s/TSNQKkRpN1qbKsT7BvzqIw", Resolved: "https://mp.weixin.qq.com/s/TSNQKkRpN1qbKsT7BvzqIw", ResourceID: "s:TSNQKkRpN1qbKsT7BvzqIw"}, "文章（raw=false 精简投影）"},
+	{"tikhub_wechat_mp_v2_fetch_article_detail", "wechat_mp_image_post",
+		Target{URI: "https://mp.weixin.qq.com/s/gUS-ZZFZ-dxS67ylZ1j1Tw", Resolved: "https://mp.weixin.qq.com/s/gUS-ZZFZ-dxS67ylZ1j1Tw", ResourceID: "s:gUS-ZZFZ-dxS67ylZ1j1Tw"}, "图片消息（raw=true 完整 item，文字在 desc，2026-10-22 实测）"},
 
 	// ---- 第二批 ----
 	{"tikhub_zhihu_web_fetch_answer_detail", "zhihu_web_fetch_answer_detail", Target{ResourceID: "answer/2054145988235880002"}, "回答（纯文字）"},

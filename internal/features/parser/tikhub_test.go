@@ -460,6 +460,24 @@ func TestXHSImageNote(t *testing.T) {
 	}
 }
 
+// 公众号图片消息：按图文作品解码，文字取 desc（保留换行），封面不单独下载。
+func TestWechatImageMessage(t *testing.T) {
+	res, p := decodeWith(t, "tikhub_wechat_mp_v2_fetch_article_detail", "wechat_mp_image_post",
+		target("s:gUS-ZZFZ-dxS67ylZ1j1Tw", "https://mp.weixin.qq.com/s/gUS-ZZFZ-dxS67ylZ1j1Tw"))
+	checkSample(t, res, p, sampleWant{kind: "image", urlPrefix: "https://mp.weixin.qq.com/s/gUS-ZZFZ-dxS67ylZ1j1Tw", minImages: 5})
+	if p.Title == "" || p.Author == nil || p.Author.Handle != "gh_ad1902868dd9" {
+		t.Errorf("标题或作者不对: title=%q author=%+v", p.Title, p.Author)
+	}
+	if res.Description == nil || !strings.Contains(*res.Description, "\n\n🔌老款木排插座") {
+		t.Errorf("文字要保留换行: %v", res.Description)
+	}
+	for _, a := range res.Assets {
+		if a.Role == "thumbnail" {
+			t.Errorf("图片消息不该单独下载封面: %s", a.URL)
+		}
+	}
+}
+
 // 「HTTP 200 但其实失败」与「上游返回了别的作品」都必须当失败，让兜底链继续。
 func TestTikHubDecodeRejectsWrongOrFailed(t *testing.T) {
 	adapters := TikHubAdapters()
