@@ -574,8 +574,39 @@ func (s *Service) hasProvider(provider string) bool {
 // ErrBadPrice 表示售价不是正整数。
 var ErrBadPrice = errors.New("price must be a positive number of credits")
 
+// Logs 列出解析记录。某一步的采样和示例比出缺失或新增时，在那一步带上差异计数与后台是否
+// 看过，后台列表据此标圆点。命中缓存的记录不带：那份内容的差异标在当初取到它的那条上。
+// 比对失败不影响列表，只是不标。
 func (s *Service) Logs(ctx context.Context, f LogFilter) ([]LogEntry, error) {
-	return s.logs.List(ctx, f)
+	logs, err := s.logs.List(ctx, f)
+	if err != nil || s.extapi == nil {
+		return logs, err
+	}
+	var ids []uuid.UUID
+	for _, l := range logs {
+		for _, a := range l.Attempts {
+			if a.SampleID != nil {
+				ids = append(ids, *a.SampleID)
+			}
+		}
+	}
+	drifts, err := s.extapi.SampleDrifts(ctx, ids)
+	if err != nil {
+		slog.Warn("解析记录的采样结构比对失败", "err", err)
+		return logs, nil
+	}
+	for i := range logs {
+		for j := range logs[i].Attempts {
+			a := &logs[i].Attempts[j]
+			if a.SampleID == nil {
+				continue
+			}
+			if d, ok := drifts[*a.SampleID]; ok {
+				a.Drift = &d
+			}
+		}
+	}
+	return logs, nil
 }
 
 func (s *Service) LogSummary(ctx context.Context, days int) ([]ProviderSummary, []SourceSummary, error) {

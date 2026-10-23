@@ -293,6 +293,48 @@ func (s *Service) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) 
 	return x, nil
 }
 
+// MarkSampleViewed 记下后台打开过这条采样的详情，解析记录列表随之不再为它标圆点。
+func (s *Service) MarkSampleViewed(ctx context.Context, id uuid.UUID) error {
+	return s.repo.MarkSampleViewed(ctx, id)
+}
+
+// SampleDrifts 给一批线上采样算结构差异，只返回和示例比出缺失或新增的那些（键为采样 ID）。
+// 解析记录列表一页几十次调用：示例按接口只解析一次，采样响应要整份读出来比。
+func (s *Service) SampleDrifts(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]Drift, error) {
+	out := map[uuid.UUID]Drift{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	samples, err := s.repo.ListSamplesByID(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	type comparison struct {
+		bases   []baseline
+		watched []string
+	}
+	byEndpoint := map[uuid.UUID]*comparison{}
+	for _, x := range samples {
+		if !diffable(x) {
+			continue
+		}
+		c, ok := byEndpoint[x.EndpointID]
+		if !ok {
+			c = &comparison{}
+			if ep, err := s.repo.Get(ctx, x.EndpointID); err == nil {
+				examples, watched := s.comparisonFor(ep.Slug)
+				c.bases, c.watched = baselinesOf(examples), watched
+			}
+			byEndpoint[x.EndpointID] = c
+		}
+		d := diffAgainst(x.Response, c.bases, c.watched, false)
+		if d.MissingCount > 0 || d.AddedCount > 0 {
+			out[x.ID] = Drift{MissingCount: d.MissingCount, AddedCount: d.AddedCount, Viewed: x.ViewedAt != nil}
+		}
+	}
+	return out, nil
+}
+
 // comparisonFor 取结构比对的两样输入：接口的示例，和适配器代码读取的字段。
 func (s *Service) comparisonFor(slug string) ([]Example, []string) {
 	if s.catalog == nil {

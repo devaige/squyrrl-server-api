@@ -32,8 +32,9 @@ func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 
 	g.GET("/api-adapters", h.adapters)
 
-	// 线上采样只读：示例在代码里维护，后台不增删
+	// 线上采样只读：示例在代码里维护，后台不增删；只记下后台看过哪一条
 	g.GET("/api-samples/:id", h.getSample)
+	g.POST("/api-samples/:id/viewed", h.markSampleViewed)
 }
 
 func (h *Handler) getSample(c *gin.Context) {
@@ -47,6 +48,18 @@ func (h *Handler) getSample(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, x)
+}
+
+func (h *Handler) markSampleViewed(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	if err := h.svc.MarkSampleViewed(c.Request.Context(), id); err != nil {
+		writeErr(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) listAccounts(c *gin.Context) {

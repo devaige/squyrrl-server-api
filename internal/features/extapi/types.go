@@ -165,10 +165,19 @@ type Sample struct {
 	HTTPStatus int             `json:"http_status"`
 	LatencyMs  int             `json:"latency_ms"`
 	CreatedAt  time.Time       `json:"created_at"`
+	ViewedAt   *time.Time      `json:"viewed_at,omitempty"` // 后台第一次打开详情的时间
 
 	// 相对于该接口示例的结构差异（列表里只有计数，详情里带字段清单）；上游失败的应答没有
 	Diff *StructureDiff `json:"diff,omitempty"`
 	// 仅详情：所属接口
 	EndpointSlug string `json:"endpoint_slug,omitempty"`
 	Provider     string `json:"provider,omitempty"`
+}
+
+// Drift 是一条线上采样相对示例的差异计数，以及后台有没有打开过它的详情。
+// 解析记录列表靠它标出还没看过的结构变化。
+type Drift struct {
+	MissingCount int  `json:"missing_count"`
+	AddedCount   int  `json:"added_count"`
+	Viewed       bool `json:"viewed"`
 }

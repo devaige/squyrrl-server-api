@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/squyrrl/api/internal/features/extapi"
 	"github.com/squyrrl/api/internal/features/pricing"
 )
 
@@ -67,6 +68,9 @@ type Attempt struct {
 	CostMicros   int64      `json:"cost_micros"`
 	BalanceAfter *int64     `json:"balance_after_micros,omitempty"`
 	SampleID     *uuid.UUID `json:"sample_id,omitempty"` // 当次调用的线上采样（请求与原始响应），已过保留期则为空
+
+	// 当次采样和示例比出缺失或新增时才有，带着后台看没看过；只由 Service.Logs 填。
+	Drift *extapi.Drift `json:"drift,omitempty"`
 }
 
 type LogRepo struct {

@@ -2,12 +2,16 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/squyrrl/api/internal/features/extapi"
 	"github.com/squyrrl/api/internal/infra/db"
 )
 
@@ -95,5 +99,79 @@ func TestLogListCacheSource(t *testing.T) {
 		if !l.Cached && l.CacheSourceID != nil {
 			t.Errorf("非缓存记录不该带缓存来源: %s %+v", id, l)
 		}
+	}
+}
+
+// 解析记录列表在某一步的采样和示例比出差异时带上计数，后台打开过那条采样后标为已看。
+// 比对要读采样的完整响应和接口的示例，落在真库上：
+//
+//	SQUYRRL_TEST_DATABASE_URL='postgres://USER:PASS@HOST:5432/disposable_test_db' go test ./internal/features/parser/ -run LogsSampleDrift -v
+func TestLogsSampleDrift(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	slug := "tikhub_douyin_app_v3_fetch_one_video"
+	var endpointID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM api_endpoints WHERE slug = $1`, slug).Scan(&endpointID); err != nil {
+		t.Fatalf("取种子接口失败: %v", err)
+	}
+	fixture, err := readFixture("douyin_app_v3_fetch_one_video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var samples []uuid.UUID
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM api_samples WHERE id = ANY($1)`, samples) })
+	sample := func(status int, data string) uuid.UUID {
+		t.Helper()
+		resp := `{"status":` + strconv.Itoa(status) + `,"body":{"code":` + strconv.Itoa(status) + `,"data":` + data + `}}`
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO api_samples (endpoint_id, response, http_status) VALUES ($1, $2, $3) RETURNING id`,
+			endpointID, resp, status).Scan(&id); err != nil {
+			t.Fatalf("建采样失败: %v", err)
+		}
+		samples = append(samples, id)
+		return id
+	}
+	same := sample(200, string(fixture))
+	drifted := sample(200, `{"brand_new_field":1}`)
+	failed := sample(400, `{"brand_new_field":1}`) // 上游失败的应答不比
+
+	adapters := DefaultAdapters()
+	ext := extapi.NewService(extapi.NewRepo(pool), extapi.Credentials{}, adapters)
+	svc := NewService(Deps{Registry: NewRegistry(), Extapi: ext, Adapters: adapters, Logs: NewLogRepo(pool)})
+	provider := uniqueProvider("drift")
+	e := LogEntry{Provider: provider, ResourceID: "r1", Status: LogOK, Source: slug, Attempts: []Attempt{
+		{Seq: 1, Source: slug, Outcome: AttemptFailed, SampleID: &failed},
+		{Seq: 2, Source: slug, Outcome: AttemptFailed, SampleID: &drifted},
+		{Seq: 3, Source: slug, Outcome: AttemptOK, SampleID: &same},
+	}}
+	if err := NewLogRepo(pool).Write(ctx, &e); err != nil {
+		t.Fatalf("写记录失败: %v", err)
+	}
+
+	attempts := func() []Attempt {
+		t.Helper()
+		logs, err := svc.Logs(ctx, LogFilter{Provider: provider})
+		if err != nil || len(logs) != 1 || len(logs[0].Attempts) != 3 {
+			t.Fatalf("应列出一条带三步的记录: %v %+v", err, logs)
+		}
+		return logs[0].Attempts
+	}
+	got := attempts()
+	if got[0].Drift != nil || got[2].Drift != nil {
+		t.Errorf("失败应答和结构一致的采样不该带差异: %+v / %+v", got[0].Drift, got[2].Drift)
+	}
+	if d := got[1].Drift; d == nil || d.MissingCount == 0 || d.AddedCount != 1 || d.Viewed {
+		t.Fatalf("改了结构的采样应带缺失与新增、未看: %+v", d)
+	}
+
+	if err := ext.MarkSampleViewed(ctx, drifted); err != nil {
+		t.Fatalf("标记已看失败: %v", err)
+	}
+	if d := attempts()[1].Drift; d == nil || !d.Viewed {
+		t.Errorf("看过详情后应标为已看: %+v", d)
+	}
+	if err := ext.MarkSampleViewed(ctx, uuid.New()); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("不存在的采样应返回 ErrNoRows，得到 %v", err)
 	}
 }

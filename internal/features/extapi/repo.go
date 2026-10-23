@@ -282,25 +282,18 @@ func (r *Repo) InsertSample(ctx context.Context, endpointID uuid.UUID, resourceI
 }
 
 const sampleCols = `id, endpoint_id, COALESCE(resource_id, ''), request, response,
-	COALESCE(http_status, 0), COALESCE(latency_ms, 0), created_at`
+	COALESCE(http_status, 0), COALESCE(latency_ms, 0), created_at, viewed_at`
 
 func scanSample(row pgx.Row) (Sample, error) {
 	var s Sample
 	var req, resp []byte
 	err := row.Scan(&s.ID, &s.EndpointID, &s.ResourceID, &req, &resp,
-		&s.HTTPStatus, &s.LatencyMs, &s.CreatedAt)
+		&s.HTTPStatus, &s.LatencyMs, &s.CreatedAt, &s.ViewedAt)
 	s.Request, s.Response = json.RawMessage(req), json.RawMessage(resp)
 	return s, err
 }
 
-// ListSamples 返回接口的线上采样（含完整请求响应，供服务层算结构差异）。
-func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+sampleCols+` FROM api_samples WHERE endpoint_id = $1
-		ORDER BY created_at DESC LIMIT 500`, endpointID)
-	if err != nil {
-		return nil, err
-	}
+func scanSamples(rows pgx.Rows) ([]Sample, error) {
 	defer rows.Close()
 	var out []Sample
 	for rows.Next() {
@@ -313,12 +306,44 @@ func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample,
 	return out, rows.Err()
 }
 
+// ListSamples 返回接口的线上采样（含完整请求响应，供服务层算结构差异）。
+func (r *Repo) ListSamples(ctx context.Context, endpointID uuid.UUID) ([]Sample, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+sampleCols+` FROM api_samples WHERE endpoint_id = $1
+		ORDER BY created_at DESC LIMIT 500`, endpointID)
+	if err != nil {
+		return nil, err
+	}
+	return scanSamples(rows)
+}
+
+// ListSamplesByID 按 ID 取一批线上采样（含完整请求响应）；已被清理的不在结果里。
+func (r *Repo) ListSamplesByID(ctx context.Context, ids []uuid.UUID) ([]Sample, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+sampleCols+` FROM api_samples WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	return scanSamples(rows)
+}
+
 func (r *Repo) GetSample(ctx context.Context, id uuid.UUID) (*Sample, error) {
 	s, err := scanSample(r.pool.QueryRow(ctx, `SELECT `+sampleCols+` FROM api_samples WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
 	}
 	return &s, nil
+}
+
+// MarkSampleViewed 记下后台第一次打开这条采样详情的时间，之后再看不改；采样不存在时返回 pgx.ErrNoRows。
+func (r *Repo) MarkSampleViewed(ctx context.Context, id uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE api_samples SET viewed_at = COALESCE(viewed_at, now()) WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 // PruneLiveSamples 清理线上采样：超过 maxAge 的删掉，每个接口超过 keep 条的删掉旧的。

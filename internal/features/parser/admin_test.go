@@ -163,4 +163,7 @@ func TestAdminRoutesEndToEnd(t *testing.T) {
 	if code, _ := call("GET", "/parse-logs?provider="+cp.provider, nil); code != 200 {
 		t.Errorf("列表失败 %d", code)
 	}
+	if code, _ := call("POST", "/api-samples/"+uuid.NewString()+"/viewed", nil); code != 404 {
+		t.Errorf("标记不存在的采样应 404，得到 %d", code)
+	}
 }
