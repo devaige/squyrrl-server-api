@@ -679,6 +679,14 @@ func TestAssetsExpireIn(t *testing.T) {
 	if got := assetsExpireIn([]Asset{{URL: "https://a/b?Expires=1792128060"}}, now); got != time.Minute {
 		t.Errorf("快过期的给 1 分钟下限，得到 %s", got)
 	}
+	// 视频号视频只有签发时间 svrnonce，按保守的有效期算；别家地址里的同名参数不算
+	wx := "https://wxapp.tc.qq.com/251/20302/stodownload?encfilekey=x&token=y&svrnonce=1792128000&X-snsvideoflag=xWT111"
+	if got := assetsExpireIn([]Asset{{URL: wx}}, now); got != wxChannelsURLLifetime-expiryMargin {
+		t.Errorf("视频号视频：得到 %s", got)
+	}
+	if assetsExpireIn([]Asset{{URL: "https://example.test/a?svrnonce=1792128000"}}, now) != 0 {
+		t.Error("不是视频号的地址不认 svrnonce")
+	}
 }
 
 // 跟跳转：拿到第一个能被平台识别的地址就停，不再往下跟（小红书往下是反爬页）。

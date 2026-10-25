@@ -898,6 +898,13 @@ paths:
                     跳过缓存强制重取。用于用户主动发起的「强制刷新」：TTL 是对
                     「这个资源多久变一次」的猜测，猜错时这是唯一的自助手段。
                     计价与普通解析一致。
+                decrypt:
+                  type: boolean
+                  default: false
+                  description: >-
+                    客户端会解开带 `decode_key` 的加密文件（视频号视频：开头 128 KiB 与
+                    ISAAC64(decode_key) 的密钥流异或过）。不带时响应的 `assets` 里没有这类文件，
+                    只有封面等可直接使用的文件。计价不变。
       responses:
         '200':
           description: 解析成功

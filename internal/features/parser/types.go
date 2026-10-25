@@ -94,6 +94,11 @@ type Asset struct {
 	Role string `json:"role,omitempty"` // thumbnail | image | media | motion（紧跟其静图的实况动效）—— 客户端排序/配对的语义提示
 	Mime string `json:"mime,omitempty"` // 尽力而为的提示；客户端下载后仍会按响应/字节自行判定
 	Alt  string `json:"alt,omitempty"`
+
+	// DecodeKey 非空 = 文件是加密的（视频号视频）：开头 128 KiB 与 ISAAC64(DecodeKey) 的密钥流
+	// 异或过，客户端下载后先解开再上传。它与 URL 出自同一次上游响应、成对有效。
+	// 只发给声明会解密的客户端（ParseInput.Decrypt），见 forClient。
+	DecodeKey string `json:"decode_key,omitempty"`
 }
 
 // ParseResult 是 Parser 输出的中间形态，由 Service 拼装为 ParsedSnippet 后返回客户端。
@@ -188,4 +193,8 @@ type ParseInput struct {
 	// 计费与普通解析完全一致（同一平台同一价，命中缓存也一样，见 Service.Parse），
 	// 所以这个参数不影响价格，只影响拿到的是不是新鲜数据。
 	Force bool `json:"force,omitempty"`
+
+	// Decrypt 表示客户端会按 Asset.DecodeKey 解开加密的文件。旧版客户端与浏览器扩展不带：
+	// 加密文件原样存下来是一个放不了的视频，还占存储，所以不发给它们（见 forClient）。
+	Decrypt bool `json:"decrypt,omitempty"`
 }

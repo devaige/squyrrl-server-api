@@ -53,8 +53,8 @@ func tikhubBatch2() AdapterSet {
 				return tikhubGet("reddit/app/fetch_post_details", map[string]string{"post_id": "t3_" + t.ResourceID})
 			}, decodeReddit), redditEnvelope{}),
 
-		// ---- 视频号：视频文件加密（前 128 KB 要用 decode_key 解密才能播放），只取封面与文字 ----
-		"tikhub_wechat_channels_v2_fetch_video_detail": shaped(tikhub(PlatformWechatChannels, "作品（视频加密，只有封面）",
+		// ---- 视频号：视频文件加密（前 128 KB 要用 decode_key 解密才能播放），由客户端解开 ----
+		"tikhub_wechat_channels_v2_fetch_video_detail": shaped(tikhub(PlatformWechatChannels, "作品（视频由客户端解密）",
 			func(t Target) extapi.Request {
 				body, _ := json.Marshal(map[string]any{"share_url": "https://weixin.qq.com/sph/" + t.ResourceID, "raw": false})
 				return extapi.Request{Method: "POST", URL: tikhubBase + "wechat_channels/v2/fetch_video_detail", Body: body}
@@ -610,6 +610,9 @@ type wxChannelsVideo struct {
 	ForwardCount *flexInt   `json:"forward_count"`
 	CommentCount *flexInt   `json:"comment_count"`
 	Media        *struct {
+		URL           string `json:"url"`
+		URLToken      string `json:"url_token"` // 同封面：视频地址拼上它才能下载
+		DecodeKey     string `json:"decode_key"`
 		CoverURL      string `json:"cover_url"`
 		CoverURLToken string `json:"cover_url_token"` // 封面地址要拼上它才能下载（不拼返回 400，实测）
 		Duration      int64  `json:"duration"`        // 秒
@@ -618,9 +621,16 @@ type wxChannelsVideo struct {
 	} `json:"media"`
 }
 
+// wxChannelsTopSpec 是视频号转码档里最清晰的一档。地址本身给的是默认档（url_token 里 basedata 指定，
+// 实测 xWT113 = 576×1024、0.5 Mbps），带 X-snsvideoflag 才换档：xWT112 次之，xWT111 是 1080p。
+// 作品没有这一档时 CDN 照给默认档（实测不存在的档位名都退回默认档），不会失败。
+// 原片（file_size 那份，去掉 basedata 才给）只能取一次、再取 400，不用（2026-10-25 实测）。
+const wxChannelsTopSpec = "xWT111"
+
 // 视频号的 title 与 description 是同一段文字（实测），不是标题，只进正文。
-// 视频文件是加密的：前 131072 字节要用 decode_key 生成的密钥流解开才能播放，客户端直接下载
-// 得到的是坏文件，所以只给封面（同 B 站），作品类型仍是 video。
+// 视频文件是加密的：开头 131072 字节与 ISAAC64(decode_key) 的密钥流异或过，其余是明文。
+// 服务端不经手文件，地址与密钥一起交给客户端，客户端下载后解开再上传（2026-10-25 起；
+// 原先客户端不会解密，只给封面）。不会解密的客户端拿不到这个视频，见 forClient。
 func decodeWechatChannels(data []byte, t Target) (*post, error) {
 	var v wxChannelsVideo
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -629,6 +639,12 @@ func decodeWechatChannels(data []byte, t Target) (*post, error) {
 	if v.ID == "" || v.Media == nil {
 		return nil, errors.New("没有作品")
 	}
+	m := v.Media
+	video := &postVideo{DurationMs: m.Duration * 1000, Width: m.Width, Height: m.Height}
+	if m.URL != "" && m.URLToken != "" {
+		video.URL = httpsURL(m.URL+m.URLToken) + "&X-snsvideoflag=" + wxChannelsTopSpec
+		video.DecodeKey = m.DecodeKey
+	}
 	return &post{
 		ID:        t.ResourceID,
 		URL:       "https://weixin.qq.com/sph/" + t.ResourceID,
@@ -636,8 +652,8 @@ func decodeWechatChannels(data []byte, t Target) (*post, error) {
 		Text:      v.Description,
 		CreatedAt: unixRFC3339(v.CreateTime),
 		Author:    &postAuthor{Name: v.Nickname, ID: v.Username},
-		Cover:     httpsURL(v.Media.CoverURL + v.Media.CoverURLToken),
-		Video:     &postVideo{DurationMs: v.Media.Duration * 1000, Width: v.Media.Width, Height: v.Media.Height},
+		Cover:     httpsURL(m.CoverURL + m.CoverURLToken),
+		Video:     video,
 		Stats: &postStats{Likes: optCount(v.LikeCount), Comments: optCount(v.CommentCount),
 			Shares: optCount(v.ForwardCount), Collects: optCount(v.FavCount)},
 	}, nil

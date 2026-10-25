@@ -93,6 +93,8 @@ var builtinSamples = []builtinSample{
 
 	{"tikhub_wechat_channels_v2_fetch_video_detail", "wechat_channels_v2_fetch_video_detail",
 		Target{URI: "https://weixin.qq.com/sph/AH3sCoIPhH", ResourceID: "AH3sCoIPhH"}, "视频作品（视频加密）"},
+	{"tikhub_wechat_channels_v2_fetch_video_detail", "wechat_channels_video_AounEmtov2",
+		Target{URI: "https://weixin.qq.com/sph/AounEmtov2", ResourceID: "AounEmtov2"}, "视频作品（带位置，视频加密，2026-10-25 实测）"},
 
 	{"tikhub_toutiao_web_get_article_info", "toutiao_web_get_article_info",
 		Target{URI: "https://www.toutiao.com/article/7450114952884503059/", ResourceID: "7450114952884503059"}, "文章"},
