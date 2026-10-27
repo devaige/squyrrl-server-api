@@ -55,6 +55,10 @@ type postVideo struct {
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Width      int    `json:"width,omitempty"`
 	Height     int    `json:"height,omitempty"`
+
+	// DecodeKey 是加密视频（视频号）的解密密钥，随文件进 Asset.DecodeKey。不进 payload：
+	// 每次解析都换一个，只对同一次给出的那个地址有效
+	DecodeKey string `json:"-"`
 }
 
 // postStats 用指针区分「0」与「上游没给」。
@@ -133,7 +137,10 @@ func (p *post) result(provider string) *ParseResult {
 		}
 	}
 	if p.Video != nil {
-		res.Assets = append(res.Assets, mediaAsset(p.Video.URL, "media", "video/mp4")...)
+		if a := mediaAsset(p.Video.URL, "media", "video/mp4"); a != nil {
+			a[0].DecodeKey = p.Video.DecodeKey
+			res.Assets = append(res.Assets, a...)
+		}
 	}
 	res.CacheTTL = assetsExpireIn(res.Assets, time.Now())
 	return res
@@ -159,8 +166,14 @@ func truncateRunes(s string, n int) string {
 //   - 抖音 / TikTok 视频：路径里 32 位哈希后的 8 位十六进制时间戳，约 1–6 小时；
 //     图片：x-expires（十进制秒）；
 //   - Instagram：oe（十六进制秒），约 4 天；
-//   - 微博视频：Expires（十进制秒），约 1–3 小时。
+//   - 微博视频：Expires（十进制秒），约 1–3 小时；
+//   - 视频号视频（2026-10-25）：没有过期时间，只有签发时间 svrnonce（十进制秒，比响应早 1 秒）。
+//     有效期没测准：签发 23 分钟时还能下，9 天前的已经 400（封面地址不过期）。按 wxChannelsURLLifetime 算。
 var bytedanceExpiryPath = regexp.MustCompile(`/[0-9a-f]{32}/([0-9a-f]{8})/`)
+
+// wxChannelsURLLifetime 取得保守：缓存短一点只是同一作品多调一次上游，长了缓存命中给的是死链，
+// 用户得再花代币强制刷新。
+const wxChannelsURLLifetime = 30 * time.Minute
 
 // expiryMargin 给客户端留出下载时间：解析返回后客户端立刻下载，但大视频要几十秒。
 const expiryMargin = 10 * time.Minute
@@ -195,6 +208,9 @@ func urlExpiry(raw string) (time.Time, bool) {
 	}
 	if n, err := strconv.ParseInt(q.Get("oe"), 16, 64); err == nil {
 		times = append(times, n)
+	}
+	if n, err := strconv.ParseInt(q.Get("svrnonce"), 10, 64); err == nil && strings.HasSuffix(u.Host, ".qq.com") {
+		times = append(times, n+int64(wxChannelsURLLifetime/time.Second))
 	}
 	if m := bytedanceExpiryPath.FindStringSubmatch(u.Path); m != nil {
 		if n, err := strconv.ParseInt(m[1], 16, 64); err == nil {

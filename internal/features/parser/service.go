@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -188,7 +189,7 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 			slog.Warn("parse_cache 读取失败", "err", err)
 		} else if hit {
 			entry.Cached = true
-			resp.Snippet, resp.Version, resp.Cached = cached, version, true
+			resp.Snippet, resp.Version, resp.Cached = forClient(cached, in.Decrypt), version, true
 			return s.settle(ctx, userID, price, start, entry, resp)
 		}
 	}
@@ -210,8 +211,21 @@ func (s *Service) Parse(ctx context.Context, userID uuid.UUID, in ParseInput) (*
 		}
 		return nil, ErrParseFailed
 	}
-	resp.Snippet, resp.Version = out.snip, out.version
+	resp.Snippet, resp.Version = forClient(out.snip, in.Decrypt), out.version
 	return s.settle(ctx, userID, price, start, entry, resp)
+}
+
+// forClient 去掉不会解密的客户端（ParseInput.Decrypt 为 false）解不开的文件：加密的视频号视频
+// 原样存下来放不了，还占存储。去掉后它们与先前一样只存封面与文字（视频号售价照旧）。
+// 合并请求共用同一份结果，所以复制一份再删，不动原件。
+func forClient(snip *ParsedSnippet, decrypt bool) *ParsedSnippet {
+	encrypted := func(a Asset) bool { return a.DecodeKey != "" }
+	if decrypt || snip == nil || !slices.ContainsFunc(snip.Assets, encrypted) {
+		return snip
+	}
+	c := *snip
+	c.Assets = slices.DeleteFunc(slices.Clone(snip.Assets), encrypted)
+	return &c
 }
 
 // settle 扣费并记一笔解析记录。

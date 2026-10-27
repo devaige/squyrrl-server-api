@@ -35,9 +35,11 @@ func TestTikHubBatch2DecodeRealSamples(t *testing.T) {
 			sampleWant{kind: "image", urlPrefix: "https://www.reddit.com/r/pics/comments/haucpf/", minImages: 1}},
 		{"tikhub_reddit_app_fetch_post_details", "reddit_text", target("1x6oat7", ""),
 			sampleWant{kind: "text", urlPrefix: "https://www.reddit.com/r/tifu/comments/1x6oat7/", noAssets: true}},
-		// 视频文件加密，只有封面
+		// 视频文件加密，地址连同密钥交给客户端解
 		{"tikhub_wechat_channels_v2_fetch_video_detail", "", target("AH3sCoIPhH", "https://weixin.qq.com/sph/AH3sCoIPhH"),
-			sampleWant{kind: "video", urlPrefix: "https://weixin.qq.com/sph/AH3sCoIPhH"}},
+			sampleWant{kind: "video", urlPrefix: "https://weixin.qq.com/sph/AH3sCoIPhH", video: true}},
+		{"tikhub_wechat_channels_v2_fetch_video_detail", "wechat_channels_video_AounEmtov2", target("AounEmtov2", "https://weixin.qq.com/sph/AounEmtov2"),
+			sampleWant{kind: "video", urlPrefix: "https://weixin.qq.com/sph/AounEmtov2", video: true}},
 		{"tikhub_toutiao_web_get_article_info", "", target("7450114952884503059", "https://www.toutiao.com/article/7450114952884503059/"),
 			sampleWant{kind: "article", urlPrefix: "https://www.toutiao.com/article/7450114952884503059/", minImages: 1}},
 		{"tikhub_toutiao_web_get_article_info", "toutiao_weitoutiao", target("1878680639539276", "https://www.toutiao.com/w/1878680639539276/"),
@@ -159,6 +161,48 @@ func TestTikHubBatch2Details(t *testing.T) {
 	_, tg := decodeWith(t, "tikhub_telegram_web_fetch_post_detail", "telegram_web_fetch_post_detail", target("durov/510", ""))
 	if tg.Stats == nil || tg.Stats.Views == nil || *tg.Stats.Views != 3830000 {
 		t.Errorf("Telegram 浏览数: %+v", tg.Stats)
+	}
+
+	// 视频号：地址拼上 token、换成 https、要最清晰的转码档；密钥只跟着文件走，不进 payload
+	wres, wx := decodeWith(t, "tikhub_wechat_channels_v2_fetch_video_detail", "wechat_channels_video_AounEmtov2", target("AounEmtov2", ""))
+	if wx.Video == nil || !strings.HasPrefix(wx.Video.URL, "https://wxapp.tc.qq.com/251/20302/stodownload?encfilekey=") ||
+		!strings.Contains(wx.Video.URL, "&token=") || !strings.HasSuffix(wx.Video.URL, "&X-snsvideoflag=xWT111") ||
+		wx.Video.Width != 1080 || wx.Video.Height != 1920 || wx.Video.DurationMs != 35000 {
+		t.Errorf("视频号视频: %+v", wx.Video)
+	}
+	var media *Asset
+	for i := range wres.Assets {
+		if wres.Assets[i].Role == "media" {
+			media = &wres.Assets[i]
+		}
+	}
+	if media == nil || media.DecodeKey != "633020370" || media.URL != wx.Video.URL {
+		t.Errorf("视频号的视频文件应带解密密钥: %+v", media)
+	}
+	if strings.Contains(string(wres.Payload), "633020370") {
+		t.Error("解密密钥不能进 payload")
+	}
+}
+
+// 不会解密的客户端拿不到加密文件，其余文件照给；合并请求共用的原件不能被改。
+func TestForClientDropsEncryptedAssets(t *testing.T) {
+	snip := &ParsedSnippet{Assets: []Asset{
+		{URL: "https://example.test/cover.jpg", Role: "thumbnail"},
+		{URL: "https://example.test/video", Role: "media", DecodeKey: "42"},
+	}}
+	if got := forClient(snip, true); got != snip {
+		t.Error("会解密的客户端应拿到原样结果")
+	}
+	got := forClient(snip, false)
+	if len(got.Assets) != 1 || got.Assets[0].Role != "thumbnail" {
+		t.Errorf("不会解密的客户端: %+v", got.Assets)
+	}
+	if len(snip.Assets) != 2 || snip.Assets[1].DecodeKey != "42" {
+		t.Errorf("原件被改了: %+v", snip.Assets)
+	}
+	plain := &ParsedSnippet{Assets: []Asset{{URL: "https://example.test/a.mp4", Role: "media"}}}
+	if forClient(plain, false) != plain {
+		t.Error("没有加密文件时不必复制")
 	}
 }
 
