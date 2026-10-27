@@ -362,7 +362,7 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindBuiltin, err.Error()
 		case !usable(res):
-			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindEmpty, "没有标题也没有正文"
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindEmpty, "没有标题、正文，也没有图片或视频"
 		default:
 			a.Outcome = AttemptOK
 			add(a)
@@ -428,7 +428,7 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 		case err != nil:
 			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, err.Error()
 		case !usable(res):
-			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, "转换后没有标题也没有正文"
+			a.Outcome, a.ErrorKind, a.Error = AttemptFailed, extapi.KindDecode, "转换后没有标题、正文，也没有图片或视频"
 		default:
 			a.Outcome = AttemptOK
 			add(a)
@@ -446,13 +446,23 @@ func (s *Service) runChain(ctx context.Context, p Parser, eps []extapi.Endpoint,
 	return nil, "", attempts, errChainExhausted
 }
 
-// usable 判断一份结果能不能交给用户：至少要有标题或正文。
+// usable 判断一份结果能不能交给用户：至少要有标题、正文，或一个图片 / 视频文件。
 // 上游降级（限流、部分字段缺失）时常见「200 但几乎是空的」，那不算成功。
+// 没配文案的视频本来就只有文件（抖音作品 7700616034386561627，2026-10-27），要算成功；
+// 只有封面不算 —— 那还是空壳。
 func usable(res *ParseResult) bool {
 	if res == nil {
 		return false
 	}
-	return (res.Title != nil && *res.Title != "") || (res.Description != nil && *res.Description != "")
+	if (res.Title != nil && *res.Title != "") || (res.Description != nil && *res.Description != "") {
+		return true
+	}
+	for _, a := range res.Assets {
+		if a.Role != "thumbnail" {
+			return true
+		}
+	}
+	return false
 }
 
 // endpointsFor 取某平台的付费兜底链；没接 extapi 时为空。

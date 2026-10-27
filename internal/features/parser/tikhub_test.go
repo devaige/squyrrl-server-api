@@ -120,7 +120,7 @@ type sampleWant struct {
 func checkSample(t *testing.T, res *ParseResult, p decodedPost, w sampleWant) {
 	t.Helper()
 	if !usable(res) {
-		t.Fatal("没有标题也没有正文")
+		t.Fatal("没有标题、正文，也没有图片或视频")
 	}
 	if p.Kind != w.kind {
 		t.Errorf("kind=%s，期望 %s", p.Kind, w.kind)
@@ -410,6 +410,48 @@ func TestAwemeSlidesVideo(t *testing.T) {
 	}
 	if th, m := res.Assets[1], res.Assets[2]; th.URL != p.Images[1].URL || imageRank(th.URL) != 0 || m.URL != v.URL || m.Mime != "video/mp4" {
 		t.Errorf("首帧或视频文件不对: %+v %+v", th, m)
+	}
+}
+
+// 没配文案的抖音视频（2026-10-27 线上采样，作品 7700616034386561627）：desc 为空，四个接口都有视频，
+// 原先因「没有标题也没有正文」全判失败。标题不拿 share_info.share_title 的「@某某发了一个抖音短视频」顶替。
+func TestAwemeVideoWithoutCaption(t *testing.T) {
+	for slug, file := range map[string]string{
+		"tikhub_douyin_app_v3_fetch_one_video":    "douyin_app_v3_fetch_one_video_no_caption",
+		"tikhub_douyin_app_v3_fetch_one_video_v2": "douyin_app_v3_fetch_one_video_v2_no_caption",
+		"tikhub_douyin_app_v3_fetch_one_video_v3": "douyin_app_v3_fetch_one_video_v3_no_caption",
+		"tikhub_douyin_web_fetch_one_video":       "douyin_web_fetch_one_video_no_caption",
+	} {
+		t.Run(slug, func(t *testing.T) {
+			res, p := decodeWith(t, slug, file, target("7700616034386561627", ""))
+			checkSample(t, res, p, sampleWant{kind: "video", urlPrefix: "https://www.douyin.com/video/7700616034386561627", video: true})
+			if res.Title != nil || res.Description != nil {
+				t.Errorf("不该有标题或正文: title=%v description=%v", res.Title, res.Description)
+			}
+		})
+	}
+}
+
+// 可用 = 有标题、正文，或者有一个图片 / 视频文件；只有封面的仍是空壳。
+func TestUsable(t *testing.T) {
+	s := "x"
+	for _, c := range []struct {
+		name string
+		res  *ParseResult
+		want bool
+	}{
+		{"nil", nil, false},
+		{"什么都没有", &ParseResult{}, false},
+		{"空标题", &ParseResult{Title: new(string)}, false},
+		{"有标题", &ParseResult{Title: &s}, true},
+		{"有正文", &ParseResult{Description: &s}, true},
+		{"只有封面", &ParseResult{Assets: []Asset{{URL: "https://a/c.jpg", Role: "thumbnail"}}}, false},
+		{"只有视频", &ParseResult{Assets: []Asset{{URL: "https://a/c.jpg", Role: "thumbnail"}, {URL: "https://a/v.mp4", Role: "media"}}}, true},
+		{"只有图片", &ParseResult{Assets: []Asset{{URL: "https://a/i.jpg", Role: "image"}}}, true},
+	} {
+		if got := usable(c.res); got != c.want {
+			t.Errorf("%s: usable=%v，期望 %v", c.name, got, c.want)
+		}
 	}
 }
 

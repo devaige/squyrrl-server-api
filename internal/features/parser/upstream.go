@@ -29,7 +29,7 @@ type Adapter struct {
 	Shape any
 
 	Request func(t Target) extapi.Request
-	// Decode 收到的是去掉上游外壳后的数据。返回的结果若没有标题也没有正文，
+	// Decode 收到的是去掉上游外壳后的数据。返回的结果若没有标题、正文，也没有图片或视频（见 usable），
 	// 视同失败、继续试下一个来源（这次调用的钱已经花了）。
 	// 上游可能返回别的作品（推荐流、ID 映射错），能核对作品 ID 的必须核对。
 	Decode func(data []byte, t Target) (*ParseResult, error)
