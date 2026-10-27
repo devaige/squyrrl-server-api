@@ -79,6 +79,13 @@ type LogRepo struct {
 
 func NewLogRepo(pool *pgxpool.Pool) *LogRepo { return &LogRepo{pool: pool} }
 
+// resource 由记录定位作品；缓存失效不修改这条历史记录。
+func (r *LogRepo) resource(ctx context.Context, id uuid.UUID) (provider, resourceID string, err error) {
+	err = r.pool.QueryRow(ctx, `SELECT provider, resource_id FROM parse_logs WHERE id = $1`, id).
+		Scan(&provider, &resourceID)
+	return
+}
+
 // Write 在一个事务里落一条记录与它的全部尝试。
 func (r *LogRepo) Write(ctx context.Context, e *LogEntry) error {
 	tx, err := r.pool.Begin(ctx)

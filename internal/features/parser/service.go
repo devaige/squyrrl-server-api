@@ -84,6 +84,15 @@ func NewService(d Deps) *Service {
 	}
 }
 
+// InvalidateCacheForLog 只清除这条记录对应作品的成功解析缓存，不调用上游、不改碎片。
+func (s *Service) InvalidateCacheForLog(ctx context.Context, logID uuid.UUID) (int64, error) {
+	provider, resourceID, err := s.logs.resource(ctx, logID)
+	if err != nil {
+		return 0, err
+	}
+	return s.cache.Invalidate(ctx, provider, resourceID)
+}
+
 // Parse 是主入口：选平台 → 定价 → 确认付得起 → 命中缓存或跑兜底链 → 成功才扣费 → 记一笔解析记录。
 //
 // 计费（ADR-080，取代 ADR-046 的「先扣后取」）：

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/squyrrl/api/internal/features/auth"
 	"github.com/squyrrl/api/internal/features/quota"
@@ -32,10 +33,11 @@ func (h *Handler) RegisterPublic(g *gin.RouterGroup) {
 	g.GET("/manifest", h.manifest)
 }
 
-// RegisterInternal 挂后台端点（/internal/admin，受 X-Internal-Token 保护）：解析记录与平台售价。
+// RegisterInternal 挂后台端点（/internal/admin，受 X-Internal-Token 保护）：解析记录、缓存失效与平台售价。
 func (h *Handler) RegisterInternal(g *gin.RouterGroup) {
 	g.GET("/parse-logs", h.listLogs)
 	g.GET("/parse-logs/summary", h.logSummary)
+	g.DELETE("/parse-logs/:id/cache", h.invalidateCache)
 	g.GET("/parse-prices", h.listPrices)
 	g.PUT("/parse-prices/:provider", h.setPrice)
 	g.DELETE("/parse-prices/:provider", h.clearPrice)
@@ -149,6 +151,25 @@ func (h *Handler) logSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"days": days, "providers": providers, "sources": sources})
+}
+
+func (h *Handler) invalidateCache(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log id"})
+		return
+	}
+	removed, err := h.svc.InvalidateCacheForLog(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "parse log not found"})
+		} else {
+			slog.Warn("解析缓存失效失败", "log_id", id, "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "cache invalidation failed"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"removed": removed})
 }
 
 func (h *Handler) listPrices(c *gin.Context) {

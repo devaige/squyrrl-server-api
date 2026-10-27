@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -11,7 +12,96 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/squyrrl/api/internal/features/extapi"
+	"github.com/squyrrl/api/internal/features/tg"
 )
+
+func TestAdminCacheInvalidationValidatesRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/internal/admin", tg.InternalAuth("test-internal-token"))
+	NewHandler(nil).RegisterInternal(g)
+
+	for _, tc := range []struct {
+		name, path, token string
+		status            int
+	}{
+		{"invalid id", "/internal/admin/parse-logs/not-a-uuid/cache", "test-internal-token", http.StatusBadRequest},
+		{"missing token", "/internal/admin/parse-logs/" + uuid.NewString() + "/cache", "", http.StatusUnauthorized},
+		{"wrong token", "/internal/admin/parse-logs/" + uuid.NewString() + "/cache", "wrong", http.StatusUnauthorized},
+		{"public path", "/uris/parse-logs/" + uuid.NewString() + "/cache", "", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodDelete, tc.path, nil)
+			req.Header.Set("X-Internal-Token", tc.token)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("得到 %d，期望 %d：%s", w.Code, tc.status, w.Body.String())
+			}
+		})
+	}
+}
+
+// 从历史记录失效作品缓存：不重新解析、不删历史，下一次普通解析才重取。
+func TestAdminCacheInvalidationRefetchesOnNextParse(t *testing.T) {
+	p := &countingParser{version: "v1"}
+	svc := newTestService(t, p, 0)
+	ctx := context.Background()
+	svc.logs = NewLogRepo(svc.cache.pool)
+	t.Cleanup(func() {
+		_, _ = svc.cache.pool.Exec(ctx, `DELETE FROM parse_logs WHERE provider = $1`, p.Provider())
+	})
+	const resourceID = "channel/123"
+	const uri = "https://example.test/" + resourceID
+
+	for _, version := range []string{"v0", "v1"} {
+		if err := svc.cache.Put(ctx, p.Provider(), resourceID, version, snip("旧数据"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := &LogEntry{Provider: p.Provider(), ResourceID: resourceID, Status: LogOK, Cached: true}
+	if err := svc.logs.Write(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	r := gin.New()
+	NewHandler(svc).RegisterInternal(r.Group("/internal/admin"))
+	call := func(id uuid.UUID) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/internal/admin/parse-logs/"+id.String()+"/cache", nil))
+		return w
+	}
+	for _, wantRemoved := range []int64{2, 0} {
+		w := call(entry.ID)
+		var out struct {
+			Removed int64 `json:"removed"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || w.Code != http.StatusOK || out.Removed != wantRemoved {
+			t.Fatalf("失效失败：status=%d body=%s err=%v", w.Code, w.Body.String(), err)
+		}
+	}
+	if p.calls.Load() != 0 {
+		t.Fatal("失效操作不应调用上游")
+	}
+	if w := call(uuid.New()); w.Code != http.StatusNotFound {
+		t.Fatalf("不存在的记录应 404：%d %s", w.Code, w.Body.String())
+	}
+	if provider, id, err := svc.logs.resource(ctx, entry.ID); err != nil || provider != p.Provider() || id != resourceID {
+		t.Fatalf("失效不应修改历史记录：provider=%q resource=%q err=%v", provider, id, err)
+	}
+
+	uid := uuid.New()
+	for _, wantCached := range []bool{false, true} {
+		res, err := svc.Parse(ctx, uid, ParseInput{URI: uri})
+		if err != nil || res.Cached != wantCached || p.calls.Load() != 1 {
+			t.Fatalf("下一次解析应重取，之后命中新缓存：response=%+v calls=%d err=%v", res, p.calls.Load(), err)
+		}
+		if res.Snippet.Title == nil || *res.Snippet.Title != "上游内容" {
+			t.Fatalf("仍在使用旧解析数据：%+v", res.Snippet)
+		}
+	}
+}
 
 // 管理后台走的是 /internal/admin 下的这些路由。这里用真库把它们串一遍：
 // 建账户 → 充值/核减 → 建接口 → 定价 → 汇总，顺带锁住后台依赖的 JSON 字段名。

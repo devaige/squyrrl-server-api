@@ -112,6 +112,14 @@ func (c *Cache) Put(ctx context.Context, provider, resourceID, version string, s
 	return err
 }
 
+// Invalidate 清除一个作品的全部版本，避免回退到旧版或被同版本的标题护栏保留错误数据。
+func (c *Cache) Invalidate(ctx context.Context, provider, resourceID string) (int64, error) {
+	tag, err := c.pool.Exec(ctx, `
+		DELETE FROM parse_cache WHERE provider = $1 AND provider_resource_id = $2`,
+		provider, resourceID)
+	return tag.RowsAffected(), err
+}
+
 // Hidden 返回该资源是否已被确认作品本身不可见，以及确认时的原因。
 //
 // 没有过期：这种状态实测几乎都是作品被平台下架，不会自己恢复（见 migration 000034）。

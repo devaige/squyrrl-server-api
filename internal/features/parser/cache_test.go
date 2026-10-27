@@ -66,6 +66,61 @@ func snip(title string) *ParsedSnippet {
 	return s
 }
 
+// 失效必须清掉全部版本、严格限定作品，并允许同版本的修正结果摆脱旧标题护栏。
+func TestCacheInvalidateRemovesAllVersionsOfOnlyOneResource(t *testing.T) {
+	pool := testPool(t)
+	provider := uniqueProvider("invalidate")
+	otherProvider := uniqueProvider("invalidate_other")
+	c := newTestCache(t, pool, provider)
+	newTestCache(t, pool, otherProvider)
+	ctx := context.Background()
+
+	for _, row := range []struct{ provider, resourceID, version string }{
+		{provider, "channel/123", ""},
+		{provider, "channel/123", "v1"},
+		{provider, "channel/123", "v2"},
+		{provider, "channel/456", "v1"},
+		{otherProvider, "channel/123", "v1"},
+	} {
+		if err := c.Put(ctx, row.provider, row.resourceID, row.version, snip("错误旧标题"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.PutHidden(ctx, provider, "channel/123", "作品不可见"); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := c.Invalidate(ctx, provider, "channel/123")
+	if err != nil || removed != 3 {
+		t.Fatalf("应清除该作品的三个版本：removed=%d err=%v", removed, err)
+	}
+	if _, _, hit, err := c.Get(ctx, provider, "channel/123"); err != nil || hit {
+		t.Fatalf("失效后不应回退到旧版本：hit=%v err=%v", hit, err)
+	}
+	for _, key := range []struct{ provider, resourceID string }{
+		{provider, "channel/456"},
+		{otherProvider, "channel/123"},
+	} {
+		if _, _, hit, err := c.Get(ctx, key.provider, key.resourceID); err != nil || !hit {
+			t.Fatalf("不应影响其他作品：%+v hit=%v err=%v", key, hit, err)
+		}
+	}
+	if _, hidden, err := c.Hidden(ctx, provider, "channel/123"); err != nil || !hidden {
+		t.Fatalf("不应清除作品不可见记录：hidden=%v err=%v", hidden, err)
+	}
+	if removed, err := c.Invalidate(ctx, provider, "channel/123"); err != nil || removed != 0 {
+		t.Fatalf("重复失效应成功且清除零行：removed=%d err=%v", removed, err)
+	}
+
+	if err := c.Put(ctx, provider, "channel/123", "v2", snip(""), 0); err != nil {
+		t.Fatal(err)
+	}
+	got, version, hit, err := c.Get(ctx, provider, "channel/123")
+	if err != nil || !hit || version != "v2" || got.Title != nil {
+		t.Fatalf("重建同版本不能保留错误旧标题：snippet=%+v version=%q hit=%v err=%v", got, version, hit, err)
+	}
+}
+
 // 同一资源的多个版本共存，读取取最新写入的那一版。
 //
 // 这是整套改动的主断言：改版前 (provider, resource_id) 是唯一键，第二个版本会直接
