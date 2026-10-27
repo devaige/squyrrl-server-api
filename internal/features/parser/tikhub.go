@@ -360,7 +360,9 @@ type aweme struct {
 		urlList
 		DownloadURLList []string `json:"download_url_list"` // 带水印
 		// 实况图片的那段动效（作品 is_live_photo=1，图的 clip_type=5、live_photo_type=1，
-		// 实测 2026-10-22，作品 7699378552240020323）：几秒的 h264 mp4，与静图同比例
+		// 实测 2026-10-22，作品 7699378552240020323）：几秒的 h264 mp4，与静图同比例。
+		// 图文混排里的视频也在这里（clip_type=4，url_list 是首帧；同作品的图 clip_type=2，
+		// 实测 2026-10-27，作品 7700564727999466664）
 		Video         *awemeVideo `json:"video"`
 		ClipType      flexInt     `json:"clip_type"`
 		LivePhotoType flexInt     `json:"live_photo_type"`
@@ -381,7 +383,8 @@ type aweme struct {
 	ArticleInfo *awemeArticle `json:"article_info"` // 只有抖音文章有
 }
 
-// awemeClipLivePhoto 是实况图片的 images[].clip_type（实测 2026-10-22；普通图文的图没有这个字段）。
+// awemeClipLivePhoto 是实况图片的 images[].clip_type（实测 2026-10-22；早先的普通图文样本没有
+// 这个字段，混排作品里的图是 2、视频是 4）。
 const awemeClipLivePhoto = 5
 
 // awemeVideo 是抖音 / TikTok 的一段视频：作品本身的 video，或实况图片的 images[].video。
@@ -480,11 +483,18 @@ func decodeAweme(data []byte, t Target) (*aweme, *post, error) {
 			continue
 		}
 		im := postImage{URL: u, Width: img.Width, Height: img.Height}
-		// 实况图片：静图换成无水印的 JPEG 并带上动效；没有这样的静图就只存静图。
-		// 只认标明是实况的：图文里别的带 video 的图（混排的视频）没见过样本，不往 JPEG 里塞
-		if img.Video != nil && (img.LivePhotoType > 0 || img.ClipType == awemeClipLivePhoto) {
+		switch {
+		case img.Video == nil:
+		case img.LivePhotoType > 0 || img.ClipType == awemeClipLivePhoto:
+			// 实况图片：静图换成无水印的 JPEG 并带上动效；没有这样的静图就只存静图
 			if live, still := img.Video.best(), jpegURL(img.URLList); live.URL != "" && still != "" {
 				im.URL, im.Live = still, live
+			}
+		default:
+			// 没标明是实况、带着视频的是图文里混排的视频：存视频，图是它的首帧。
+			// 原先当图存，测试反馈一图一视频的作品存下来是两张图（2026-10-27）
+			if v := img.Video.best(); v.URL != "" {
+				im.Video = v
 			}
 		}
 		p.Images = append(p.Images, im)

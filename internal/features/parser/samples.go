@@ -45,6 +45,7 @@ var builtinSamples = []builtinSample{
 	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_image_post", Target{ResourceID: "7692800900575176625"}, "图文作品（原图是 VVC，另有 jpeg）"},
 	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_video_7698165296368139707", Target{ResourceID: "7698165296368139707"}, "视频作品（带 suggest_words、common_bar_info 等，2026-10-19 线上采样）"},
 	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_live_photo", Target{ResourceID: "7699378552240020323"}, "实况图文（images[].video 是动效，静图另有 jpeg，2026-10-22 线上采样）"},
+	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_slides_video", Target{ResourceID: "7700564727999466664"}, "图文混排视频（一图一视频，视频那张 clip_type=4，带 risk_infos，2026-10-27 线上采样）"},
 	{"tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_article", Target{ResourceID: "7698925399581804456"}, "文章（正文是 markdown，插图只有 HEIC，video 里是背景音乐）"},
 	{"tikhub_douyin_app_v3_fetch_share_info_by_share_code", "douyin_app_v3_fetch_share_info_by_share_code",
 		Target{URI: "【刚，Claude首次设计出抗蝎毒蛋白！狂算64小时，已过实:/ 测】长按复制打开抖音，即可阅读文章 ︽︽cz9zRIbcJa9︽︽", Code: "cz9zRIbcJa9"}, "文章口令（分享者信息已抹掉）"},

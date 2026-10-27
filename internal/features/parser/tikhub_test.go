@@ -378,8 +378,38 @@ func TestAwemeLivePhoto(t *testing.T) {
 	if im := images(`{"url_list":[` + heic + `,` + webp + `],"clip_type":5,"live_photo_type":1,"video":` + clip + `}`); len(im) != 1 || im[0].Live != nil || !strings.Contains(im[0].URL, ".webp?") {
 		t.Errorf("没有 jpeg 静图就只存静图，得到 %+v", im)
 	}
-	if im := images(`{"url_list":[` + jpeg + `],"video":` + clip + `}`); len(im) != 1 || im[0].Live != nil {
-		t.Errorf("没标明是实况的图不带动效，得到 %+v", im)
+	if im := images(`{"url_list":[` + jpeg + `],"video":` + clip + `}`); len(im) != 1 || im[0].Live != nil || im[0].Video == nil {
+		t.Errorf("没标明是实况、带视频的图按混排视频存，得到 %+v", im)
+	}
+}
+
+// 抖音图文混排（2026-10-27 线上采样，作品 7700564727999466664）：第一张是图（clip_type=2），
+// 第二张是 10 秒的 720p h264 视频（clip_type=4，url_list 是首帧）。原先两张都存成了图。
+func TestAwemeSlidesVideo(t *testing.T) {
+	res, p := decodeWith(t, "tikhub_douyin_app_v3_fetch_one_video", "douyin_app_v3_slides_video", target("7700564727999466664", ""))
+	checkSample(t, res, p, sampleWant{kind: "image", urlPrefix: "https://www.douyin.com/note/7700564727999466664", video: true, minImages: 1})
+	if p.Video != nil {
+		t.Errorf("图文不该有作品级视频（play_addr 是背景音乐）: %+v", p.Video)
+	}
+	if len(p.Images) != 2 {
+		t.Fatalf("应有 2 张，得到 %d", len(p.Images))
+	}
+	if im := p.Images[0]; im.Video != nil || im.Live != nil || imageRank(im.URL) != 0 {
+		t.Errorf("第一张应是普通的图，得到 %+v", im)
+	}
+	v := p.Images[1].Video
+	if v == nil || !strings.HasPrefix(v.URL, "https://") || v.Width != 720 || v.Height != 1280 || v.DurationMs != 10008 {
+		t.Fatalf("第二张应是 720×1280、10 秒的视频，得到 %+v", v)
+	}
+	var roles []string
+	for _, a := range res.Assets {
+		roles = append(roles, a.Role)
+	}
+	if strings.Join(roles, ",") != "image,thumbnail,media" {
+		t.Fatalf("视频的首帧应紧挨在视频前面做缩略图，得到 %v", roles)
+	}
+	if th, m := res.Assets[1], res.Assets[2]; th.URL != p.Images[1].URL || imageRank(th.URL) != 0 || m.URL != v.URL || m.Mime != "video/mp4" {
+		t.Errorf("首帧或视频文件不对: %+v %+v", th, m)
 	}
 }
 

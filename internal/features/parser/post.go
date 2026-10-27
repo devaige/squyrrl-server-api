@@ -46,6 +46,8 @@ type postImage struct {
 	// 实况图片（抖音的「实况」/ iOS 的 Live Photo）的那段动效。有它时 URL 一定是 JPEG：
 	// 客户端把两者合成一张实况照片（Motion Photo）存成一个附件
 	Live *postVideo `json:"live,omitempty"`
+	// 图文里的一段视频（抖音图文混排）：这一张存的是视频，URL 是它的首帧，做视频的缩略图
+	Video *postVideo `json:"video,omitempty"`
 }
 
 type postVideo struct {
@@ -118,6 +120,12 @@ func (p *post) result(provider string) *ParseResult {
 		res.Assets = append(res.Assets, mediaAsset(p.Cover, "thumbnail", "")...)
 	}
 	for _, img := range p.Images {
+		if img.Video != nil {
+			// 首帧紧挨在视频前面，同视频作品的封面一样做它的缩略图、不另存
+			res.Assets = append(res.Assets, mediaAsset(img.URL, "thumbnail", "")...)
+			res.Assets = append(res.Assets, mediaAsset(img.Video.URL, "media", "video/mp4")...)
+			continue
+		}
 		res.Assets = append(res.Assets, mediaAsset(img.URL, "image", "")...)
 		// 动效紧跟在它的静图后面，客户端按相邻配对
 		if img.Live != nil {
